@@ -1,0 +1,3 @@
+# Optional import tidy-up (same as upstream): cargo +nightly fmt -- --config-path rustfmt.nightly.toml
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"

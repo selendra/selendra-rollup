@@ -12,7 +12,10 @@ The Sovereign SDK is a Rust toolkit for building app-specific rollups. It splits
 - REA's Rust path (`inspect-rust-binary`) needs a compiled `sov-demo-rollup` built with `cargo auditable`. Building that binary was not done in this session, so the Rust crate graph comes from `Cargo.toml` and source, not from binary evidence.
 - Rust architecture (traits, lifecycle, storage, proving) comes from reading the source in `crates/` and `examples/`.
 
-The SDK's own README claims 1.2 ms median soft-confirmations and 30k+ user operations per second. These figures were not verified here
+The SDK's own README claims 1.2 ms median soft-confirmations and 30k+ user operations per second. These figures were not verified here.
+
+**Selendra uses Avail, not Celestia.** Upstream supports several DA layers. Selendra builds on **Avail** only. Celestia appears below only because it is upstream's most complete adapter; its code is not copied. Upstream's Avail adapter is a stub that Selendra finishes (`TODO.md` Phase 9). Selendra's other choices are SP1, EVM by default and soft confirmations (see `TODO.md`, Decisions).
+
 ## Repository map
 
 Most of the code lives in the module system (127k lines) and the full node (86k lines). The Cargo workspace lists 93 members. Line counts below are `.rs` + `.ts` files.
@@ -205,9 +208,9 @@ The OpenAPI spec is in `sov-api-spec/openapi-v3.yaml`. Metrics go out as InfluxD
 
 | Adapter | Size | State |
 | --- | --- | --- |
-| Celestia | ~11.8k lines | Complete. Separate batch and proof namespaces; `NamespaceBoundaryProof` for completeness |
+| Celestia | ~11.8k lines | Complete. Separate batch and proof namespaces; `NamespaceBoundaryProof` for completeness. **Not used by Selendra**; reference only for the completeness-proof pattern |
 | Mock DA | n/a | Complete. In-memory, sqlite or Postgres; also a standalone `mock-da-server` |
-| Avail | 652 lines | Partial: blob extraction, extraction proof and verifier are `todo!()`; proof submission is `unimplemented!()` |
+| Avail | 652 lines | Partial: blob extraction, extraction proof and verifier are `todo!()`; proof submission is `unimplemented!()`. **Selendra's DA layer**: finished in `TODO.md` Phase 9 |
 
 **Demo rollup assembly** (`examples/demo-rollup`). `stf/stf-declaration/src/lib.rs` declares `Runtime<S>` with bank, accounts, uniqueness, chain state, blob storage, sequencer registry, the three incentive modules, paymaster, revenue share, the four Hyperlane modules, EVM and two test modules. `stf/src/runtime.rs` picks `SoftConfirmationsKernel`. `src/mock_rollup.rs` fixes the Spec as mock DA + mock zkVM + `MultiAddressEvmSolana` addresses. `src/main.rs` takes `--da-layer {mock,celestia,external-mock}` and `--zk-vm {mock,sp1}`. Configs are TOML with `[da]`, `[storage]`, `[runner]`, `[monitoring]`, `[proof_manager]`, `[sequencer]` and `[sequencer.preferred]`.
 
@@ -220,11 +223,11 @@ The design rests on one idea: a single STF codebase compiled three ways, as nati
 - **Soft confirmations are speculative execution.** `PreferredSequencer` runs txs against live state and confirms them in about a millisecond (vendor claim). The full node re-executes from DA later; the sequencer bond is what makes the promise credible.
 - **Two NOMT roots, hashed together.** Proving cost depends on the NOMT multiproof plus the witness hints; there is no JMT path left.
 - **Back-pressure couples proving to sync.** If provers fall behind, the runner stops. Prover capacity is a liveness dependency in zk mode.
-- **Uneven adapter maturity.** Celestia and mock DA are complete. Avail is stubbed. Risc0 cannot aggregate, so production zk mode means SP1.
+- **Uneven adapter maturity.** Celestia and mock DA are complete. Avail is stubbed, and Selendra uses Avail, so finishing the Avail adapter (blob extraction, completeness proofs, KZG verification in the guest) is on Selendra's critical path. Risc0 cannot aggregate, so production zk mode means SP1.
 
 **Open questions**
 
-- What rea-chain needs to inherit (DA choice, zkVM, EVM compatibility, soft confirmations) is not stated yet; it decides which crates are worth copying.
+- ~~What rea-chain needs to inherit (DA choice, zkVM, EVM compatibility, soft confirmations) is not stated yet.~~ Decided: Avail DA (not Celestia), SP1, EVM enabled, soft confirmations. See `TODO.md`, Decisions.
 - REA's binary-level view of the Rust crate graph was not produced. It needs `cargo auditable build -p sov-demo-rollup` and then `rea inspect-rust-binary` on the result.
 
 **Sources**

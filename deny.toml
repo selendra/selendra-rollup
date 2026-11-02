@@ -1,0 +1,48 @@
+# cargo-deny: https://embarkstudios.github.io/cargo-deny/
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []  # Every entry needs an issue link and a reason.
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# The allow-list anticipates upcoming dependencies; don't warn about unused entries.
+unused-allowed-license = "allow"
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",            # Boost Software License — NOT Business Source License (BUSL-1.1)
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+
+[licenses.private]
+# Our own crates are `publish = false`; their licensing is tracked in docs/provenance.md.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# Prefer rustls; keep OpenSSL out of the tree.
+deny = [{ name = "native-tls" }, { name = "openssl" }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"
+# Git deps must be pinned to a commit: a moved tag/branch could inject code.
+required-git-spec = "rev"

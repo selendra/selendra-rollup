@@ -1,0 +1,6 @@
+# Pinned to the same release as upstream Sovereign SDK (c7046e2) so copied code builds unchanged.
+# Bump deliberately: update CI image/cache keys and re-run the full test suite.
+[toolchain]
+channel = "1.93.0"
+components = ["rustfmt", "rust-src", "clippy"]
+profile = "minimal"

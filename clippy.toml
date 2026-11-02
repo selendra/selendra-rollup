@@ -1,0 +1,7 @@
+# Workspace-wide clippy config. Clippy reads only the nearest clippy.toml, so a crate
+# that needs stricter rules (e.g. STF-side crates banning HashMap, Phase 8) gets its
+# own clippy.toml that must repeat these settings.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true

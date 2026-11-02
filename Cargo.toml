@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+# Add each crate here as it is written (e.g. "crates/primitives", "crates/modules/bank").
+# Planned layout: TODO.md, Phase 1.
+members = []
+# The SP1 guest is built with the SP1 toolchain, not as part of this workspace.
+exclude = ["zk/sp1-guest"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+authors = ["Selendra"]
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+dead_code = "deny"
+non_ascii_idents = "deny" # Bad for readability and a homoglyph attack vector
+unused_must_use = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+[workspace.lints.clippy]
+debug_assert_with_mut_call = "deny"
+inefficient_to_string = "deny"
+map_flatten = "deny"
+manual_ok_or = "deny"
+doc_link_with_quotes = "deny"
+match_same_arms = "deny"
+semicolon_if_nothing_returned = "deny"
+float_arithmetic = "deny"     # Native and zkVM execution must agree bit-for-bit
+dbg_macro = "deny"
+todo = "deny"
+mem_forget = "deny"
+
+[workspace.dependencies]
+# Add `selendra-<name> = { path = "crates/<name>", default-features = false }` with each new crate.
+
+[profile.release]
+# Fail loudly on arithmetic bugs in production builds too.
+overflow-checks = true

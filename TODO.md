@@ -44,12 +44,12 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 
 ## Phase 1 — Repo & tooling
 
-- [ ] `git init`, Cargo workspace, `rust-toolchain.toml` (pin version), `rustfmt.toml`, `clippy.toml`
-- [ ] Crate layout: `crates/{primitives,interface,state,modules-api,macros,stf,kernel,modules/*,node,sequencer,db,adapters/{avail,mock-da,sp1,mock-zkvm},evm,cli}`
-- [ ] CI: fmt, clippy `-D warnings`, test, `cargo deny` (licenses/advisories), `cargo audit`, `cargo udeps`
-- [ ] `#![forbid(unsafe_code)]` everywhere except where justified
-- [ ] Track copied code: `docs/provenance.md` — file → upstream path + commit + what changed (needed for future upstream security patches)
-- [ ] Script to diff our copied files against upstream for security fixes
+- [x] `git init`, Cargo workspace, `rust-toolchain.toml` (pin version), `rustfmt.toml`, `clippy.toml` — Rust 1.93.0 (same as upstream), edition 2021
+- [ ] Crate layout: `crates/{primitives,interface,state,modules-api,macros,stf,kernel,modules/*,node,sequencer,db,adapters/{avail,mock-da,sp1,mock-zkvm},evm,cli}` — created one at a time when its code is written: add to `members` in `Cargo.toml`, use `[lints] workspace = true`, `#![forbid(unsafe_code)]` in the crate root
+- [x] CI: fmt, clippy `-D warnings`, test, `cargo deny` (licenses/advisories), `cargo audit`, `cargo udeps` — `.github/workflows/ci.yml`, same checks via `make ci`
+- [x] `#![forbid(unsafe_code)]` everywhere except where justified — workspace lint + attribute in every crate root
+- [x] Track copied code: `docs/provenance.md` — file → upstream path + commit + what changed (needed for future upstream security patches)
+- [x] Script to diff our copied files against upstream for security fixes — `scripts/upstream-diff.sh`
 
 ## Phase 2 — Core interface (the traits) 🔁
 
@@ -58,7 +58,7 @@ From `crates/rollup-interface`:
 - [ ] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf`
 - [ ] 🔁 `Zkvm`, `ZkvmHost`, `ZkvmGuest`, `ZkVerifier`, `OuterZkvmHost` → `::zk`
 - [ ] 🔁 `StateTransitionPublicData` (proof public outputs) ⚠️
-- [ ] ✍️ Strip what we don't need (Risc0, Celestia-specific bits, unused generics)
+- [ ] ✍️ Strip what we don't need (Risc0, Avail-specific bits, unused generics)
 - [ ] ✍️ Selendra `Spec`: `Da = AvailDaSpec`, `Address = MultiAddressEvm`, `InnerZkvm/OuterZkvm = SP1`, `CryptoSpec`
 
 ## Phase 3 — Crypto, primitives & addresses ⚠️
