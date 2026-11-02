@@ -58,7 +58,7 @@ From `crates/rollup-interface`:
 - [ ] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf`
 - [ ] 🔁 `Zkvm`, `ZkvmHost`, `ZkvmGuest`, `ZkVerifier`, `OuterZkvmHost` → `::zk`
 - [ ] 🔁 `StateTransitionPublicData` (proof public outputs) ⚠️
-- [ ] ✍️ Strip what we don't need (Risc0, Avail-specific bits, unused generics)
+- [ ] ✍️ Strip what we don't need (Risc0, Calestia-specific bits, unused generics)
 - [ ] ✍️ Selendra `Spec`: `Da = AvailDaSpec`, `Address = MultiAddressEvm`, `InnerZkvm/OuterZkvm = SP1`, `CryptoSpec`
 
 ## Phase 3 — Crypto, primitives & addresses ⚠️
