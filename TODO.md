@@ -44,7 +44,7 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 
 ## Phase 1 — Repo & tooling
 
-- [x] `git init`, Cargo workspace, `rust-toolchain.toml` (pin version), `rustfmt.toml`, `clippy.toml` — Rust 1.93.0 (same as upstream), edition 2021
+- [x] `git init`, Cargo workspace, `rust-toolchain.toml` (pin version), `rustfmt.toml`, `clippy.toml` — Rust 1.93.0 (same as upstream), edition 2024
 - [ ] Crate layout: `crates/{primitives,interface,state,modules-api,macros,stf,kernel,modules/*,node,sequencer,db,adapters/{avail,mock-da,sp1,mock-zkvm},evm,cli}` — created one at a time when its code is written: add to `members` in `Cargo.toml`, use `[lints] workspace = true`, `#![forbid(unsafe_code)]` in the crate root
 - [x] CI: fmt, clippy `-D warnings`, test, `cargo deny` (licenses/advisories), `cargo audit`, `cargo udeps` — `.github/workflows/ci.yml`, same checks via `make ci`
 - [x] `#![forbid(unsafe_code)]` everywhere except where justified — workspace lint + attribute in every crate root
@@ -54,7 +54,7 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 ## Phase 2 — Core interface (the traits) 🔁
 
 From `crates/rollup-interface`:
-- [ ] 🔁 `DaSpec`, `DaVerifier`, `BlobReaderTrait`, `DaService` → `selendra-interface::da`
+- [x] 🔁 `DaSpec`, `DaVerifier`, `BlobReaderTrait`, `DaService` → `selendra-interface::da` (state machine) + `::node::da` (native only)
 - [ ] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf`
 - [ ] 🔁 `Zkvm`, `ZkvmHost`, `ZkvmGuest`, `ZkVerifier`, `OuterZkvmHost` → `::zk`
 - [ ] 🔁 `StateTransitionPublicData` (proof public outputs) ⚠️

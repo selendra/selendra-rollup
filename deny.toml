@@ -5,7 +5,7 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []  # Every entry needs an issue link and a reason.
+ignore = []  # Every entry needs a reason. Keep in sync with .cargo/audit.toml.
 
 [licenses]
 version = 2
