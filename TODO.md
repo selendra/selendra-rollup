@@ -55,7 +55,7 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 
 From `crates/rollup-interface`:
 - [x] 🔁 `DaSpec`, `DaVerifier`, `BlobReaderTrait`, `DaService` → `selendra-interface::da` (state machine) + `::node::da` (native only)
-- [ ] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf`
+- [x] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf` (optimistic-mode parts stripped; `StateTransitionVerifier` + `ProofSender` come with `::zk`)
 - [ ] 🔁 `Zkvm`, `ZkvmHost`, `ZkvmGuest`, `ZkVerifier`, `OuterZkvmHost` → `::zk`
 - [ ] 🔁 `StateTransitionPublicData` (proof public outputs) ⚠️
 - [ ] ✍️ Strip what we don't need (Risc0, Calestia-specific bits, unused generics)

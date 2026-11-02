@@ -10,8 +10,14 @@ pub mod common;
 pub mod da;
 #[cfg(feature = "native")]
 pub mod node;
+pub mod stf;
+pub mod zk;
 
 pub use address::{BasicAddress, MaybeArbitrary};
+pub use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// A rollup transaction hash.
+pub type TxHash = common::HexHash;
 
 /// Useful third-party crate re-exports.
 pub mod reexports {

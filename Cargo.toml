@@ -54,6 +54,7 @@ proptest = { version = "1.5", default-features = false, features = ["std", "allo
 proptest-derive = "0.9"
 schemars = { version = "1.2", features = ["derive"] }
 serde = { version = "1.0.208", default-features = false, features = ["alloc", "derive"] }
+serde_with = { version = "3", default-features = false, features = ["alloc", "base64", "macros"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 test-strategy = "0.4.0"
 thiserror = "2"
