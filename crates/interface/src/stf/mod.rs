@@ -6,7 +6,10 @@
 
 mod batch;
 mod events;
+#[cfg(feature = "native")]
+mod proof_sender;
 mod transaction;
+mod verifier;
 
 use borsh::BorshDeserialize;
 use borsh::BorshSerialize;
@@ -15,10 +18,13 @@ use std::fmt::{Debug, Display};
 
 pub use batch::*;
 pub use events::*;
+#[cfg(feature = "native")]
+pub use proof_sender::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 pub use transaction::*;
+pub use verifier::StateTransitionVerifier;
 
 use crate::common::{HexHash, RollupHeight, SlotNumber};
 use crate::da::{DaSpec, RelevantBlobIters};
@@ -338,9 +344,12 @@ pub type ApplySlotOutput<Da: DaSpec, Stf: StateTransitionFunction<Da>> = ApplySl
 ///
 /// The STF is generic over a DA layer specification.
 pub trait StateTransitionFunction<Da: DaSpec> {
-    /// Root hash of state merkle tree
+    /// Root hash of state merkle tree. Borsh is required because it is part of the
+    /// proof's public output.
     type StateRoot: Serialize
         + DeserializeOwned
+        + BorshSerialize
+        + BorshDeserialize
         + Clone
         + AsRef<[u8]>
         + Debug
@@ -349,8 +358,9 @@ pub trait StateTransitionFunction<Da: DaSpec> {
         + Sync
         + 'static;
 
-    /// The address of the prover.
-    type Address: Serialize + DeserializeOwned + Clone + Debug;
+    /// The address of the prover. Borsh is required because it is part of the proof's
+    /// public output.
+    type Address: Serialize + DeserializeOwned + BorshSerialize + BorshDeserialize + Clone + Debug;
 
     /// The initial params of the rollup.
     type GenesisParams: GenesisParams;

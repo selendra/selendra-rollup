@@ -55,9 +55,9 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 
 From `crates/rollup-interface`:
 - [x] 🔁 `DaSpec`, `DaVerifier`, `BlobReaderTrait`, `DaService` → `selendra-interface::da` (state machine) + `::node::da` (native only)
-- [x] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf` (optimistic-mode parts stripped; `StateTransitionVerifier` + `ProofSender` come with `::zk`)
-- [ ] 🔁 `Zkvm`, `ZkvmHost`, `ZkvmGuest`, `ZkVerifier`, `OuterZkvmHost` → `::zk`
-- [ ] 🔁 `StateTransitionPublicData` (proof public outputs) ⚠️
+- [x] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf` (optimistic-mode parts stripped; incl. `StateTransitionVerifier`, native-only `ProofSender`)
+- [x] 🔁 `Zkvm`, `ZkvmHost`, `ZkvmGuest`, `ZkVerifier`, `OuterZkvmHost` → `::zk` (public outputs borsh-only; `CryptoSpec` comes with Phase 3; aggregation `circuit` with Phase 12)
+- [x] 🔁 `StateTransitionPublicData` (proof public outputs) ⚠️ — copied, borsh-encoded; ⚠️ review still open (Phase 14)
 - [ ] ✍️ Strip what we don't need (Risc0, Calestia-specific bits, unused generics)
 - [ ] ✍️ Selendra `Spec`: `Da = AvailDaSpec`, `Address = MultiAddressEvm`, `InnerZkvm/OuterZkvm = SP1`, `CryptoSpec`
 

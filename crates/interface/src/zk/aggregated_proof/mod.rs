@@ -1,11 +1,40 @@
-//! Types related to aggregated proofs.
+//! Defines types that are related to the `AggregatedProof`.
+
+/// Common types shared between the aggregated proof program and the host script.
+pub mod common;
+
+use core::marker::PhantomData;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::{StateTransitionPublicData, ZkVerifier};
 use crate::common::SlotNumber;
 use crate::da::DaSpec;
 use crate::zk::SerializedZkProof;
+
+/// Host-side interface for the outer zkVM that produces aggregated proofs.
+pub trait OuterZkvmHost: Clone + Send + Sync + 'static {
+    /// Aggregates per-block inner proofs into a single serialized aggregated proof.
+    fn run_proof_aggregation<
+        Address: Serialize + DeserializeOwned + Clone,
+        Da: DaSpec,
+        Root: Serialize + DeserializeOwned + Clone + PartialEq + core::fmt::Debug,
+    >(
+        &self,
+        headers_with_block_proofs: Vec<(Da::BlockHeader, BlockProof<Address, Da, Root>)>,
+    ) -> anyhow::Result<SerializedAggregatedProof>;
+}
+
+/// A single block's proof data, used to build an [`AggregatedProofPublicData`].
+#[derive(Clone)]
+pub struct BlockProof<Address, Da: DaSpec, Root> {
+    /// The raw proof bytes.
+    pub proof: SerializedZkProof,
+    /// The state transition public data for this block.
+    pub st: StateTransitionPublicData<Address, Da, Root>,
+}
 
 /// A code commitment hash used to identify ZK circuits (both inner and outer).
 ///
@@ -137,6 +166,53 @@ impl SerializedAggregatedProof {
             raw_proof: self.raw_aggregated_proof,
         }
     }
+}
+
+/// A serialized partial proof receipt.
+#[derive(
+    Debug, Eq, PartialEq, BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Default,
+)]
+pub struct SerializedPartialProofReceipt {
+    /// Serialized proof receipt.
+    pub raw_proof_receipt: Vec<u8>,
+}
+
+/// Validates an Aggregated Proof.
+pub struct AggregateProofVerifier<Vm: ZkVerifier> {
+    _vm: PhantomData<Vm>,
+    outer_proof_code_commitment: Vm::CodeCommitment,
+}
+
+impl<Vm: ZkVerifier> AggregateProofVerifier<Vm> {
+    /// Creates a new `AggregateProofVerifier`.
+    pub fn new(outer_proof_code_commitment: Vm::CodeCommitment) -> Self {
+        Self {
+            _vm: PhantomData,
+            outer_proof_code_commitment,
+        }
+    }
+
+    /// Verifies whether an [`SerializedAggregatedProof`] contains a valid proof.
+    pub fn verify<Address: BorshDeserialize, Da: DaSpec, Root: BorshDeserialize>(
+        &self,
+        proof_data: &SerializedAggregatedProof,
+    ) -> Result<AggregatedProofPublicData<Address, Da, Root>, Vm::Error> {
+        let public_data = Vm::verify_with_proof::<AggregatedProofPublicData<Address, Da, Root>>(
+            &proof_data.clone().to_serialized_zk_proof(),
+            &self.outer_proof_code_commitment,
+        )?;
+
+        Ok(public_data)
+    }
+}
+
+/// A DA block header bundled with its corresponding serialized proof.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+pub struct BlockHeaderWithProof<Da: crate::da::DaSpec> {
+    /// The DA layer block header associated with this proof.
+    pub da_block_header: Da::BlockHeader,
+    /// The serialized proof bytes.
+    pub proof: SerializedZkProof,
 }
 
 #[cfg(test)]
