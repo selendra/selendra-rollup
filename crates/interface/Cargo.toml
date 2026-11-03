@@ -14,7 +14,8 @@ async-trait = { workspace = true, optional = true }
 backon = { workspace = true, optional = true }
 borsh = { workspace = true, features = ["bytes"] }
 bytes = { workspace = true, features = ["serde"] }
-derive_more = { workspace = true, features = ["add", "as_ref", "display", "from_str"] }
+derive_more = { workspace = true, features = ["add", "as_ref", "display", "from", "from_str"] }
+digest = { workspace = true }
 hex = { workspace = true }
 # Proptest should be a dev-dependency, but those can't be optional
 proptest = { workspace = true, optional = true }

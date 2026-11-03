@@ -7,6 +7,7 @@
 
 mod address;
 pub mod common;
+pub mod crypto;
 pub mod da;
 #[cfg(feature = "native")]
 pub mod node;
@@ -21,5 +22,5 @@ pub type TxHash = common::HexHash;
 
 /// Useful third-party crate re-exports.
 pub mod reexports {
-    pub use {anyhow, schemars};
+    pub use {anyhow, digest, schemars};
 }

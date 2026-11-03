@@ -4,6 +4,7 @@ resolver = "2"
 # Planned layout: TODO.md, Phase 1.
 members = [
     "crates/interface",
+    "crates/primitives",
 ]
 # The SP1 guest is built with the SP1 toolchain, not as part of this workspace.
 exclude = ["zk/sp1-guest"]
@@ -38,6 +39,7 @@ mem_forget = "deny"
 [workspace.dependencies]
 # Add `selendra-<name> = { path = "crates/<name>", default-features = false }` with each new crate.
 selendra-interface = { path = "crates/interface", default-features = false }
+selendra-primitives = { path = "crates/primitives", default-features = false }
 
 # Use the newest releases. Exception: crates whose output is consensus-critical (encoding,
 # hashing, EVM) are pinned exactly (`=x.y.z`) and only upgraded deliberately.
@@ -48,13 +50,18 @@ backon = { version = "1.5.1", default-features = false, features = ["tokio-sleep
 borsh = { version = "=1.8.1", features = ["derive"] } # consensus-critical encoding: exact pin
 bytes = { version = "1.10", default-features = false }
 derive_more = { version = "2.0", default-features = false, features = ["std"] }
+# zkVM-patched: SP1 6.x guest patches exact versions. Upgrade only together with the SP1 patches.
+digest = { version = "0.10.7", default-features = false, features = ["alloc"] }
+ed25519-consensus = { version = "=2.1.0", default-features = false, features = ["std"] }
 hex = "0.4.3"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 proptest = { version = "1.5", default-features = false, features = ["std", "alloc"] }
 proptest-derive = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] } # ed25519-consensus 2.1 uses rand_core 0.6
 schemars = { version = "1.2", features = ["derive"] }
 serde = { version = "1.0.208", default-features = false, features = ["alloc", "derive"] }
 serde_with = { version = "3", default-features = false, features = ["alloc", "base64", "macros"] }
+sha2 = { version = "=0.10.9", default-features = false } # zkVM-patched (SP1), see digest
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 test-strategy = "0.4.0"
 thiserror = "2"

@@ -1,0 +1,32 @@
+[package]
+name = "selendra-primitives"
+description = "Selendra primitives: key types and signature schemes, and later addresses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+borsh = { workspace = true }
+ed25519-consensus = { workspace = true }
+hex = { workspace = true }
+rand_core = { workspace = true, optional = true }
+schemars = { workspace = true }
+selendra-interface = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+postcard = { workspace = true }
+selendra-primitives = { path = ".", features = ["native"] }
+serde_json = { workspace = true }
+
+[features]
+default = []
+# Node-only code (never in the zk guest): private keys and key generation.
+native = ["dep:rand_core", "selendra-interface/native"]
+
+[lints]
+workspace = true

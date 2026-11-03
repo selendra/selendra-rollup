@@ -1,0 +1,90 @@
+//! Cryptographic primitive traits used throughout Selendra. Concrete key types live in
+//! `selendra-primitives`.
+mod signatures;
+pub use signatures::*;
+
+use crate::common::HexHash;
+
+/// Type that represents an identifier for an authorizer of the transaction.
+/// The credential is a [`HexHash`].
+/// For example, this can be a padded EVM address or a hash of a rollup public key.
+#[derive(
+    borsh::BorshDeserialize,
+    borsh::BorshSerialize,
+    serde::Serialize,
+    serde::Deserialize,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Clone,
+    Copy,
+    derive_more::Display,
+    derive_more::FromStr,
+    derive_more::From,
+)]
+#[cfg_attr(
+    feature = "arbitrary",
+    derive(arbitrary::Arbitrary, proptest_derive::Arbitrary)
+)]
+pub struct CredentialId(pub HexHash);
+
+impl CredentialId {
+    /// Make new `CredentialId`
+    pub fn from_bytes(value: [u8; 32]) -> Self {
+        Self(HexHash::new(value))
+    }
+}
+
+impl schemars::JsonSchema for CredentialId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CredentialId".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        HexHash::json_schema(generator)
+    }
+}
+
+impl From<[u8; 32]> for CredentialId {
+    fn from(value: [u8; 32]) -> Self {
+        Self(HexHash::new(value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use super::*;
+
+    fn check_str_and_back(credential_id: CredentialId) {
+        let s = credential_id.to_string();
+        let credential_id_recovered = CredentialId::from_str(&s).unwrap();
+        assert_eq!(credential_id, credential_id_recovered);
+    }
+
+    #[test]
+    fn test_hash_str_and_back_simple() {
+        for i in 0..1 {
+            let credential_id = CredentialId(HexHash::new([i as u8; 32]));
+            check_str_and_back(credential_id);
+        }
+    }
+
+    #[test]
+    fn test_removed_0x_prefix() {
+        let credential_id = CredentialId(HexHash::new([10u8; 32]));
+        let s = credential_id.to_string().replace("0x", "");
+        let result = CredentialId::from_str(&s);
+        assert!(result.is_ok());
+        assert_eq!(credential_id, result.unwrap());
+    }
+
+    #[test_strategy::proptest]
+    fn test_arbitrary_hash_str_and_back(credential_id: CredentialId) {
+        check_str_and_back(credential_id);
+    }
+}

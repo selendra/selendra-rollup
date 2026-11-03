@@ -63,7 +63,7 @@ From `crates/rollup-interface`:
 
 ## Phase 3 — Crypto, primitives & addresses ⚠️
 
-- [ ] 🔁 Crypto spec, key types, signature verify wrappers (audited crates: `ed25519-consensus`, `k256`, `sha2`); re-add `ZkVerifier::CryptoSpec` (removed in Phase 2, without `sovereign_admin_pubkey`)
+- [x] 🔁 Crypto spec, key types, signature verify wrappers (audited crates: `ed25519-consensus`, `k256`, `sha2`); re-add `ZkVerifier::CryptoSpec` (removed in Phase 2, without `sovereign_admin_pubkey`) — traits in `selendra-interface::crypto`, ed25519 + `Ed25519CryptoSpec` in `selendra-primitives`; `sha2 =0.10.9` / `ed25519-consensus =2.1.0` pinned for SP1 patches; secp256k1 (`k256`) comes with `EthereumPublicKey` below
 - [ ] 🔁 `Address` (28-byte, bech32m) from `sov-modules-api/src/common/address.rs`
 - [ ] ✍️ Set `ADDRESS_PREFIX = "sel"` in `constants.toml`; rename `sov` in schemas, JSON schema pattern, CLI, docs, TS clients
 - [ ] ✍️ Update test vectors: `[1..=28]` → `sel1…`, `[11; 28]` → `sel1…`; add the RFC 8032 key vector

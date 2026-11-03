@@ -16,12 +16,34 @@ pub mod aggregated_proof;
 use core::fmt::Debug;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use digest::Digest;
+use digest::typenum::U32;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::common::SlotNumber;
+use crate::crypto::{PublicKey, Signature};
 use crate::da::{DaSpec, RelevantBlobs, RelevantProofs};
 use crate::zk::aggregated_proof::SerializedAggregatedProof;
+
+/// The `CryptoSpec` trait configures the cryptographic primitives used by a particular instance of a rollup.
+/// This trait implementation is meant to be provided by the `Zkvm`.
+pub trait CryptoSpec: PartialEq + Debug + Clone + Send + Sync + 'static {
+    /// The private key used for digital signatures
+    #[cfg(feature = "native")]
+    type PrivateKey: crate::crypto::PrivateKey<PublicKey = Self::PublicKey, Signature = Self::Signature>;
+
+    /// The public key used for digital signatures
+    type PublicKey: PublicKey;
+
+    /// The hasher preferred by the rollup. Selendra uses SHA-256 everywhere.
+    type Hasher: Digest<OutputSize = U32> + Send + Sync + 'static;
+
+    /// The digital signature scheme used by the rollup.
+    type Signature: Signature<PublicKey = Self::PublicKey>
+        + serde::Serialize
+        + for<'a> serde::Deserialize<'a>;
+}
 
 /// A complete Zkvm implementation.
 pub trait Zkvm: Default + Clone + Send + Sync + 'static {
@@ -105,6 +127,9 @@ pub trait CodeCommitmentTrait:
 pub trait ZkVerifier: Default + Clone + Send + Sync + 'static {
     /// A commitment to the zkVM program which is being proven
     type CodeCommitment: CodeCommitmentTrait;
+
+    /// Defines the cryptographic operations provided natively by the Zkvm.
+    type CryptoSpec: CryptoSpec;
 
     /// The error type which is returned when a proof fails to verify
     type Error: Debug;
