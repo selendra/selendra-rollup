@@ -1,6 +1,6 @@
 //! Transaction batch types and utilities.
 //!
-//! This module defines the core transaction types used throughout the Sovereign SDK,
+//! This module defines the core transaction types used throughout Selendra,
 //! including fully authenticated transactions ready for DA layer submission.
 
 use borsh::{BorshDeserialize, BorshSerialize};

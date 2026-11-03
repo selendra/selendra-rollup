@@ -1,5 +1,5 @@
-//! This module is the core of the Sovereign SDK. It defines the traits and types that
-//! allow the SDK to run the "business logic" of any application generically.
+//! This module is the core of Selendra's interface. It defines the traits and types that
+//! allow the chain's "business logic" to run generically over DA layers and zkVMs.
 //!
 //! The most important trait in this module is the [`StateTransitionFunction`], which defines the
 //! main event loop of the rollup.
@@ -30,31 +30,6 @@ use crate::common::{HexHash, RollupHeight, SlotNumber};
 use crate::da::{DaSpec, RelevantBlobIters};
 use crate::zk::StateTransitionPublicData;
 use crate::zk::aggregated_proof::{AggregatedProofPublicData, SerializedAggregatedProof};
-
-/// The configuration of a full node of the rollup which creates zk proofs.
-pub struct ProverConfig;
-/// The configuration used to initialize the "Verifier" of the state transition function
-/// which runs inside of the zkVM.
-pub struct ZkConfig;
-/// The configuration of a standard full node of the rollup which does not create zk proofs
-pub struct StandardConfig;
-
-/// A special marker trait which allows us to define different rollup configurations. There are
-/// only 3 possible instantiations of this trait: [`ProverConfig`], [`ZkConfig`], and [`StandardConfig`].
-pub trait StateTransitionConfig: sealed::Sealed {}
-impl StateTransitionConfig for ProverConfig {}
-impl StateTransitionConfig for ZkConfig {}
-impl StateTransitionConfig for StandardConfig {}
-
-// https://rust-lang.github.io/api-guidelines/future-proofing.html
-mod sealed {
-    use super::{ProverConfig, StandardConfig, ZkConfig};
-
-    pub trait Sealed {}
-    impl Sealed for ProverConfig {}
-    impl Sealed for ZkConfig {}
-    impl Sealed for StandardConfig {}
-}
 
 /// A receipt for a batch of transactions. These receipts are stored in the rollup's database
 /// and may be queried via RPC. Batch receipts are generic over a type `BatchReceiptContents` which the rollup

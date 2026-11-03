@@ -58,12 +58,12 @@ From `crates/rollup-interface`:
 - [x] 🔁 `StateTransitionFunction`, `ApplySlotOutput`, `ExecutionContext`, tx receipts/outcomes → `::stf` (optimistic-mode parts stripped; incl. `StateTransitionVerifier`, native-only `ProofSender`)
 - [x] 🔁 `Zkvm`, `ZkvmHost`, `ZkvmGuest`, `ZkVerifier`, `OuterZkvmHost` → `::zk` (public outputs borsh-only; `CryptoSpec` comes with Phase 3; aggregation `circuit` with Phase 12)
 - [x] 🔁 `StateTransitionPublicData` (proof public outputs) ⚠️ — copied, borsh-encoded; ⚠️ review still open (Phase 14)
-- [ ] ✍️ Strip what we don't need (Risc0, Calestia-specific bits, unused generics)
-- [ ] ✍️ Selendra `Spec`: `Da = AvailDaSpec`, `Address = MultiAddressEvm`, `InnerZkvm/OuterZkvm = SP1`, `CryptoSpec`
+- [x] ✍️ Strip what we don't need (Risc0, Celestia-specific bits, unused generics) — never copied Risc0/Celestia/optimistic/light client; removed dead `StateTransitionConfig` markers + `CheckedMath`; upstream wording → Selendra/Avail
+- Selendra `Spec` moved to Phase 5 (needs the `Spec` trait, `MultiAddressEvm` from Phase 3, Avail + SP1 from Phase 9)
 
 ## Phase 3 — Crypto, primitives & addresses ⚠️
 
-- [ ] 🔁 Crypto spec, key types, signature verify wrappers (audited crates: `ed25519-consensus`, `k256`, `sha2`)
+- [ ] 🔁 Crypto spec, key types, signature verify wrappers (audited crates: `ed25519-consensus`, `k256`, `sha2`); re-add `ZkVerifier::CryptoSpec` (removed in Phase 2, without `sovereign_admin_pubkey`)
 - [ ] 🔁 `Address` (28-byte, bech32m) from `sov-modules-api/src/common/address.rs`
 - [ ] ✍️ Set `ADDRESS_PREFIX = "sel"` in `constants.toml`; rename `sov` in schemas, JSON schema pattern, CLI, docs, TS clients
 - [ ] ✍️ Update test vectors: `[1..=28]` → `sel1…`, `[11; 28]` → `sel1…`; add the RFC 8032 key vector
@@ -94,6 +94,8 @@ From `sov-state`, `sov-db`:
 
 From `sov-modules-api`, `sov-modules-macros`:
 - [ ] 🔁 `Module` trait, `ModuleInfo`, `Context`, `TxState`, events, errors
+- [ ] 🔁 `Spec` trait (`sov-modules-api/src/module/spec.rs`)
+- [ ] ✍️ Selendra `Spec`: generic `SelendraSpec<Da, InnerZkvm, OuterZkvm>` with `Address = MultiAddressEvm`, `CryptoSpec`; mock DA + mock zkVM instance for M1; `Da = AvailDaSpec`, `InnerZkvm/OuterZkvm = SP1` instance in Phase 9
 - [ ] 🔁 Derive macros: `ModuleInfo`, `Genesis`, `DispatchCall`, `Event`, `Hooks`, `MessageCodec`
 - [ ] 🔁 Hooks: pre/post dispatch tx, begin/end block, finalize
 - [ ] 🔁 Gas metering (`SlotGasMeter`, per-tx gas, base fee)

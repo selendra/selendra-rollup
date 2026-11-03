@@ -12,48 +12,6 @@ use tokio::sync::oneshot;
 use crate::common::HexHash;
 use crate::da::{BlockHeaderTrait, DaSpec, DaVerifier, RelevantBlobs, RelevantProofs, Time};
 
-/// Perform a checked arithmetic, returning None if the result is invalid.
-pub trait CheckedMath<Rhs = Self> {
-    /// The output type of arithmetic operations
-    type Output;
-
-    /// Performs checked multiplication, returning None if the result would overflow.
-    fn checked_mul(&self, rhs: Rhs) -> Option<Self::Output>;
-    /// Performs checked division, returning None if the caller attempts divide by zero or if the calculation overflows.
-    fn checked_div(&self, rhs: Rhs) -> Option<Self::Output>;
-    /// Performs checked subtraction, returning None if the result would underflow.
-    fn checked_sub(&self, rhs: Rhs) -> Option<Self::Output>;
-    /// Performs checked addition, returning None if the result would overflow.
-    fn checked_add(&self, rhs: Rhs) -> Option<Self::Output>;
-}
-
-macro_rules! impl_checked_math_primitive {
-    ($($t:ty),*) => {
-        $(impl CheckedMath for $t {
-            type Output = Self;
-
-            fn checked_mul(&self, rhs: Self) -> Option<Self::Output> {
-                <$t>::checked_mul(*self, rhs)
-            }
-
-            fn checked_div(&self, rhs: Self) -> Option<Self::Output> {
-                <$t>::checked_div(*self, rhs)
-            }
-
-            fn checked_sub(&self, rhs: Self) -> Option<Self::Output> {
-                <$t>::checked_sub(*self, rhs)
-            }
-
-            fn checked_add(&self, rhs: Self) -> Option<Self::Output> {
-                <$t>::checked_add(*self, rhs)
-            }
-        })*
-    };
-}
-
-impl_checked_math_primitive!(u8, u16, u32, u64, u128, usize);
-impl_checked_math_primitive!(i8, i16, i32, i64, i128, isize);
-
 /// The [`MaybeRetryable`] enum can be returned from a fallible function to
 /// determine whether it can re-attempted or not.
 #[derive(Debug, thiserror::Error)]

@@ -206,7 +206,7 @@ pub trait BlobReaderTrait: Serialize + DeserializeOwned + Send + Sync + 'static 
     /// valid rollup payload they claim** (e.g. a compressed envelope whose authenticated
     /// bytes don't decompress to the declared length, or aren't a canonical encoding).
     ///
-    /// It exists because the generic consumer (`sov-blob-storage`'s accept path) otherwise
+    /// It exists because the generic consumer (the blob-storage module's accept path) otherwise
     /// cannot tell this apart from a prover *withholding* bytes — both surface as fewer
     /// rollup bytes than [`Self::total_len`] — yet the two need opposite handling:
     /// undecodable content is the *sender's* fault (slash/discard the blob), whereas
