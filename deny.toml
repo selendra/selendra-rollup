@@ -5,7 +5,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []  # Every entry needs a reason. Keep in sync with .cargo/audit.toml.
+# Every entry needs a reason. Keep in sync with .cargo/audit.toml.
+ignore = [
+  # `paste` is unmaintained (no fix exists). Compile-time proc-macro only, no runtime code.
+  # Pulled in by alloy-primitives, which the EVM (revm) needs anyway. Re-check when alloy drops it.
+  { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro via alloy-primitives, see comment" },
+]
 
 [licenses]
 version = 2

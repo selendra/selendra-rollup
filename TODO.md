@@ -15,7 +15,7 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 | DA layer | **Avail** | Chosen for KZG validity proofs + DAS. Sovereign adapter is a stub → we finish it (Phase 9) |
 | EVM | **Enabled by default** (`sov-evm`, revm) | Ethereum JSON-RPC + MetaMask/Foundry support from day one |
 | Address type | **`MultiAddressEvm`** = `Standard` (28-byte, bech32m) or `Vm` (20-byte `0x…`) | Standard prefix **`sel`** instead of `sov` |
-| Address prefix | `ADDRESS_PREFIX = { const = "sel" }` in `constants.toml` | Must be set **before genesis**; e.g. `sel16adfsqvzky9t042tlmfujeq88g8wzuhnm2nzxfd0qgdxsudeldf` |
+| Address prefix | `ADDRESS_PREFIX = "sel"` — Rust constant in `selendra-primitives::address` (not overridable config) | Must be set **before genesis**; e.g. `sel16adfsqvzky9t042tlmfujeq88g8wzuhnm2nzxfd0qgdxsudeldf` |
 | Keys | ed25519 (`sel1…`) + secp256k1 (`0x…`, EIP-712 / Ethereum txs) | |
 | zkVM | SP1 (only adapter with proof aggregation) | Has BLS12-381, keccak, ed25519 precompiles |
 | Sequencing | **Preferred sequencer, 1 s soft blocks, lazy DA posting** | Post to Avail when `max_txs` reached OR `max_age` elapsed; **never post when empty** |
@@ -64,12 +64,12 @@ From `crates/rollup-interface`:
 ## Phase 3 — Crypto, primitives & addresses ⚠️
 
 - [x] 🔁 Crypto spec, key types, signature verify wrappers (audited crates: `ed25519-consensus`, `k256`, `sha2`); re-add `ZkVerifier::CryptoSpec` (removed in Phase 2, without `sovereign_admin_pubkey`) — traits in `selendra-interface::crypto`, ed25519 + `Ed25519CryptoSpec` in `selendra-primitives`; `sha2 =0.10.9` / `ed25519-consensus =2.1.0` pinned for SP1 patches; secp256k1 (`k256`) comes with `EthereumPublicKey` below
-- [ ] 🔁 `Address` (28-byte, bech32m) from `sov-modules-api/src/common/address.rs`
-- [ ] ✍️ Set `ADDRESS_PREFIX = "sel"` in `constants.toml`; rename `sov` in schemas, JSON schema pattern, CLI, docs, TS clients
-- [ ] ✍️ Update test vectors: `[1..=28]` → `sel1…`, `[11; 28]` → `sel1…`; add the RFC 8032 key vector
-- [ ] ✍️ Reject `sov1…` addresses (wrong HRP) — test it
-- [ ] 🔁 `MultiAddress<EthereumAddress>` + `EthereumAddress` + `EthereumPublicKey` from `sov-address` (feature `evm`)
-- [ ] ✍️ Test `Standard`/`Vm` parsing: 28 bytes vs 20 bytes, `sel` prefix vs `0x`
+- [x] 🔁 `Address` (28-byte, bech32m) from `sov-modules-api/src/common/address.rs` — `selendra-primitives::Address`; strict canonical decoding (upstream accepted extra padding symbols / non-zero padding bits); `Base58Address` dropped
+- [x] ✍️ Set `ADDRESS_PREFIX = "sel"` in `constants.toml`; rename `sov` in schemas, JSON schema pattern, CLI, docs, TS clients — Rust const instead of `constants.toml`; JSON schema `^sel1[bech32 charset]{51}$`; docs already `sel1`; CLI + TS clients don't exist yet (Phase 13 must use `sel`)
+- [x] ✍️ Update test vectors: `[1..=28]` → `sel1…`, `[11; 28]` → `sel1…`; add the RFC 8032 key vector — cross-checked with an independent BIP-350 encoder; plus a test for the team genesis address
+- [x] ✍️ Reject `sov1…` addresses (wrong HRP) — test it
+- [x] 🔁 `MultiAddress<EthereumAddress>` + `EthereumAddress` + `EthereumPublicKey` from `sov-address` (feature `evm`) — in `selendra-primitives`, always on; no `From<CredentialId>` (keys own accounts); canonical secp256k1 keys/low-S signatures; `k256` 0.14 (advisory)
+- [x] ✍️ Test `Standard`/`Vm` parsing: 28 bytes vs 20 bytes, `sel` prefix vs `0x` — plus team genesis accounts (`sel1fs6…`, `0x02f9…`) pinned in tests
 - [ ] ✍️ Chain ID + domain separation in every signed message (prevent cross-chain replay)
 - [ ] 🔁 Borsh serialization conventions; ✍️ fuzz all decoders (`cargo fuzz`)
 - [ ] ✍️ No-panic review of all parsing code
@@ -232,6 +232,7 @@ From `sov-modules-stf-blueprint`, `sov-kernels`, `sov-capabilities`:
 
 ### SP1
 - [ ] 🔁 SP1 adapter + guest program (`zk/sp1-guest`) ⚠️
+- [ ] ✍️ Re-check SP1 patches vs our pins: `k256` 0.14 (SP1 secp256k1 patch targets 0.13.4, which has RUSTSEC-2026-0387), `sha2 =0.10.9` + 0.9.9 (via `ed25519-consensus`), `ed25519-consensus =2.1.0`, `tiny-keccak` (alloy keccak); `getrandom` 0.4 reaches the guest via `k256` → `rfc6979` → `crypto-bigint` defaults
 - [ ] ✍️ Verify guest uses identical STF/runtime as native (same crate, feature-gated)
 
 ## Phase 10 — Full node
