@@ -26,8 +26,9 @@ pub struct TransactionReceipt<T: TxReceiptContents> {
     pub tx_hash: TxHash,
     /// The full transaction data including sequencing metadata, if it should be persisted
     /// in the database.
-    /// Skip serialization because it is unnecessary over the wire.
-    #[serde(skip_serializing)]
+    /// Skipped by serde (unnecessary over the wire). Skipped in both directions: skipping only
+    /// serialization would break round-trips in non-self-describing formats such as postcard.
+    #[serde(skip)]
     pub body_to_save: Option<FullyBakedTx>,
     /// The events output by this transaction
     pub events: Vec<StoredEvent>,

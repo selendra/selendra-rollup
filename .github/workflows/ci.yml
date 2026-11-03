@@ -5,6 +5,8 @@ on:
     branches: [main, dev]
   pull_request: {}
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * *" # nightly: long fuzz run
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,6 +35,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  # The zk guest builds without `native`: lint that configuration, and make sure no OS
+  # randomness (`getrandom`) reaches it. No `--all-targets`: tests turn `native` on.
+  guest:
+    runs-on: ubuntu-24.04
+    if: hashFiles('crates/**/Cargo.toml') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: make guest
+
   test:
     runs-on: ubuntu-24.04
     if: hashFiles('crates/**/Cargo.toml') != ''
@@ -41,6 +54,16 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --locked
+
+  # The SP1 guest is 32-bit (`usize` = 32 bits): run the tests with a 32-bit `usize` too.
+  test-32bit:
+    runs-on: ubuntu-24.04
+    if: hashFiles('crates/**/Cargo.toml') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: make test32
 
   deny:
     runs-on: ubuntu-24.04
@@ -74,3 +97,23 @@ jobs:
       - run: cargo +nightly udeps --workspace --all-targets --all-features --locked
         env:
           RUSTFLAGS: "" # nightly may add new warnings unrelated to unused deps
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    if: hashFiles('crates/**/Cargo.toml') != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [addresses, keys, tx_decoding]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # `+nightly`: rust-toolchain.toml pins stable, and cargo-fuzz needs nightly flags.
+      # Short smoke run on every push; 30 minutes per target on the nightly schedule.
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && 1800 || 60 }}
+        working-directory: fuzz
+        env:
+          RUSTFLAGS: ""

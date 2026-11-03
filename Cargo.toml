@@ -6,8 +6,8 @@ members = [
     "crates/interface",
     "crates/primitives",
 ]
-# The SP1 guest is built with the SP1 toolchain, not as part of this workspace.
-exclude = ["zk/sp1-guest"]
+# Built separately: the SP1 guest with the SP1 toolchain, fuzz targets with nightly `cargo fuzz`.
+exclude = ["zk/sp1-guest", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -43,22 +43,31 @@ selendra-primitives = { path = "crates/primitives", default-features = false }
 
 # Use the newest releases. Exception: crates whose output is consensus-critical (encoding,
 # hashing, EVM) are pinned exactly (`=x.y.z`) and only upgraded deliberately.
-alloy-primitives = { version = "1.7", default-features = false, features = ["std"] } # keccak via tiny-keccak (SP1-patched)
+# keccak256 (addresses, secp256k1 message hash) is consensus-critical: exact pin. The `tiny-keccak`
+# feature selects the SP1-patched backend (the default backend is `sha3` 0.11, which SP1 does not patch).
+alloy-primitives = { version = "=1.7.3", default-features = false, features = ["std", "tiny-keccak"] }
 anyhow = "1.0.95"
 arbitrary = { version = "1.3.2", features = ["derive"] }
 async-trait = "0.1.81"
+base64 = { version = "0.23", default-features = false, features = ["alloc"] } # strict (canonical) decoding; serde_with's Base64 ignores padding
 bech32 = "0.12"
 backon = { version = "1.5.1", default-features = false, features = ["tokio-sleep"] }
-borsh = { version = "=1.8.1", features = ["derive"] } # consensus-critical encoding: exact pin
+# Consensus-critical encoding: exact pin. `de_strict_order` makes `BTreeMap`/`BTreeSet` decoding
+# reject unsorted or duplicate keys (otherwise one map has many encodings).
+borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 bytes = { version = "1.10", default-features = false }
 derive_more = { version = "2.0", default-features = false, features = ["std"] }
 # zkVM-patched: SP1 6.x guest patches exact versions. Upgrade only together with the SP1 patches.
 digest = { version = "0.10.7", default-features = false, features = ["alloc"] }
 ed25519-consensus = { version = "=2.1.0", default-features = false, features = ["std"] }
+# The curve crate behind ed25519-consensus 2.1.0 (same version, so no second copy); SP1-patched.
+curve25519-dalek-ng = { version = "=4.1.1", default-features = false, features = ["u64_backend"] } # no `std`: it pulls getrandom
 hex = "0.4.3"
-# 0.14, not the 0.13.4 that SP1's secp256k1 patch targets: 0.13 pulls crypto-bigint 0.5 with
-# RUSTSEC-2026-0387 (timing leaks when signing). Re-check SP1 patch support in Phase 9.
-k256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
+# Signature validity is consensus-critical: exact pin. 0.14, not the 0.13.4 that SP1's secp256k1
+# patch targets: 0.13 pulls crypto-bigint 0.5 with RUSTSEC-2026-0387 (timing leaks when signing).
+# Re-check SP1 patch support in Phase 9. No `std`: it turns on `getrandom`, which must not reach
+# the zk guest (randomness is enabled only by `selendra-primitives/native`).
+k256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 proptest = { version = "1.5", default-features = false, features = ["std", "alloc"] }
 proptest-derive = "0.9"

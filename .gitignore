@@ -2,3 +2,7 @@
 /zk/sp1-guest/target
 *.key
 provenance.md
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

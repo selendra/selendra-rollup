@@ -8,6 +8,7 @@
 use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use curve25519_dalek_ng::edwards::CompressedEdwardsY;
 use ed25519_consensus::{Signature, VerificationKey};
 use schemars::JsonSchema;
 use selendra_interface::common::HexString;
@@ -18,7 +19,28 @@ pub const PUBLIC_KEY_LENGTH: usize = 32;
 /// Length of an ed25519 signature in bytes.
 pub const SIGNATURE_LENGTH: usize = 64;
 
-/// An ed25519 public key. Decoding checks that the bytes are a valid curve point.
+/// Why a 32-byte string is not an accepted ed25519 public key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidEd25519PublicKey {
+    /// The bytes do not decode to a curve point.
+    #[error("not a valid ed25519 curve point")]
+    NotAPoint,
+    /// The point is valid but these bytes are not its canonical encoding (`y >= p`, or the
+    /// sign bit set on `x = 0`).
+    #[error("non-canonical ed25519 public key encoding")]
+    NonCanonical,
+    /// The point has small order. Under ZIP-215 (cofactored) verification anyone can
+    /// produce a valid signature for such a key, for any message.
+    #[error("small-order ed25519 public key")]
+    SmallOrder,
+}
+
+/// An ed25519 public key.
+///
+/// Decoding accepts only the canonical encoding of a curve point that is not of small order,
+/// so every key has exactly one byte string (and one address), and nobody can sign for a key
+/// without its private key. `ed25519-consensus` alone accepts both (ZIP-215 is a rule for
+/// *signatures*; it does not make key bytes unique).
 #[derive(PartialEq, Eq, Hash, Clone, Debug, PartialOrd, Ord)]
 pub struct Ed25519PublicKey {
     pub_key: VerificationKey,
@@ -30,11 +52,20 @@ impl Ed25519PublicKey {
         self.pub_key.as_bytes()
     }
 
-    /// Decodes a public key, checking that the bytes are a valid curve point.
-    pub fn from_bytes(bytes: [u8; PUBLIC_KEY_LENGTH]) -> Result<Self, ed25519_consensus::Error> {
-        Ok(Self {
-            pub_key: VerificationKey::try_from(bytes)?,
-        })
+    /// Decodes a public key: a canonically encoded curve point that is not of small order.
+    pub fn from_bytes(bytes: [u8; PUBLIC_KEY_LENGTH]) -> Result<Self, InvalidEd25519PublicKey> {
+        let point = CompressedEdwardsY(bytes)
+            .decompress()
+            .ok_or(InvalidEd25519PublicKey::NotAPoint)?;
+        if point.compress().to_bytes() != bytes {
+            return Err(InvalidEd25519PublicKey::NonCanonical);
+        }
+        if point.is_small_order() {
+            return Err(InvalidEd25519PublicKey::SmallOrder);
+        }
+        let pub_key =
+            VerificationKey::try_from(bytes).map_err(|_| InvalidEd25519PublicKey::NotAPoint)?;
+        Ok(Self { pub_key })
     }
 }
 
@@ -84,7 +115,8 @@ impl BorshDeserialize for Ed25519PublicKey {
     }
 }
 
-/// JSON: `0x`-prefixed hex (the prefix is optional when parsing). Binary formats: raw bytes.
+/// JSON: `0x`-prefixed lowercase hex. Binary serde: a length-prefixed byte sequence.
+/// Borsh: the raw bytes.
 impl serde::Serialize for Ed25519PublicKey {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serde::Serialize::serialize(&HexString(*self.bytes()), serializer)
@@ -189,7 +221,8 @@ impl selendra_interface::crypto::Signature for Ed25519Signature {
     }
 }
 
-/// JSON: `0x`-prefixed hex (the prefix is optional when parsing). Binary formats: raw bytes.
+/// JSON: `0x`-prefixed lowercase hex. Binary serde: a length-prefixed byte sequence.
+/// Borsh: the raw bytes.
 impl serde::Serialize for Ed25519Signature {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serde::Serialize::serialize(&HexString(self.0), serializer)
@@ -318,6 +351,7 @@ mod private_key {
 
 #[cfg(test)]
 mod tests {
+    use curve25519_dalek_ng::edwards::CompressedEdwardsY;
     use selendra_interface::crypto::{PrivateKey, PublicKey, Signature};
 
     use super::*;
@@ -406,7 +440,89 @@ mod tests {
         assert!(
             serde_json::from_str::<Ed25519PublicKey>(&format!("\"{}\"", HexString(bad))).is_err()
         );
-        assert!(Ed25519PublicKey::from_str(&hex::encode(bad)).is_err());
+        assert!(Ed25519PublicKey::from_str(&HexString(bad).to_string()).is_err());
+    }
+
+    fn assert_rejected_everywhere(bytes: [u8; PUBLIC_KEY_LENGTH], why: InvalidEd25519PublicKey) {
+        assert_eq!(
+            Ed25519PublicKey::from_bytes(bytes),
+            Err(why),
+            "{}",
+            hex::encode(bytes)
+        );
+        assert!(Ed25519PublicKey::try_from(bytes.as_slice()).is_err());
+        assert!(borsh::from_slice::<Ed25519PublicKey>(&bytes).is_err());
+        let s = HexString(bytes).to_string();
+        assert!(serde_json::from_str::<Ed25519PublicKey>(&format!("\"{s}\"")).is_err());
+        assert!(Ed25519PublicKey::from_str(&s).is_err());
+    }
+
+    /// Canonical encodings of the 8 small-order points. With a small-order key, the signature
+    /// `R = identity, s = 0` verifies for every message under ZIP-215, so anyone could sign.
+    const SMALL_ORDER: [&str; 8] = [
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+    ];
+
+    #[test]
+    fn small_order_public_keys_are_rejected() {
+        for hex_point in SMALL_ORDER {
+            let bytes: [u8; 32] = hex::decode(hex_point).unwrap().try_into().unwrap();
+            let point = CompressedEdwardsY(bytes).decompress().unwrap();
+            assert!(point.is_small_order() && point.compress().to_bytes() == bytes);
+
+            // ed25519-consensus alone accepts the key and the forged signature.
+            let vk = VerificationKey::try_from(bytes).unwrap();
+            let mut forged = [0u8; SIGNATURE_LENGTH];
+            forged[0] = 1;
+            assert!(
+                vk.verify(&ed25519_consensus::Signature::from(forged), b"any message")
+                    .is_ok()
+            );
+
+            assert_rejected_everywhere(bytes, InvalidEd25519PublicKey::SmallOrder);
+        }
+    }
+
+    #[test]
+    fn non_canonical_public_keys_are_rejected() {
+        // y = p + d for d < 19 (y >= p), with either sign bit; plus the sign bit set on the
+        // two x = 0 points (y = 1 and y = -1). All of these that decode are non-canonical.
+        let mut encodings = Vec::new();
+        for d in 0u8..19 {
+            let mut y = [0xffu8; 32];
+            y[0] = 0xed + d;
+            y[31] = 0x7f;
+            encodings.push(y);
+            y[31] = 0xff;
+            encodings.push(y);
+        }
+        for hex_point in [SMALL_ORDER[0], SMALL_ORDER[1]] {
+            let mut bytes: [u8; 32] = hex::decode(hex_point).unwrap().try_into().unwrap();
+            bytes[31] |= 0x80;
+            encodings.push(bytes);
+        }
+
+        let mut decodable = 0;
+        for bytes in encodings {
+            match CompressedEdwardsY(bytes).decompress() {
+                Some(point) => {
+                    decodable += 1;
+                    assert_ne!(point.compress().to_bytes(), bytes);
+                    assert!(VerificationKey::try_from(bytes).is_ok());
+                    assert_rejected_everywhere(bytes, InvalidEd25519PublicKey::NonCanonical);
+                }
+                None => assert_rejected_everywhere(bytes, InvalidEd25519PublicKey::NotAPoint),
+            }
+        }
+        // 12 values of d decode, each with 2 sign bits, plus the 2 sign-bit variants.
+        assert_eq!(decodable, 26);
     }
 
     #[test]
@@ -422,9 +538,10 @@ mod tests {
             pk
         );
         assert_eq!(
-            Ed25519PublicKey::from_str(&hex::encode(pk.bytes())).unwrap(),
+            Ed25519PublicKey::from_str(&format!("0x{}", hex::encode(pk.bytes()))).unwrap(),
             pk
         );
+        assert!(Ed25519PublicKey::from_str(&hex::encode(pk.bytes())).is_err());
 
         let sig_json = serde_json::to_string(&sig).unwrap();
         assert_eq!(

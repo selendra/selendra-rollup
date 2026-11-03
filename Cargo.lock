@@ -28,6 +28,7 @@ dependencies = [
  "secp256k1",
  "serde",
  "sha3",
+ "tiny-keccak",
 ]
 
 [[package]]
@@ -1789,7 +1790,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c9f42978c78a00e3d68f69fc03e57a234debae69da4020a4fb588fcdcd07b06"
 dependencies = [
  "elliptic-curve 0.14.3",
- "once_cell",
  "primefield",
  "serdect",
  "wnaf",
@@ -2202,6 +2202,7 @@ dependencies = [
  "arbitrary",
  "async-trait",
  "backon",
+ "base64",
  "borsh",
  "bytes",
  "derive_more",
@@ -2230,6 +2231,7 @@ dependencies = [
  "arbitrary",
  "bech32",
  "borsh",
+ "curve25519-dalek-ng",
  "ed25519-consensus",
  "hex",
  "k256 0.14.0",
@@ -2652,6 +2654,15 @@ checksum = "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]

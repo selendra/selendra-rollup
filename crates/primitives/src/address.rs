@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn address_from_public_key() {
         let pk: Ed25519PublicKey =
-            "022e229198d957bf0c0a504e7d7bcec99a1d62cccc7861ed2452676ad0323ad8"
+            "0x022e229198d957bf0c0a504e7d7bcec99a1d62cccc7861ed2452676ad0323ad8"
                 .parse()
                 .unwrap();
         let addr = Address::from(pk.credential_id());
@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn team_test_genesis_address() {
         let pk: Ed25519PublicKey =
-            "4c3505f649e7354cf5904725232a1fb91b7b78ddb0be0e6e34c43ca2ff871e84"
+            "0x4c3505f649e7354cf5904725232a1fb91b7b78ddb0be0e6e34c43ca2ff871e84"
                 .parse()
                 .unwrap();
         assert_eq!(

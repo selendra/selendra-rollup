@@ -9,6 +9,17 @@ pub mod bech32;
 pub mod crypto;
 pub mod ethereum_address;
 pub mod multi_address;
+pub mod signing;
+
+// `selendra-interface/native` adds `CryptoSpec::PrivateKey`, which this crate implements only with
+// its own `native` feature. Cargo cannot make the first imply the second (the dependency points
+// the other way), so say what to do instead of failing with a missing trait item.
+#[cfg(not(feature = "native"))]
+selendra_interface::__if_native! {
+    compile_error!(
+        "`selendra-interface/native` is enabled but `selendra-primitives/native` is not: enable both"
+    );
+}
 
 pub use address::{ADDRESS_PREFIX, Address};
 pub use ethereum_address::EthereumAddress;

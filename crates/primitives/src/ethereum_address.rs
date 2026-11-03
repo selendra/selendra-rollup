@@ -1,7 +1,3 @@
-// Adapted from Sovereign SDK `crates/module-system/sov-address/src/evm/address.rs` at c7046e2
-// (Sovereign Permissionless Commercial License, Copyright Sovereign Labs, Inc.).
-// Changes: see docs/provenance.md.
-
 //! 20-byte Ethereum addresses (`0x…`).
 
 use std::str::FromStr;

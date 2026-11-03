@@ -50,6 +50,10 @@ while IFS='|' read -r _ ours up commit _; do
   ours=$(trim "$ours"); up=$(trim "$up"); commit=$(trim "$commit")
   git -C "$upstream" rev-parse --verify --quiet "$commit^{commit}" >/dev/null \
     || { echo "!! $ours: unknown upstream commit $commit" >&2; changed=1; continue; }
+  # A bad row must be reported, not silently match nothing (or abort the run).
+  [ -n "$(git -C "$upstream" ls-tree -r --name-only "$commit" -- "$up")" ] \
+    || { echo "!! $ours: $up not found at upstream $commit" >&2; changed=1; continue; }
+  [ -e "$root/$ours" ] || { echo "!! $ours: no such file in this repo" >&2; changed=1; continue; }
 
   if [ "$mode" = upstream ]; then
     out=$(git -C "$upstream" diff "${stat[@]}" "$commit" "$ref" -- "$up")

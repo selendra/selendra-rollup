@@ -135,7 +135,7 @@ impl<Address, Da: DaSpec, Root: AsRef<[u8]>> core::fmt::Display
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "AggregatedProofPublicData(initial_slot_number: {}, final_slot_number: {}, origin_slot_number: {}, origin_state_root: {}, initial_state_root: 0x{}, final_state_root: 0x{}, initial_slot_hash: 0x{}, final_slot_hash: 0x{}, inner_vkey_hash: {}, outer_vk_hash: {})",
+            "AggregatedProofPublicData(initial_slot_number: {}, final_slot_number: {}, origin_slot_number: {}, origin_state_root: 0x{}, initial_state_root: 0x{}, final_state_root: 0x{}, initial_slot_hash: 0x{}, final_slot_hash: 0x{}, inner_vkey_hash: {}, outer_vk_hash: {})",
             self.initial_slot_number,
             self.final_slot_number,
             self.origin_slot_number,

@@ -132,7 +132,7 @@ impl<Address, Da: DaSpec, Root> From<ProofReceiptContents<Address, Da, Root>>
 /// The context in which the execution is happening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExecutionContext {
-    /// / The transaction is being executed in order to warm up the main executor cache.
+    /// The transaction is being executed in order to warm up the main executor cache.
     SequencerWarmUp,
     /// The transaction is being executed by a sequencer before inclusion.
     Sequencer,
@@ -152,7 +152,9 @@ impl ExecutionContext {
     /// String representation of the NODE variant.
     pub const NODE: &'static str = "Node";
 
-    /// Returns true if and only if `self` matches [`ExecutionContext::Sequencer`].
+    /// Returns true for execution on the sequencer before inclusion:
+    /// [`ExecutionContext::Sequencer`] and [`ExecutionContext::SequencerWarmUp`] (cache warm-up
+    /// runs). Returns false for [`ExecutionContext::Node`].
     pub fn is_sequencer(&self) -> bool {
         match self {
             Self::Sequencer | Self::SequencerWarmUp => true,
@@ -194,7 +196,7 @@ pub enum InvalidProofError {
 }
 
 impl InvalidProofError {
-    /// Checks if the error is revertable.
+    /// Returns true if the error cannot be reverted: the prover was slashed or penalized.
     pub fn is_not_revertable(&self) -> bool {
         matches!(
             self,
@@ -207,7 +209,8 @@ impl InvalidProofError {
 pub type ProofOutcome<Address, Da, Root> =
     ProofOutcomeEnum<ProofReceiptContents<Address, Da, Root>>;
 
-/// The outcome of a proof, without the actual proof data
+/// The outcome of a proof, without the proof data of a valid proof (an invalid proof keeps
+/// its data, for inspection)
 pub type PartialProofOutcome<Address, Da, Root> =
     ProofOutcomeEnum<PartialProofReceiptContents<Address, Da, Root>>;
 

@@ -3,6 +3,11 @@
 use bech32::primitives::decode::{CheckedHrpstring, CheckedHrpstringError};
 use bech32::{Bech32m, Hrp};
 
+/// Largest payload (bytes) accepted by [`encode`]/[`decode`]: with a prefix of up to 10
+/// characters, 40 bytes (64 data symbols + separator + 6 checksum) stays under the
+/// 90-character bech32m limit.
+pub const MAX_PAYLOAD: usize = 40;
+
 /// Why a bech32m string was rejected.
 #[derive(Debug, thiserror::Error)]
 pub enum Bech32ParseError {
@@ -35,9 +40,10 @@ pub enum Bech32ParseError {
 ///
 /// # Panics
 ///
-/// If `hrp` is not a valid bech32 prefix or the result is longer than the bech32m
-/// limit. Both are fixed by the caller's constants and covered by tests.
+/// If `hrp` is not a valid bech32 prefix. Prefixes are constants covered by tests; the
+/// payload size is bounded at compile time so the 90-character bech32m limit always holds.
 pub fn encode<const N: usize>(hrp: &'static str, bytes: &[u8; N]) -> String {
+    const { assert!(N <= MAX_PAYLOAD, "payload too long for bech32m") };
     let hrp = Hrp::parse(hrp).expect("bech32 prefixes are valid constants");
     bech32::encode::<Bech32m>(hrp, bytes).expect("fixed-size payloads fit in bech32m")
 }

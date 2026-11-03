@@ -72,7 +72,6 @@ pub struct EventValue(Vec<u8>);
 
 impl EventValue {
     /// Return the inner bytes of the event value.
-    /// Return the inner bytes of the event key.
     pub fn inner(&self) -> &Vec<u8> {
         &self.0
     }

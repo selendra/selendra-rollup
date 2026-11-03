@@ -50,7 +50,9 @@ pub trait PublicKey:
     + TryFrom<Vec<u8>>
     + AsRef<[u8]>
 {
-    /// Returns hashed public key.
+    /// Returns the credential that identifies this key. It is not necessarily a hash: for
+    /// ed25519 it is the 32 public-key bytes, for secp256k1 the 20-byte Ethereum address
+    /// left-padded with zeros.
     fn credential_id(&self) -> CredentialId;
 }
 

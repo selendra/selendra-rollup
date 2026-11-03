@@ -241,7 +241,8 @@ pub trait BlobReaderTrait: Serialize + DeserializeOwned + Send + Sync + 'static 
     /// blob data will be required for execution.
     #[cfg(feature = "native")]
     fn full_data(&mut self) -> &[u8] {
-        self.advance(self.total_len() - self.verified_data().len())
+        // Saturating: a buggy adapter reporting `total_len < verified` must not panic the node.
+        self.advance(self.total_len().saturating_sub(self.verified_data().len()))
     }
 }
 
@@ -330,9 +331,9 @@ impl<T: BlockHeaderTrait> core::fmt::Display for BlockHeaderDisplay<'_, T> {
     derive(proptest_derive::Arbitrary, arbitrary::Arbitrary)
 )]
 #[serde(transparent)]
-/// A timestamp, represented as seconds since the unix epoch.
+/// A timestamp, represented as milliseconds since the unix epoch (negative before it).
 pub struct Time {
-    /// The number of seconds since the unix epoch
+    /// The number of milliseconds since the unix epoch.
     millis: i64,
 }
 
@@ -359,28 +360,26 @@ impl Time {
     }
 
     /// Create a time from the specified number of milliseconds.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the number of milliseconds is greater than i64::MAX
     pub const fn from_millis(millis: i64) -> Self {
         Time { millis }
     }
 
-    /// Returns the number of whole seconds since the epoch
+    /// Returns the number of whole seconds since the epoch, rounded down (towards negative
+    /// infinity), so that `secs() * 1000 + subsec_millis() == as_millis()` for every time.
     ///
     /// The returned value does not include the fractional (millisecond) part of the duration,
     /// which can be obtained using `subsec_millis`.
     pub const fn secs(&self) -> i64 {
-        self.millis / 1000
+        self.millis.div_euclid(1000)
     }
 
     /// Returns the fractional part of this [`Time`], in milliseconds.
     ///
     /// This method does not return the length of the time when represented by milliseconds.
-    /// The returned number always represents a fractional portion of a second (i.e., it is less than one billion).
+    /// The returned number always represents a fractional portion of a second (i.e., it is
+    /// less than 1000), also for times before the epoch.
     pub const fn subsec_millis(&self) -> u16 {
-        (self.millis % 1000) as u16
+        self.millis.rem_euclid(1000) as u16
     }
 
     /// Returns the time as milliseconds since the unix epoch
@@ -473,5 +472,22 @@ mod tests {
 
         let deserialized: Time = postcard::from_bytes(&serialized).unwrap();
         assert_eq!(deserialized, time);
+    }
+
+    #[test]
+    fn time_parts_are_consistent_before_the_epoch() {
+        for (millis, secs, sub) in [
+            (-1, -1, 999),
+            (-1000, -1, 0),
+            (-1001, -2, 999),
+            (0, 0, 0),
+            (1999, 1, 999),
+            (i64::MIN, i64::MIN.div_euclid(1000), 192),
+            (i64::MAX, i64::MAX / 1000, 807),
+        ] {
+            let time = Time::from_millis(millis);
+            assert_eq!((time.secs(), time.subsec_millis()), (secs, sub), "{millis}");
+            assert!(time.subsec_millis() < 1000);
+        }
     }
 }

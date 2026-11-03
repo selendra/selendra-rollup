@@ -23,8 +23,8 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 | Operating mode | **`Operator` at launch → `Zk` for mainnet; skip `Optimistic`** | Sovereign sets mode only at genesis → we add a governance switch (Phase 6) |
 | Governance | **Testing: single admin key, no multisig, no timelock** → before public testnet/mainnet: multisig + `timelock` → token governance (SEL) | Admin controls: sequencing params, operating mode, SEL mint/burn, fee-token list & rates. Admin address is config, not hard-coded |
 | Genesis allocation (testing) | **All 300,000,000 SEL to team test accounts**:<br>`sel1fs6stajfuu65eavsgujjx2slhydhk7xakzlqum35cs72ydqpl45` (ed25519) → 150,000,000 SEL<br>`0x02f9647E14d07ac4c76295ed34eBa30a47b626A3` (secp256k1, MetaMask) → 150,000,000 SEL | Random **test-only** keys in `keys/*.key` (gitignored). Same accounts act as admin. Replace with real addresses via genesis config before any public network |
-| EVM chain ID | **2027** (testing, configurable in genesis) | ⚠️ 2027 is already registered to "CitizenChain" (`ethereum-lists/chains` `eip155-2027.json`) → OK for local devnet, **must pick an unused ID before public testnet** |
-| Gas / native token | **Name `Selendra`, symbol `SEL`, 18 decimals, genesis supply 300,000,000 SEL** | = 3,000,000 × 10¹⁸ base units (fits `Amount(u128)`). Supply changeable later by governance mint/burn. Same token is EVM native currency (1:1, no scaling) |
+| EVM chain ID | **1961** (Selendra; configurable in genesis) | Registered in `ethereum-lists/chains` as "Selendra Network Mainnet" (`eip155-1961.json`, symbol SEL, 18 decimals); 1953 = Selendra Network Testnet. ⚠️ The existing Selendra mainnet uses 1961 too: while both chains are live, an EIP-155 tx signed for one is valid on the other (same keys, same `0x` accounts) → decide migration/shutdown of the old chain, or use a different ID for testnets |
+| Gas / native token | **Name `Selendra`, symbol `SEL`, 18 decimals, genesis supply 300,000,000 SEL** | = 300,000,000 × 10¹⁸ = 3 × 10²⁶ base units (fits `Amount(u128)`). Supply changeable later by governance mint/burn. Same token is EVM native currency (1:1, no scaling) |
 | Multi-token gas | **SEL = default fee token; other fee tokens priced by price oracle** | Admin approves which tokens are allowed; their SEL rate comes from the oracle (`token/USD ÷ SEL/USD`). Native txs may pay in any allowed token; EVM txs pay in SEL. Not in Sovereign → new `fee-tokens` + `price-oracle` modules (Phase 6) |
 | Sponsored fees | **Any account (dApp) can pay fees for a list of accounts**, limited to its own contracts, with per-tx / per-account / total budget limits and expiry | Many sponsorships at once (Sovereign `paymaster` allows only one payer per sequencer) → new `fee-sponsor` module (Phase 6) |
 | State-root hash | **SHA-256** (NOMT trees + `global_root`) | 128-bit collision security, most-studied hash, SP1 precompile. Alternatives (SHA3/Keccak equal; BLAKE3/Poseidon less margin; SHA-512 variants no precompile) don't add real security. EVM still uses Keccak-256 internally (Ethereum standard) |
@@ -36,17 +36,18 @@ Legend: 🔁 = copy & adapt from Sovereign · ✍️ = write ourselves · ⚠️
 
 - [ ] Before public testnet: real genesis allocation (team, treasury, sequencer bond, prover rewards, faucet…)
 - [ ] Before public testnet: multisig signers + threshold (e.g. 3-of-5) and timelock delay (e.g. 48 h)
-- [ ] Before public testnet: unused EVM chain ID, register in `ethereum-lists/chains` (chainlist.org)
+- [x] EVM chain ID: 1961 (already registered to Selendra Network Mainnet)
+- [ ] Before public testnet: replay plan vs the existing Selendra mainnet (also 1961) — migrate/retire old chain, or give testnets their own ID (1953 is the existing Selendra testnet; update the `ethereum-lists/chains` entry's RPC/explorer when the rollup goes live)
 - [ ] First extra fee tokens (e.g. bridged USDC/USDT?)
 - [ ] Oracle provider: Pyth (pull model, Wormhole-signed, works on any chain — recommended) vs RedStone vs Chainlink (needs deployment)
 - [ ] SEL/USD source while SEL has no market: admin-set price → later on-chain DEX TWAP (SEL/USDC) with bounds
-- [x] Write `docs/selendra-spec.md` with all decisions (keep in sync when decisions change)
+- [x] Write the Selendra overview: `README.md` (was `docs/selendra.md`); the locked decisions are the table above (keep both in sync when decisions change)
 
 ## Phase 1 — Repo & tooling
 
 - [x] `git init`, Cargo workspace, `rust-toolchain.toml` (pin version), `rustfmt.toml`, `clippy.toml` — Rust 1.93.0 (same as upstream), edition 2024
 - [ ] Crate layout: `crates/{primitives,interface,state,modules-api,macros,stf,kernel,modules/*,node,sequencer,db,adapters/{avail,mock-da,sp1,mock-zkvm},evm,cli}` — created one at a time when its code is written: add to `members` in `Cargo.toml`, use `[lints] workspace = true`, `#![forbid(unsafe_code)]` in the crate root
-- [x] CI: fmt, clippy `-D warnings`, test, `cargo deny` (licenses/advisories), `cargo audit`, `cargo udeps` — `.github/workflows/ci.yml`, same checks via `make ci`
+- [x] CI: fmt, clippy `-D warnings`, guest build (no `native`, no `getrandom`), test, 32-bit test (`usize` like the SP1 guest), `cargo deny` (licenses/advisories), `cargo audit`, `cargo udeps`, fuzz (60 s per push, 30 min nightly) — `.github/workflows/ci.yml`, same checks via `make ci`
 - [x] `#![forbid(unsafe_code)]` everywhere except where justified — workspace lint + attribute in every crate root
 - [x] Track copied code: `docs/provenance.md` — file → upstream path + commit + what changed (needed for future upstream security patches)
 - [x] Script to diff our copied files against upstream for security fixes — `scripts/upstream-diff.sh`
@@ -70,9 +71,9 @@ From `crates/rollup-interface`:
 - [x] ✍️ Reject `sov1…` addresses (wrong HRP) — test it
 - [x] 🔁 `MultiAddress<EthereumAddress>` + `EthereumAddress` + `EthereumPublicKey` from `sov-address` (feature `evm`) — in `selendra-primitives`, always on; no `From<CredentialId>` (keys own accounts); canonical secp256k1 keys/low-S signatures; `k256` 0.14 (advisory)
 - [x] ✍️ Test `Standard`/`Vm` parsing: 28 bytes vs 20 bytes, `sel` prefix vs `0x` — plus team genesis accounts (`sel1fs6…`, `0x02f9…`) pinned in tests
-- [ ] ✍️ Chain ID + domain separation in every signed message (prevent cross-chain replay)
-- [ ] 🔁 Borsh serialization conventions; ✍️ fuzz all decoders (`cargo fuzz`)
-- [ ] ✍️ No-panic review of all parsing code
+- [x] ✍️ Chain ID + domain separation in every signed message (prevent cross-chain replay) — `selendra_primitives::signing`: signs `0xB5 "SELENDRA" | version | domain | chain_id (u64 LE) | payload`, `SigningDomain::{Transaction, SequencerBlob, OffchainMessage}`, `SELENDRA_CHAIN_ID = 1961`; replaces upstream's `chain_hash`; first byte can't start an Ethereum tx or EIP-191/712 message. Ethereum txs keep EIP-155 (Phase 7)
+- [x] 🔁 Borsh serialization conventions; ✍️ fuzz all decoders (`cargo fuzz`) — rules in `docs/serialization.md`; `fuzz/` targets `addresses`, `keys`, `tx_decoding` (no panic + canonical round-trip), in CI + `make fuzz`. Fuzzing found: `k256` accepted SEC1 compact (`0x05`) keys as a 2nd encoding → only `0x02/0x03/0x04` accepted, borsh decode rejects non-canonical bytes. Add a target for every new decoder
+- [x] ✍️ No-panic review of all parsing code — fixed: `FullyBakedTx` accepted any non-zero `Option` tag (now only 0/1) and `data_len + seq_len` could overflow on the 32-bit zk guest; `BlobReaderTrait::full_data` slicing now saturates; bech32 payload size bounded at compile time. An independent audit (4 reviewers + adversarial verification) then found and we fixed: ed25519 public keys accepted small-order points (anyone can sign) and non-canonical encodings; hex strings accepted a missing `0x` and any case; `FullyBakedTx`/`RawTx` JSON accepted unpadded base64, unknown fields and the array form (last one found by the fuzzer's new JSON round-trip check); slot numbers parsed `+5`/`005`. Re-review each new decoder (Phases 4–9)
 
 ## Phase 4 — State & storage ⚠️
 
@@ -100,7 +101,7 @@ From `sov-modules-api`, `sov-modules-macros`:
 - [ ] 🔁 Hooks: pre/post dispatch tx, begin/end block, finalize
 - [ ] 🔁 Gas metering (`SlotGasMeter`, per-tx gas, base fee)
 - [ ] 🔁 Capabilities traits: `GasEnforcer`, `TransactionAuthenticator`, `TransactionAuthorizer`, `SequencerAuthorization`, `SequencerRemuneration`, `ProofProcessor` ⚠️
-- [ ] 🔁 Authenticator that accepts both native (ed25519) and Ethereum (secp256k1 RLP / EIP-712) txs
+- [ ] 🔁 Authenticator that accepts both native (ed25519) and Ethereum (secp256k1 RLP / EIP-712) txs — native txs verify via `selendra_primitives::signing` with `SigningDomain::Transaction` (not upstream's `chain_hash`); Ethereum txs via EIP-155 with chain ID 1961
 - [ ] ✍️ Rename/re-namespace everything; remove `sov-revenue-share` coupling
 - [ ] Later: `UniversalWallet`, `RuntimeRestApi`, `CliWallet` derives
 
@@ -111,7 +112,7 @@ From `sov-modules-api`, `sov-modules-macros`:
 
 ### Native token SEL ⚠️
 - [ ] ✍️ `constants.toml`: `GAS_TOKEN_DECIMALS = 18` (Sovereign default is 6); generate new Selendra `GAS_TOKEN_ID`
-- [ ] ✍️ Bank genesis `gas_token_config`: `token_name = "Selendra"`, `token_decimals = 18`, balances = team test accounts (1,500,000 × 10¹⁸ each), `admins = [admin]` (→ timelock later)
+- [ ] ✍️ Bank genesis `gas_token_config`: `token_name = "Selendra"`, `token_decimals = 18`, balances = team test accounts (150,000,000 × 10¹⁸ = 1.5 × 10²⁶ each), `admins = [admin]` (→ timelock later)
 - [ ] ✍️ Add `symbol` to token metadata (Sovereign bank has **no symbol field**) → `SEL`; expose via `/modules/bank/tokens/{id}/metadata`
 - [ ] ✍️ Supply changes only via governance `mint` / `burn` (through timelock); emit events; track `total_supply`
 - [ ] ✍️ Overflow tests at 18 decimals (u128 max ≈ 3.4 × 10³⁸ base units ≈ 3.4 × 10²⁰ SEL — plenty, but test mint paths)
@@ -182,7 +183,7 @@ From `sov-modules-api`, `sov-modules-macros`:
 From `sov-evm`, `sov-ethereum`, `sov-address` (feature `evm`):
 - [ ] 🔁 `sov-evm` module (revm) → `selendra-evm`; include in `Runtime<S>` by default
 - [ ] ✍️ Gas token = EVM native balance (single SEL balance via `bank`, 18 decimals both sides, no dual accounts)
-- [ ] ✍️ EVM chain ID in genesis config (`2027` for devnet); EIP-155 replay protection
+- [ ] ✍️ EVM chain ID in genesis config (`1961`); EIP-155 replay protection
 - [ ] ✍️ Pin revm version; plan for Ethereum hard-fork upgrades (Cancun/Prague opcodes)
 - [ ] ✍️ Check how Solidity ↔ native module calls work (precompiles?) before relying on it
 - [ ] ✍️ Slot gas limit + max batch size in genesis/config (controls block capacity)
@@ -216,7 +217,7 @@ From `sov-modules-stf-blueprint`, `sov-kernels`, `sov-capabilities`:
 - [ ] ✍️ Blob extraction: `app_lookup` → Selendra cell range → `kate_queryRows` → decode with `kate-recovery` / `avail-core` (don't reimplement encoding)
 - [ ] ✍️ `send_transaction` / `send_proof` via `avail-rust` (`submitData` with app_id); split batches over per-extrinsic data limit (check current limit)
 - [ ] ✍️ `get_proofs_at` (proofs app_id)
-- [ ] ✍️ **Self-signed blobs**: blob = `{sequencer_pubkey, signature, payload}`; sign incl. Avail block number/nonce (anti re-post); `sender()` = pubkey — Avail matrix has no signer info
+- [ ] ✍️ **Self-signed blobs**: blob = `{sequencer_pubkey, signature, payload}`; sign incl. Avail block number/nonce (anti re-post) via `selendra_primitives::signing` with `SigningDomain::SequencerBlob`; `sender()` = pubkey — Avail matrix has no signer info
 - [ ] ✍️ **`AvailDaVerifier` in SP1 guest**:
   - [ ] Header hash (blake2-256, SCALE) == slot hash; `prev_hash` linkage
   - [ ] Completeness: every row covering Selendra's `app_lookup` range is supplied
@@ -232,7 +233,7 @@ From `sov-modules-stf-blueprint`, `sov-kernels`, `sov-capabilities`:
 
 ### SP1
 - [ ] 🔁 SP1 adapter + guest program (`zk/sp1-guest`) ⚠️
-- [ ] ✍️ Re-check SP1 patches vs our pins: `k256` 0.14 (SP1 secp256k1 patch targets 0.13.4, which has RUSTSEC-2026-0387), `sha2 =0.10.9` + 0.9.9 (via `ed25519-consensus`), `ed25519-consensus =2.1.0`, `tiny-keccak` (alloy keccak); `getrandom` 0.4 reaches the guest via `k256` → `rfc6979` → `crypto-bigint` defaults
+- [ ] ✍️ Re-check SP1 patches vs our pins: `k256` 0.14 (SP1 secp256k1 patch targets 0.13.4, which has RUSTSEC-2026-0387), `sha2 =0.10.9` + 0.9.9 (via `ed25519-consensus`), `ed25519-consensus =2.1.0`, `tiny-keccak` (alloy keccak, selected by the `tiny-keccak` feature); `getrandom` is kept out of the guest (`k256` without `std`, `curve25519-dalek-ng` without `std`; `make guest` checks it)
 - [ ] ✍️ Verify guest uses identical STF/runtime as native (same crate, feature-gated)
 
 ## Phase 10 — Full node
@@ -249,7 +250,8 @@ From `sov-stf-runner`, `sov-modules-rollup-blueprint`:
 
 From `sov-sequencer`, `sov-blob-sender`:
 - [ ] 🔁 Standard mempool sequencer (start here); accepts native + Ethereum txs
-- [ ] ✍️ Sign batches before posting (self-signed blob format, Phase 9)
+- [ ] ✍️ Sign batches before posting (self-signed blob format, Phase 9; `SigningDomain::SequencerBlob`)
+- [ ] ✍️ Zeroize private keys before the sequencer key is used: `EthereumPrivateKey` drops its extra `bytes: [u8; 32]` copy (read bytes back from `SigningKey`); both `Ed25519PrivateKey` and `EthereumPrivateKey` wipe the secret on drop (`zeroize`; check what `k256` / `ed25519-consensus` already wipe); consider removing `Clone` so secret copies can't spread ⚠️
 - [ ] 🔁 Blob sender with retries + in-flight tracking
 - [ ] 🔁 Preferred sequencer + soft confirmations (speculative execution, state-root cross-check)
 - [ ] ✍️ Mempool DoS limits: size caps, per-sender rate limits, min fee ⚠️
@@ -295,7 +297,7 @@ From `sov-sequencer`, `sov-blob-sender`:
 
 - [ ] Unit tests for every copied file (port upstream tests too)
 - [ ] Integration tests: mock DA + mock zkVM end-to-end, then Avail + SP1
-- [ ] Fuzz: tx decoding (native + RLP), blob parsing, Avail cell decoding, STF with random txs
+- [ ] Fuzz: tx decoding (native + RLP), blob parsing, Avail cell decoding, STF with random txs (extend `fuzz/`; addresses, keys and `FullyBakedTx`/`RawTx` already covered in Phase 3)
 - [ ] Property test: native vs zk execution give same root
 - [ ] Load test (port `sov-synthetic-load` / soak tools), incl. EVM-heavy load
 - [ ] Threat model doc (sequencer censorship, Avail data withholding, prover liveness, EVM exploits, bridge)

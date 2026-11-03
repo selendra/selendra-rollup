@@ -12,6 +12,9 @@ pub type HexHash = HexString<[u8; 32]>;
 
 /// A [`serde`]-compatible newtype wrapper around [`Vec<u8>`] or other
 /// bytes-like types, which is serialized as a 0x-prefixed hex string.
+///
+/// Parsing accepts only the form [`Display`] produces: a `0x` prefix followed by lowercase
+/// hex digits, so every value has exactly one string encoding.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, derive_more::AsRef)]
 #[cfg_attr(
     feature = "arbitrary",
@@ -29,23 +32,28 @@ impl schemars::JsonSchema for HexString {
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "pattern": "^0x(?:[a-fA-F0-9]{2})+$",
-            "description": "A `0x`-prefixed hexadecimal string (uppercase or lowercase) of variable length, with an even number of hex digits.",
+            "pattern": "^0x(?:[a-f0-9]{2})*$",
+            "description": "A `0x`-prefixed lowercase hexadecimal string of variable length, with an even number of hex digits.",
         })
     }
 }
 
 // Useful for representing Ethereum addresses
 impl<const N: usize> schemars::JsonSchema for HexString<[u8; N]> {
+    // One name per length: schemars stores schemas by name, so a shared name would make every
+    // length use whichever pattern was generated first.
     fn schema_name() -> std::borrow::Cow<'static, str> {
-        "HexHash".into()
+        match N {
+            32 => "HexHash".into(),
+            _ => format!("HexBytes{N}").into(),
+        }
     }
 
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "pattern": format!("^0x[a-fA-F0-9]{{{}}}$", N * 2),
-            "description": format!("{} bytes in hexadecimal format, with `0x` prefix.", N),
+            "pattern": format!("^0x[a-f0-9]{{{}}}$", N * 2),
+            "description": format!("{} bytes in lowercase hexadecimal format, with `0x` prefix.", N),
         })
     }
 }
@@ -183,8 +191,7 @@ pub mod hex_string_serde {
 
     /// Deserializes a hex string into raw bytes.
     ///
-    /// Both upper and lower case characters are valid in the input string and can
-    /// even be mixed.
+    /// The input must be `0x`-prefixed lowercase hex, as produced by [`serialize`].
     pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
     where
         D: Deserializer<'de>,
@@ -194,10 +201,15 @@ pub mod hex_string_serde {
     }
 }
 
+/// Parses the canonical form only: `0x` followed by an even number of lowercase hex digits.
 fn parse_vec_u8(s: &str) -> anyhow::Result<Vec<u8>> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-
-    hex::decode(s).map_err(|e| anyhow::anyhow!("Failed to decode hex string {}, error: {}", s, e))
+    let digits = s
+        .strip_prefix("0x")
+        .ok_or_else(|| anyhow::anyhow!("hex string must start with 0x"))?;
+    if digits.bytes().any(|b| b.is_ascii_uppercase()) {
+        anyhow::bail!("hex string must be lowercase");
+    }
+    hex::decode(digits).map_err(|e| anyhow::anyhow!("Failed to decode hex string: {e}"))
 }
 
 #[cfg(test)]
@@ -242,5 +254,50 @@ mod tests {
     #[test_strategy::proptest]
     fn hex_string_str_roundtrip(item: HexString) {
         test_str_roundtrip(item);
+    }
+
+    #[test]
+    fn only_the_canonical_string_is_accepted() {
+        assert_eq!(HexString::from_str("0x").unwrap(), HexString(vec![]));
+        assert_eq!(HexString::from_str("0xab").unwrap(), HexString(vec![0xab]));
+        for bad in ["", "ab", "0xAB", "0xAb", "0Xab", "0xabc", "0x0g", " 0xab"] {
+            assert!(HexString::<Vec<u8>>::from_str(bad).is_err(), "{bad:?}");
+            assert!(
+                serde_json::from_str::<HexString>(&format!("\"{bad}\"")).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(HexString::<[u8; 1]>::from_str("0x").is_err());
+    }
+
+    #[test]
+    fn fixed_length_schemas_do_not_collide() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct Both {
+            a: HexString<[u8; 20]>,
+            b: HexString<[u8; 32]>,
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(Both)).unwrap();
+        assert_eq!(schema["$defs"]["HexBytes20"]["pattern"], "^0x[a-f0-9]{40}$");
+        assert_eq!(schema["$defs"]["HexHash"]["pattern"], "^0x[a-f0-9]{64}$");
+    }
+
+    #[test]
+    fn schema_matches_serialized_form() {
+        let schema = serde_json::to_value(schemars::schema_for!(HexString)).unwrap();
+        assert_eq!(schema["pattern"], "^0x(?:[a-f0-9]{2})*$");
+        // The serializer's output (including empty bytes) matches the pattern.
+        for bytes in [vec![], vec![0xab], vec![0, 0xff, 0x10]] {
+            let s = HexString(bytes).to_string();
+            assert!(s.starts_with("0x") && s.len() % 2 == 0);
+            assert!(
+                s[2..]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(HexString<[u8; 2]>)).unwrap();
+        assert_eq!(schema["pattern"], "^0x[a-f0-9]{4}$");
     }
 }

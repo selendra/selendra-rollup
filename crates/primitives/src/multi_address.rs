@@ -1,7 +1,3 @@
-// Adapted from Sovereign SDK `crates/module-system/sov-address/src/lib.rs` at c7046e2
-// (Sovereign Permissionless Commercial License, Copyright Sovereign Labs, Inc.).
-// Changes: see docs/provenance.md.
-
 //! [`MultiAddress`]: one account address type covering native `sel1…` accounts and
 //! VM-native accounts such as Ethereum's `0x…`.
 
@@ -338,7 +334,7 @@ mod tests {
     #[test]
     fn team_test_genesis_accounts() {
         let secp: EthereumPublicKey =
-            "0324718b830d04cba00c6eb7456c9f2da9afaf27342e5cd615b7a228d9adad585c"
+            "0x0324718b830d04cba00c6eb7456c9f2da9afaf27342e5cd615b7a228d9adad585c"
                 .parse()
                 .unwrap();
         assert_eq!(
@@ -347,7 +343,7 @@ mod tests {
         );
 
         let ed: Ed25519PublicKey =
-            "4c3505f649e7354cf5904725232a1fb91b7b78ddb0be0e6e34c43ca2ff871e84"
+            "0x4c3505f649e7354cf5904725232a1fb91b7b78ddb0be0e6e34c43ca2ff871e84"
                 .parse()
                 .unwrap();
         assert_eq!(

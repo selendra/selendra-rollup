@@ -1,4 +1,21 @@
 use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
+
+/// A string that is not the canonical decimal form of a slot number or height.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("expected a decimal number without sign or leading zeros, got {0:?}")]
+pub struct NonCanonicalNumber(String);
+
+/// Parses the form `Display` prints: ASCII digits, no sign, no leading zeros.
+/// (`u64::from_str` also accepts `+5` and `005`, which would give one number several strings.)
+fn parse_canonical_u64(s: &str) -> Result<u64, NonCanonicalNumber> {
+    let canonical =
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) && (s == "0" || !s.starts_with('0'));
+    match canonical.then(|| s.parse()) {
+        Some(Ok(n)) => Ok(n),
+        _ => Err(NonCanonicalNumber(s.to_owned())),
+    }
+}
 
 /// Uniquely identifies a slot **within the canonical DA fork**.
 ///
@@ -12,7 +29,6 @@ use std::ops::{Deref, DerefMut};
     PartialOrd,
     Ord,
     Hash,
-    derive_more::FromStr,
     derive_more::Add,
     derive_more::Sub,
     derive_more::Display,
@@ -26,6 +42,14 @@ use std::ops::{Deref, DerefMut};
     derive(arbitrary::Arbitrary, proptest_derive::Arbitrary)
 )]
 pub struct SlotNumber(u64);
+
+impl FromStr for SlotNumber {
+    type Err = NonCanonicalNumber;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_canonical_u64(s).map(Self)
+    }
+}
 
 impl std::fmt::Debug for SlotNumber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -102,9 +126,15 @@ impl SlotNumber {
     ///
     /// # Return
     ///
-    /// Returns `None` if the result would have underflowed.
+    /// Returns `self - rhs`, or `0` if `rhs` is greater than `self` (see
+    /// [`u64::saturating_sub`]). Use [`SlotNumber::checked_delta`] to tell the two apart.
     pub fn saturating_delta(&self, rhs: Self) -> u64 {
         self.0.saturating_sub(rhs.0)
+    }
+
+    /// Calculates `self - rhs`, or `None` if `rhs` is greater than `self`.
+    pub fn checked_delta(&self, rhs: Self) -> Option<u64> {
+        self.0.checked_sub(rhs.0)
     }
 
     /// See [`u64::saturating_add`].
@@ -147,17 +177,32 @@ macro_rules! impl_into_slot_number {
     ($t:ty) => {
         impl IntoSlotNumber for $t {
             fn to_slot_number(self) -> SlotNumber {
-                SlotNumber::new(self as _)
+                SlotNumber::new(u64::from(self))
             }
         }
     };
 }
 
 impl_into_slot_number!(u8);
-impl_into_slot_number!(i32);
 impl_into_slot_number!(u32);
 impl_into_slot_number!(u64);
-impl_into_slot_number!(usize);
+
+impl IntoSlotNumber for usize {
+    fn to_slot_number(self) -> SlotNumber {
+        // Lossless: `usize` is at most 64 bits on every supported target.
+        SlotNumber::new(self as u64)
+    }
+}
+
+/// For integer literals, which default to `i32` (`5.to_slot_number()`).
+impl IntoSlotNumber for i32 {
+    /// # Panics
+    ///
+    /// Panics if `self` is negative (a cast would turn it into a huge slot number).
+    fn to_slot_number(self) -> SlotNumber {
+        SlotNumber::new(u64::try_from(self).expect("slot number must not be negative"))
+    }
+}
 
 /// A [`SlotNumber`] at which a user-space state transition happened.
 ///
@@ -172,7 +217,6 @@ impl_into_slot_number!(usize);
     PartialOrd,
     Ord,
     Hash,
-    derive_more::FromStr,
     derive_more::Add, // TODO(@nesofu): remove this, as it's not safe.
     derive_more::Display,
     serde::Serialize,
@@ -185,6 +229,14 @@ impl_into_slot_number!(usize);
     derive(arbitrary::Arbitrary, proptest_derive::Arbitrary)
 )]
 pub struct VisibleSlotNumber(SlotNumber);
+
+impl FromStr for VisibleSlotNumber {
+    type Err = NonCanonicalNumber;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        SlotNumber::from_str(s).map(Self)
+    }
+}
 
 impl std::fmt::Debug for VisibleSlotNumber {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -265,7 +317,6 @@ fn test_visible_slot_number() {
     Ord,
     Hash,
     derive_more::Display,
-    derive_more::FromStr,
     serde::Serialize,
     serde::Deserialize,
     borsh::BorshDeserialize,
@@ -273,6 +324,14 @@ fn test_visible_slot_number() {
     schemars::JsonSchema,
 )]
 pub struct RollupHeight(u64);
+
+impl FromStr for RollupHeight {
+    type Err = NonCanonicalNumber;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_canonical_u64(s).map(Self)
+    }
+}
 
 impl std::fmt::Debug for RollupHeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -327,5 +386,36 @@ impl RollupHeight {
     #[must_use]
     pub fn saturating_add(self, rhs: u64) -> Self {
         Self(self.0.saturating_add(rhs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_canonical_decimal_string_is_accepted() {
+        for (s, n) in [("0", 0), ("5", 5), ("18446744073709551615", u64::MAX)] {
+            assert_eq!(SlotNumber::from_str(s).unwrap().get(), n);
+            assert_eq!(VisibleSlotNumber::from_str(s).unwrap().get(), n);
+            assert_eq!(RollupHeight::from_str(s).unwrap().get(), n);
+            assert_eq!(SlotNumber::new(n).to_string(), s);
+            assert_eq!(RollupHeight::new(n).to_string(), s);
+        }
+        for bad in [
+            "",
+            "+5",
+            "-5",
+            "05",
+            "00",
+            " 5",
+            "5 ",
+            "0x5",
+            "18446744073709551616",
+        ] {
+            assert!(SlotNumber::from_str(bad).is_err(), "{bad:?}");
+            assert!(VisibleSlotNumber::from_str(bad).is_err(), "{bad:?}");
+            assert!(RollupHeight::from_str(bad).is_err(), "{bad:?}");
+        }
     }
 }

@@ -68,19 +68,19 @@ mod tests {
 
     #[test]
     fn test_hash_str_and_back_simple() {
-        for i in 0..1 {
-            let credential_id = CredentialId(HexHash::new([i as u8; 32]));
+        for i in [0u8, 1, 0x7f, 0xff] {
+            let credential_id = CredentialId(HexHash::new([i; 32]));
             check_str_and_back(credential_id);
         }
     }
 
     #[test]
-    fn test_removed_0x_prefix() {
+    fn test_only_canonical_string_is_accepted() {
         let credential_id = CredentialId(HexHash::new([10u8; 32]));
-        let s = credential_id.to_string().replace("0x", "");
-        let result = CredentialId::from_str(&s);
-        assert!(result.is_ok());
-        assert_eq!(credential_id, result.unwrap());
+        let s = credential_id.to_string();
+        assert!(CredentialId::from_str(&s.replace("0x", "")).is_err());
+        assert!(CredentialId::from_str(&s.to_ascii_uppercase().replace("0X", "0x")).is_err());
+        assert_eq!(CredentialId::from_str(&s).unwrap(), credential_id);
     }
 
     #[test_strategy::proptest]

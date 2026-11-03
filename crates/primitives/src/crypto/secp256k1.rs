@@ -1,7 +1,3 @@
-// Adapted from Sovereign SDK `crates/module-system/sov-address/src/evm/{public_key,signature,private_key}.rs`
-// at c7046e2 (Sovereign Permissionless Commercial License, Copyright Sovereign Labs, Inc.).
-// Changes: see docs/provenance.md.
-
 //! secp256k1 keys and ECDSA signatures over `keccak256(message)`, as used by Ethereum
 //! wallets. Backed by `k256`.
 //!
@@ -36,7 +32,15 @@ pub struct EthereumPublicKey {
 impl EthereumPublicKey {
     /// Parses a SEC1 public key (33-byte compressed or 65-byte uncompressed) and
     /// normalizes it to the compressed form.
+    ///
+    /// Only the standard tags are accepted: `0x02`/`0x03` (33 bytes) and `0x04` (65 bytes).
+    /// `k256` also accepts SEC1 "compact" (`0x05`) and "hybrid" (`0x06`/`0x07`) points, which
+    /// would give the same key additional encodings; those are rejected.
     pub fn from_sec1_bytes(bytes: &[u8]) -> Result<Self, k256::elliptic_curve::Error> {
+        match (bytes.len(), bytes.first()) {
+            (33, Some(0x02 | 0x03)) | (65, Some(0x04)) => {}
+            _ => return Err(k256::elliptic_curve::Error),
+        }
         Ok(Self::from(&k256::PublicKey::from_sec1_bytes(bytes)?))
     }
 
@@ -116,13 +120,20 @@ impl BorshDeserialize for EthereumPublicKey {
         let mut bytes = [0u8; PUBLIC_KEY_LENGTH];
         reader.read_exact(&mut bytes)?;
         let key = Self::from_sec1_bytes(&bytes).map_err(std::io::Error::other)?;
-        // A 33-byte SEC1 key is compressed, so it is already canonical.
-        debug_assert_eq!(key.bytes, bytes);
+        // Only the compressed form is canonical. Checked, not assumed: the fuzzer found that
+        // k256 accepts other 33-byte encodings (compact `0x05`) of the same key.
+        if key.bytes != bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "non-canonical secp256k1 public key encoding",
+            ));
+        }
         Ok(key)
     }
 }
 
-/// JSON: `0x`-prefixed hex of the compressed key. Binary formats: the 33 raw bytes.
+/// JSON: `0x`-prefixed lowercase hex of the compressed key. Binary serde: a length-prefixed
+/// byte sequence. Borsh: the 33 raw bytes.
 impl serde::Serialize for EthereumPublicKey {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serde::Serialize::serialize(&HexString(self.bytes), serializer)
@@ -150,7 +161,8 @@ impl JsonSchema for EthereumPublicKey {
 impl FromStr for EthereumPublicKey {
     type Err = anyhow::Error;
 
-    /// Accepts compressed or uncompressed SEC1 hex, with or without `0x`.
+    /// Accepts `0x`-prefixed lowercase hex of a compressed or uncompressed SEC1 key; an
+    /// uncompressed key is normalized to its compressed form.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let HexString(bytes) = HexString::<Vec<u8>>::from_str(s)?;
         Self::try_from(bytes.as_slice())
@@ -237,7 +249,8 @@ impl selendra_interface::crypto::Signature for EthereumSignature {
     }
 }
 
-/// JSON: `0x`-prefixed hex. Binary formats: the 64 raw bytes.
+/// JSON: `0x`-prefixed lowercase hex. Binary serde: a length-prefixed byte sequence.
+/// Borsh: the 64 raw bytes.
 impl serde::Serialize for EthereumSignature {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serde::Serialize::serialize(&HexString(self.0), serializer)
@@ -474,10 +487,27 @@ mod tests {
 
     #[test]
     fn rejects_malformed_signatures() {
-        assert!(EthereumSignature::from_bytes([0; 64]).is_err());
-        let mut r_too_big = [0xff; 64];
-        r_too_big[63] = 1;
-        assert!(EthereumSignature::from_bytes(r_too_big).is_err());
+        // Start from a valid signature and break one scalar at a time, so each rejection comes
+        // from that scalar's range check alone.
+        let good: [u8; 64] = EthereumPrivateKey::generate()
+            .sign(b"m")
+            .as_ref()
+            .try_into()
+            .unwrap();
+        assert!(EthereumSignature::from_bytes(good).is_ok());
+
+        // The secp256k1 group order n.
+        let n = hex::decode("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+            .unwrap();
+        for bad_scalar in [[0u8; 32].as_slice(), &n, &[0xff; 32]] {
+            let mut bad_r = good;
+            bad_r[..32].copy_from_slice(bad_scalar);
+            assert!(EthereumSignature::from_bytes(bad_r).is_err());
+
+            let mut bad_s = good;
+            bad_s[32..].copy_from_slice(bad_scalar);
+            assert!(EthereumSignature::from_bytes(bad_s).is_err());
+        }
     }
 
     #[test]
@@ -495,6 +525,18 @@ mod tests {
         // Borsh only accepts the 33-byte compressed form.
         assert!(borsh::from_slice::<EthereumPublicKey>(uncompressed.as_bytes()).is_err());
         assert!(EthereumPublicKey::from_sec1_bytes(&[0; 33]).is_err());
+
+        // Found by fuzzing: SEC1 "compact" (0x05 || x) is the same key under another tag.
+        let mut compact = *pk.bytes();
+        compact[0] = 0x05;
+        assert!(EthereumPublicKey::from_sec1_bytes(&compact).is_err());
+        assert!(borsh::from_slice::<EthereumPublicKey>(&compact).is_err());
+        // Hybrid (0x06/0x07 || x || y) likewise.
+        let mut hybrid = uncompressed.as_bytes().to_vec();
+        for tag in [0x06, 0x07] {
+            hybrid[0] = tag;
+            assert!(EthereumPublicKey::from_sec1_bytes(&hybrid).is_err());
+        }
     }
 
     #[test]
@@ -524,10 +566,15 @@ mod tests {
         assert_eq!((pk3, sig3, sk3.as_hex()), (pk, sig, sk.as_hex()));
 
         assert_eq!(
-            hex::encode(pk.bytes())
+            format!("0x{}", hex::encode(pk.bytes()))
                 .parse::<EthereumPublicKey>()
                 .unwrap(),
             pk
+        );
+        assert!(
+            hex::encode(pk.bytes())
+                .parse::<EthereumPublicKey>()
+                .is_err()
         );
     }
 

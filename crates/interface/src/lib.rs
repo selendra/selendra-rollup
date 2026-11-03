@@ -20,6 +20,24 @@ pub use bytes::{Buf, BufMut, Bytes, BytesMut};
 /// A rollup transaction hash.
 pub type TxHash = common::HexHash;
 
+/// Expands its input only when this crate's `native` feature is enabled. Lets dependent crates
+/// detect `selendra-interface/native` (a crate cannot otherwise see another crate's features).
+#[cfg(feature = "native")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_native {
+    ($($item:tt)*) => { $($item)* };
+}
+
+/// Expands its input only when this crate's `native` feature is enabled. Lets dependent crates
+/// detect `selendra-interface/native` (a crate cannot otherwise see another crate's features).
+#[cfg(not(feature = "native"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_native {
+    ($($item:tt)*) => {};
+}
+
 /// Useful third-party crate re-exports.
 pub mod reexports {
     pub use {anyhow, digest, schemars};

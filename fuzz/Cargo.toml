@@ -1,0 +1,41 @@
+[package]
+name = "selendra-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
+libfuzzer-sys = "0.4"
+selendra-interface = { path = "../crates/interface" }
+selendra-primitives = { path = "../crates/primitives" }
+serde = "1"
+serde_json = "1"
+
+# Separate workspace: built with nightly + sanitizers by `cargo fuzz`, not by the main workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "addresses"
+path = "fuzz_targets/addresses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keys"
+path = "fuzz_targets/keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tx_decoding"
+path = "fuzz_targets/tx_decoding.rs"
+test = false
+doc = false
+bench = false
