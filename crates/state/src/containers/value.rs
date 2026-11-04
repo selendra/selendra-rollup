@@ -171,3 +171,101 @@ where
         state.delete(&self.slot_key())
     }
 }
+
+/// Raw APIs (native only): the stored bytes, without the codec.
+#[cfg(feature = "native")]
+impl<N, V, Codec> NamespacedStateValue<N, V, Codec>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V>,
+    N: CompileTimeNamespace,
+{
+    /// Gets the raw value bytes from state, or `None` if the value is absent.
+    pub fn get_raw<Reader: StateReader<N>>(
+        &self,
+        state: &mut Reader,
+    ) -> Result<Option<Vec<u8>>, Reader::Error> {
+        Ok(state.get(&self.slot_key())?.map(|v| v.value().to_vec()))
+    }
+
+    /// Sets the raw value bytes in state.
+    ///
+    /// The bytes are stored as they are: if they do not decode as a `V`, every later typed read
+    /// ([`get`](Self::get), [`remove`](Self::remove), ...) panics (see
+    /// [`StateReader::get_decoded`]). Only for node tooling such as migrations.
+    pub fn set_raw<Writer: StateWriter<N>>(
+        &mut self,
+        value: &[u8],
+        state: &mut Writer,
+    ) -> Result<(), Writer::Error> {
+        state.set(&self.slot_key(), SlotValue::from(value.to_vec()))
+    }
+
+    /// Removes the value from state, returning its raw bytes if it was present.
+    pub fn remove_raw<ReaderAndWriter: StateReaderAndWriter<N>>(
+        &mut self,
+        state: &mut ReaderAndWriter,
+    ) -> Result<Option<Vec<u8>>, <ReaderAndWriter as StateWriter<N>>::Error> {
+        let key = self.slot_key();
+        let value = StateReader::<N>::get(state, &key)?;
+        state.delete(&key)?;
+        Ok(value.map(|v| v.value().to_vec()))
+    }
+}
+
+/// Storage proofs.
+impl<N, V, Codec> NamespacedStateValue<N, V, Codec>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V>,
+    N: crate::ProvableCompileTimeNamespace,
+{
+    /// Gets the value with a proof of its presence or absence against the latest committed
+    /// state root (native only). See [`ProvenStateAccessor`](crate::ProvenStateAccessor).
+    #[cfg(feature = "native")]
+    pub fn get_with_proof<W>(&self, state: &mut W) -> Option<crate::StorageProof<W::Proof>>
+    where
+        W: crate::ProvenStateAccessor<N>,
+    {
+        state.get_global_latest_with_proof(self.slot_key())
+    }
+
+    /// Verifies a proof of this value against `state_root`, returning the value (`None`:
+    /// proven absent).
+    ///
+    /// Checks that the proof is for this value's namespace and key, and decodes the value.
+    /// Needs no `native`: light clients and the guest can verify.
+    ///
+    /// # Errors
+    /// If the proof is for another namespace or key, does not open against `state_root`, or the
+    /// proven bytes do not decode as a `V`.
+    pub fn verify_proof<St: crate::Storage>(
+        &self,
+        state_root: St::Root,
+        proof: crate::StorageProof<St::Proof>,
+    ) -> anyhow::Result<Option<V>> {
+        anyhow::ensure!(
+            proof.namespace == N::PROVABLE_NAMESPACE,
+            "The provided proof comes from a different namespace. Expected {:?} but found {:?}",
+            N::PROVABLE_NAMESPACE,
+            proof.namespace
+        );
+
+        let (key, value) = St::open_proof(state_root, proof)?;
+        anyhow::ensure!(
+            key == self.slot_key(),
+            "The provided proof is for a different key. Expected {} but found {}",
+            self.slot_key(),
+            key
+        );
+
+        value
+            .map(|v| {
+                self.codec()
+                    .value_codec()
+                    .try_decode(v.value())
+                    .map_err(|e| anyhow::anyhow!("Failed to decode value from proof: {e:?}"))
+            })
+            .transpose()
+    }
+}

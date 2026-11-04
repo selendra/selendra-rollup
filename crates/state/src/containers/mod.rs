@@ -19,10 +19,14 @@ pub(crate) mod vec;
 use std::fmt::Display;
 use std::str::FromStr;
 
+#[cfg(feature = "native")]
+pub use map::RawMapEntry;
 pub use map::{AccessoryStateMap, KernelStateMap, NamespacedStateMap, StateMap, StateMapError};
 pub use value::{
     AccessoryStateValue, KernelStateValue, NamespacedStateValue, StateValue, StateValueError,
 };
+#[cfg(feature = "native")]
+pub use vec::StateVecRawIter;
 pub use vec::{
     AccessoryStateVec, KernelStateVec, NamespacedStateVec, StateVec, StateVecError, StateVecIter,
 };
@@ -330,5 +334,7 @@ where
     }
 }
 
+#[cfg(all(test, feature = "native"))]
+mod native_tests;
 #[cfg(test)]
 mod tests;

@@ -121,6 +121,8 @@ use std::convert::Infallible;
 use crate::codec::{StateCodec, StateItemCodec, StateItemDecoder};
 use crate::namespaces::{Accessory, CompileTimeNamespace};
 use crate::slot::{SlotKey, SlotValue};
+#[cfg(feature = "native")]
+use crate::{namespaces::ProvableCompileTimeNamespace, storage::StorageProof};
 
 /// A storage reader which can access a particular namespace.
 pub trait StateReader<N: CompileTimeNamespace> {
@@ -249,3 +251,22 @@ where
 pub trait AccessoryStateReaderAndWriter: InfallibleStateReaderAndWriter<Accessory> {}
 
 impl<T: InfallibleStateReaderAndWriter<Accessory>> AccessoryStateReaderAndWriter for T {}
+
+/// An accessor that can read values with a proof of their presence or absence (native only).
+///
+/// The real implementor is the REST API's state accessor (`ApiStateAccessor`, Phase 13); in
+/// this crate only the test storage implements it. Containers use it in `get_with_proof`.
+///
+/// Upstream also required [`StateWriter<N>`]; proving needs only reads.
+#[cfg(feature = "native")]
+pub trait ProvenStateAccessor<N: ProvableCompileTimeNamespace>: StateReader<N> {
+    /// The storage's proof type.
+    type Proof;
+
+    /// Fetches the value with the requested key and a proof of its presence or absence
+    /// against the latest committed state root. Historical proofs are not supported: an
+    /// archival accessor still proves against the latest root.
+    ///
+    /// Returns `None` if no proof can be produced (e.g. nothing is committed yet).
+    fn get_global_latest_with_proof(&mut self, key: SlotKey) -> Option<StorageProof<Self::Proof>>;
+}

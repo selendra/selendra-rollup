@@ -1,6 +1,6 @@
 [package]
 name = "selendra-state"
-description = "Selendra state: namespaces, storage keys/values, codecs and the StateValue/StateMap/StateVec containers."
+description = "Selendra state: namespaces, storage keys/values, codecs, the StateValue/StateMap/StateVec containers, the Storage trait, witnesses and StateCheckpoint."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,8 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
+arbitrary = { workspace = true, optional = true }
 borsh = { workspace = true }
 selendra-interface = { workspace = true }
 serde = { workspace = true }
@@ -17,7 +19,16 @@ thiserror = { workspace = true }
 postcard = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 test-strategy = { workspace = true }
+
+[features]
+default = []
+# Node-only code (never in the zk guest): `NativeStorage` (accessory and historical reads),
+# raw container APIs and storage proofs.
+native = ["selendra-interface/native"]
+# `NamespacedStateMap::arbitrary_state_map`.
+arbitrary = ["dep:arbitrary"]
 
 [lints]
 workspace = true

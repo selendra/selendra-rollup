@@ -9,7 +9,7 @@ them can make nodes disagree, make the prover fail, or let one value have two en
 |---|---|---|
 | Anything hashed, signed, proven or stored in state (txs, blobs, state values, proof public outputs) | **borsh** | Specified, canonical, independent of serde attributes. Pinned exactly (`borsh = "=x.y.z"`) |
 | Proof public outputs | **borsh**, enforced by the trait bounds of `ZkvmGuest::commit` / `ZkVerifier` | Adapters commit raw bytes (e.g. SP1 `commit_slice`), never the zkVM's default `commit` (bincode) |
-| Hints from host to zk guest | serde (any format) | Prover-internal; nobody else checks these bytes |
+| Hints from host to zk guest | serde (any format) for the container (e.g. `StateTransitionWitness`); **borsh** for each storage witness hint | Prover-internal, but the guest decodes them: hints have one accepted encoding (see "Witness hints and storage proofs") |
 | RPC / REST / config files | JSON (serde) | Human-readable. JSON shape may change without a fork |
 | Tests, local caches | `postcard` or anything | Not consensus |
 
@@ -110,6 +110,44 @@ state root (a fork).
   - `Namespace` / `ProvableNamespace`: borsh one tag byte (`0` user, `1` kernel, `2` accessory);
     JSON only the snake_case string (`"user"`). Serde's derived decoding would also accept `{"user":null}`.
 
+## Witness hints and storage proofs
+
+The native prover records a **witness** for the zk guest (`selendra-state`: `Witness`,
+`ArrayWitness`): an ordered list of hints, each the **borsh** encoding of one value. The guest
+consumes them in the same order.
+
+- `Witness::try_get_hint` / `get_hint` decode with `borsh::from_slice`, so trailing bytes are
+  rejected and each hint has one accepted encoding (upstream used `T::deserialize(&mut slice)`,
+  which ignored them). A hint is consumed even when it fails to decode.
+- Every hint is unverified until `Storage::compute_state_update` checks the reads against the
+  previous state root. A missing or undecodable hint is an **invalid witness**: `get_hint`
+  panics, which is the intended result (no proof), and must never become a recoverable error.
+  Leftover hints do not change the result; `Witness::ensure_consumed` reports them (whether
+  the guest calls it is decided with the NOMT backend).
+- `ArrayWitness` itself: borsh like `Vec<Vec<u8>>` (the remaining hints); serde a sequence of
+  hints, each `0x` + lowercase hex in JSON and a byte sequence in binary formats.
+- Hint types: a read value is `Option<SlotValue>`; a size query's answer is the bare leaf,
+  `Option<NodeLeaf>` (never upstream's `NodeLeafAndMaybeValue` with a `ReadType` tag the guest
+  had to check). The exact sequence, including the proof hints of `compute_state_update`, is
+  defined by each storage (see the `Storage` docs, "The witness protocol").
+
+State leaves (changing either changes every state root or witness):
+
+| Item | Encoding |
+|---|---|
+| `NodeLeaf` (borsh, e.g. a leaf hint) | `size` (u32 LE) ‖ `val_hash` (32 bytes): 36 bytes |
+| What a leaf commits to: `val_hash_and_size` | `val_hash` (32 bytes) ‖ `size` (u32 LE): 36 bytes |
+| `val_hash` | `Storage::Hasher(value bytes)` (SHA-256) |
+| `size` | `SlotValue::size()`: the length as `u32`, saturating at `u32::MAX` (never reached in the 32-bit guest, where a value holds < 2^31 bytes; upstream panicked) |
+
+`StorageProof<P>` (from API clients and light clients): borsh the fields in order — `key`
+(`SlotKey`), `value` (`Option<SlotValue>`, tag `0`/`1`), `proof` (`P`), `namespace`
+(`ProvableNamespace`). JSON: an object with exactly the fields `key`, `value` (required, `null`
+when absent), `proof`, `namespace`; no unknown fields, no array form. Verify a proof with the
+container's `verify_proof`, which checks the namespace, that the key belongs to that container
+(prefix, and for maps that the key bytes are the canonical encoding of the decoded key), then
+opens it against the root; `Storage::open_proof` alone does not check the container.
+
 ## Signatures
 
 Never sign or verify a bare payload. Use `selendra_primitives::signing`, which signs
@@ -120,5 +158,5 @@ valid Ethereum transaction or EIP-191/712 message.
 ## Checking
 
 - `cargo test` — unit tests, including known-answer vectors and rejection tests.
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `state_keys`, `tx_decoding`
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `state_keys`, `state_witness`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

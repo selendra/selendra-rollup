@@ -6,6 +6,40 @@ mod slot_numbering;
 pub use hex_string::*;
 pub use slot_numbering::*;
 
+/// Deserializes a struct, accepting only the object form in human-readable formats.
+///
+/// Use it from a hand-written `Deserialize` impl on a derived helper struct (usually with
+/// `#[serde(deny_unknown_fields)]`).
+///
+/// Derived struct impls also accept a JSON array of the field values (`[[1,2]]` for
+/// `{"data":[1,2]}`), which would give one value two JSON encodings. Binary formats such as
+/// postcard encode structs as sequences, so they keep the derived behavior.
+pub fn deserialize_object_only<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct ObjectOnly<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for ObjectOnly<T> {
+        type Value = T;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    if deserializer.is_human_readable() {
+        deserializer.deserialize_map(ObjectOnly(std::marker::PhantomData))
+    } else {
+        T::deserialize(deserializer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};

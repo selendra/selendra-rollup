@@ -7,7 +7,7 @@ use crate::namespaces::{Accessory, Kernel, User};
 use crate::{SlotKey, SlotValue, StateReader, StateWriter};
 
 /// In-memory state with one map per namespace.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct InMemoryState {
     pub(crate) user: BTreeMap<SlotKey, SlotValue>,
     pub(crate) kernel: BTreeMap<SlotKey, SlotValue>,

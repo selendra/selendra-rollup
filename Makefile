@@ -10,10 +10,13 @@ clippy:
 	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 # The zk guest configuration (no `native`): lint it, and fail if OS randomness reaches it.
+# `selendra-state` has no self dev-dependency turning `native` on, so its tests (witness replay,
+# checkpoint, cache) also build and run in the guest configuration.
 guest:
 	cargo clippy -p selendra-interface --no-default-features --locked -- -D warnings
 	cargo clippy -p selendra-primitives --no-default-features --locked -- -D warnings
-	cargo clippy -p selendra-state --no-default-features --locked -- -D warnings
+	cargo clippy -p selendra-state --no-default-features --all-targets --locked -- -D warnings
+	cargo test -p selendra-state --no-default-features --locked
 	! cargo tree -p selendra-interface -p selendra-primitives -p selendra-state --no-default-features -e normal --locked | grep getrandom
 
 test:
@@ -23,6 +26,7 @@ test:
 test32:
 	rustup target add i686-unknown-linux-musl
 	cargo test --workspace --all-features --locked --target i686-unknown-linux-musl
+	cargo test -p selendra-state --no-default-features --locked --target i686-unknown-linux-musl
 
 deny:
 	cargo deny check advisories bans licenses sources

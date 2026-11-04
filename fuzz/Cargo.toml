@@ -42,6 +42,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "state_witness"
+path = "fuzz_targets/state_witness.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tx_decoding"
 path = "fuzz_targets/tx_decoding.rs"
 test = false

@@ -251,6 +251,18 @@ impl SlotValue {
     pub fn is_empty(&self) -> bool {
         self.value.is_empty()
     }
+
+    /// The size of the value in bytes as a `u32` (the width state leaves and gas use),
+    /// saturating at `u32::MAX`.
+    ///
+    /// Equal to [`len`](Self::len) for every value the zk guest can hold: its `usize` is 32 bits
+    /// and a `Vec` holds at most `isize::MAX` (< `u32::MAX`) bytes, so it never saturates there.
+    /// Only a native value over 4 GiB saturates, which no proof could include anyway. Upstream
+    /// panicked instead (`try_into().expect(..)`). The size never identifies a value on its own:
+    /// leaves also commit to the value's hash ([`NodeLeaf`](crate::NodeLeaf)).
+    pub fn size(&self) -> u32 {
+        u32::try_from(self.value.len()).unwrap_or(u32::MAX)
+    }
 }
 
 impl From<Vec<u8>> for SlotValue {
@@ -469,6 +481,7 @@ mod tests {
         let value = SlotValue::from(bytes.clone());
         assert_eq!(value.value(), bytes.as_slice());
         assert_eq!(value.len(), bytes.len());
+        assert_eq!(usize::try_from(value.size()).unwrap(), bytes.len());
         let borsh_bytes = borsh::to_vec(&value).unwrap();
         assert_eq!(borsh_bytes, borsh::to_vec(&bytes).unwrap());
         assert_eq!(borsh::from_slice::<SlotValue>(&borsh_bytes).unwrap(), value);

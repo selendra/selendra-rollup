@@ -5,6 +5,8 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
+#[cfg(feature = "native")]
+use crate::SlotValue;
 use crate::codec::{BorshCodec, EncodeLike, StateCodec, StateItemCodec};
 use crate::namespaces::{Accessory, CompileTimeNamespace, Kernel, User};
 use crate::{Prefix, SlotKey, StateReader, StateReaderAndWriter, StateWriter};
@@ -459,6 +461,221 @@ where
 }
 
 impl<N, V, Codec, Reader> FusedIterator for StateVecIter<'_, '_, N, V, Codec, Reader>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V> + StateItemCodec<u64>,
+    N: CompileTimeNamespace,
+    Reader: StateReader<N>,
+{
+}
+
+/// Raw APIs (native only): the stored element bytes, without the value codec. The length is
+/// still read and written with the codec, and the layout and write ordering are those of the
+/// typed operations (see [`NamespacedStateVec`]).
+#[cfg(feature = "native")]
+impl<N, V, Codec> NamespacedStateVec<N, V, Codec>
+where
+    N: CompileTimeNamespace,
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V> + StateItemCodec<u64>,
+{
+    /// Returns the raw bytes of element `index`, or `None` if it is out of bounds.
+    pub fn get_raw<Reader: StateReader<N>>(
+        &self,
+        index: u64,
+        state: &mut Reader,
+    ) -> Result<Option<Vec<u8>>, Reader::Error> {
+        if index < self.len(state)? {
+            self.get_raw_in_bounds(index, state)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reads element `index` without checking the length (callers check `index < len`).
+    fn get_raw_in_bounds<Reader: StateReader<N>>(
+        &self,
+        index: u64,
+        state: &mut Reader,
+    ) -> Result<Option<Vec<u8>>, Reader::Error> {
+        Ok(state
+            .get(&self.elem_key(index))?
+            .map(|v| v.value().to_vec()))
+    }
+
+    /// Sets the raw bytes of element `index`. If the index is out of bounds, returns an error.
+    ///
+    /// The bytes are stored as they are: if they do not decode as a `V`, every later typed read
+    /// of the element panics (see [`StateReader::get_decoded`]). Only for node tooling.
+    pub fn set_raw<ReaderAndWriter>(
+        &mut self,
+        index: u64,
+        value: &[u8],
+        state: &mut ReaderAndWriter,
+    ) -> Result<Result<(), StateVecError<N>>, <ReaderAndWriter as StateWriter<N>>::Error>
+    where
+        ReaderAndWriter: StateReaderAndWriter<N>,
+    {
+        let len = self.len(state)?;
+        Ok(if index < len {
+            state.set(&self.elem_key(index), SlotValue::from(value.to_vec()))?;
+            Ok(())
+        } else {
+            Err(StateVecError::IndexOutOfBounds(index))
+        })
+    }
+
+    /// Pushes raw bytes to the end of the vector. Writes the element, then the length (like
+    /// [`push`](Self::push); same caveat as [`set_raw`](Self::set_raw)).
+    ///
+    /// # Panics
+    /// If the vector already has `u64::MAX` elements, which would take `2^64` pushes.
+    pub fn push_raw<ReaderAndWriter>(
+        &mut self,
+        value: &[u8],
+        state: &mut ReaderAndWriter,
+    ) -> Result<(), <ReaderAndWriter as StateWriter<N>>::Error>
+    where
+        ReaderAndWriter: StateReaderAndWriter<N>,
+    {
+        let len = self.len(state)?;
+        let new_len = len
+            .checked_add(1)
+            .expect("a state vec cannot reach u64::MAX elements: that takes 2^64 pushes");
+        state.set(&self.elem_key(len), SlotValue::from(value.to_vec()))?;
+        self.set_len(new_len, state)
+    }
+
+    /// Pops the last element and returns its raw bytes. Shrinks the length, then deletes the
+    /// element (like [`pop`](Self::pop); upstream deleted first, so a failed length write left a
+    /// hole at `len - 1`).
+    pub fn pop_raw<ReaderAndWriter>(
+        &mut self,
+        state: &mut ReaderAndWriter,
+    ) -> Result<Option<Vec<u8>>, <ReaderAndWriter as StateWriter<N>>::Error>
+    where
+        ReaderAndWriter: StateReaderAndWriter<N>,
+    {
+        let len = self.len(state)?;
+        let Some(last_i) = len.checked_sub(1) else {
+            return Ok(None);
+        };
+        let Some(elem) = self.get_raw_in_bounds(last_i, state)? else {
+            // Missing element (ruled out by the invariant): leave state as it is.
+            return Ok(None);
+        };
+        self.set_len(last_i, state)?;
+        state.delete(&self.elem_key(last_i))?;
+        Ok(Some(elem))
+    }
+
+    /// Returns an iterator over the raw bytes of all elements, reading through `state` (so it
+    /// sees uncommitted writes and, in a checkpoint, records reads like any other access). It
+    /// reads the length once, then one element per step.
+    pub fn iter_raw<'a, 'ws, Reader>(
+        &'a self,
+        state: &'ws mut Reader,
+    ) -> Result<StateVecRawIter<'a, 'ws, N, V, Codec, Reader>, Reader::Error>
+    where
+        Reader: StateReader<N>,
+    {
+        let end = self.len(state)?;
+        Ok(StateVecRawIter {
+            state_vec: self,
+            state,
+            next_i: 0,
+            end,
+        })
+    }
+}
+
+/// An [`Iterator`] over the raw bytes of a state vector's elements, from both ends (native
+/// only). See [`NamespacedStateVec::iter_raw`]; behaves like [`StateVecIter`] (ends after an
+/// error or a missing element, fused, no `ExactSizeIterator`).
+#[cfg(feature = "native")]
+pub struct StateVecRawIter<'a, 'ws, N, V, Codec, Reader>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V> + StateItemCodec<u64>,
+    N: CompileTimeNamespace,
+    Reader: StateReader<N>,
+{
+    state_vec: &'a NamespacedStateVec<N, V, Codec>,
+    state: &'ws mut Reader,
+    /// Next index from the front.
+    next_i: u64,
+    /// One past the next index from the back. Invariant: `next_i <= end`.
+    end: u64,
+}
+
+#[cfg(feature = "native")]
+impl<N, V, Codec, Reader> StateVecRawIter<'_, '_, N, V, Codec, Reader>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V> + StateItemCodec<u64>,
+    N: CompileTimeNamespace,
+    Reader: StateReader<N>,
+{
+    /// Reads element `index`; on an error or a missing element, ends the iterator.
+    fn read(&mut self, index: u64) -> Option<Result<Vec<u8>, Reader::Error>> {
+        // `index < end <= len` (read when the iterator was created).
+        let item = self
+            .state_vec
+            .get_raw_in_bounds(index, self.state)
+            .transpose();
+        if !matches!(item, Some(Ok(_))) {
+            self.end = self.next_i;
+        }
+        item
+    }
+}
+
+#[cfg(feature = "native")]
+impl<N, V, Codec, Reader> Iterator for StateVecRawIter<'_, '_, N, V, Codec, Reader>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V> + StateItemCodec<u64>,
+    N: CompileTimeNamespace,
+    Reader: StateReader<N>,
+{
+    type Item = Result<Vec<u8>, Reader::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_i >= self.end {
+            return None;
+        }
+        let index = self.next_i;
+        // `index < end`, so this cannot saturate.
+        self.next_i = index.saturating_add(1);
+        self.read(index)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end.saturating_sub(self.next_i);
+        (0, usize::try_from(remaining).ok())
+    }
+}
+
+#[cfg(feature = "native")]
+impl<N, V, Codec, Reader> DoubleEndedIterator for StateVecRawIter<'_, '_, N, V, Codec, Reader>
+where
+    Codec: StateCodec,
+    Codec::ValueCodec: StateItemCodec<V> + StateItemCodec<u64>,
+    N: CompileTimeNamespace,
+    Reader: StateReader<N>,
+{
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.next_i >= self.end {
+            return None;
+        }
+        // `end > next_i >= 0`, so this cannot saturate.
+        self.end = self.end.saturating_sub(1);
+        self.read(self.end)
+    }
+}
+
+#[cfg(feature = "native")]
+impl<N, V, Codec, Reader> FusedIterator for StateVecRawIter<'_, '_, N, V, Codec, Reader>
 where
     Codec: StateCodec,
     Codec::ValueCodec: StateItemCodec<V> + StateItemCodec<u64>,

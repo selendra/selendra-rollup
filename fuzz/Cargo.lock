@@ -2185,6 +2185,7 @@ dependencies = [
 name = "selendra-state"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "borsh",
  "selendra-interface",
  "serde",

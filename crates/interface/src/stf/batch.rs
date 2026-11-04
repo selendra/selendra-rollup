@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use crate::Bytes;
+use crate::common::deserialize_object_only;
 
 /// Maximum allowed size for a raw transaction in bytes (1MB default)
 pub const MAX_RAW_TX_SIZE: usize = 1024 * 1024;
@@ -55,37 +56,6 @@ impl<'de> serde_with::DeserializeAs<'de, Bytes> for CanonicalBase64 {
             .decode(encoded)
             .map(Bytes::from)
             .map_err(serde::de::Error::custom)
-    }
-}
-
-/// Deserializes a struct, accepting only the object form in human-readable formats.
-///
-/// Derived struct impls also accept a JSON array of the field values (`[[1,2]]` for
-/// `{"data":[1,2]}`), which would give one value two JSON encodings. Binary formats such as
-/// postcard encode structs as sequences, so they keep the derived behavior.
-fn deserialize_object_only<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct ObjectOnly<T>(std::marker::PhantomData<T>);
-
-    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectOnly<T> {
-        type Value = T;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("an object")
-        }
-
-        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
-            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-        }
-    }
-
-    if deserializer.is_human_readable() {
-        deserializer.deserialize_map(ObjectOnly(std::marker::PhantomData))
-    } else {
-        T::deserialize(deserializer)
     }
 }
 
