@@ -43,9 +43,50 @@ fn json_canonical<T: serde::de::DeserializeOwned + serde::Serialize>(s: &str) {
     }
 }
 
+/// p = 2^255 - 19 and the group order l, little-endian, written out independently of the
+/// code under test.
+const P: [u8; 32] = {
+    let mut p = [0xff; 32];
+    p[0] = 0xed;
+    p[31] = 0x7f;
+    p
+};
+const L: [u8; 32] = [
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+];
+
+fn less_than(a: &[u8], b: &[u8; 32]) -> bool {
+    a.iter().rev().cmp(b.iter().rev()).is_lt()
+}
+
+/// An accepted ed25519 signature has a canonical `R` (`y < p`, no sign bit on `x = 0`) and
+/// `s < l`; anything else would let native and the SP1 guest disagree (see `ed25519.rs`).
+fn ed25519_signature_canonical(data: &[u8]) {
+    let Ok(sig) = Ed25519Signature::try_from(data) else {
+        return;
+    };
+    let bytes = sig.to_bytes();
+    let mut y = [0u8; 32];
+    y.copy_from_slice(&bytes[..32]);
+    let sign_bit = y[31] & 0x80 != 0;
+    y[31] &= 0x7f;
+    let mut minus_one = P;
+    minus_one[0] -= 1;
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    assert!(less_than(&y, &P), "ed25519 R with y >= p accepted");
+    assert!(
+        !(sign_bit && (y == one || y == minus_one)),
+        "ed25519 R with sign bit on x = 0 accepted"
+    );
+    assert!(less_than(&bytes[32..], &L), "ed25519 s >= l accepted");
+}
+
 fuzz_target!(|data: &[u8]| {
     borsh_canonical::<Ed25519PublicKey>(data);
     borsh_canonical::<Ed25519Signature>(data);
+    ed25519_signature_canonical(data);
     borsh_canonical::<EthereumPublicKey>(data);
     borsh_canonical::<EthereumSignature>(data);
     let _ = EthereumPublicKey::try_from(data);

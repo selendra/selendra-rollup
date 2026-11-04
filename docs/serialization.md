@@ -24,7 +24,10 @@ the fuzz targets check it: whenever decoding succeeds, re-encoding must give bac
   `Ed25519PublicKey` (32), `EthereumPublicKey` (33, compressed SEC1), signatures (64), `CodeCommitmentHash` (32).
 - Decoding validates: public keys must be valid curve points in their canonical encoding
   (ed25519 keys must also not be of small order, or anyone could sign for them); secp256k1
-  signatures must be low-S; hand-written decoders accept only `0`/`1` as an `Option` tag.
+  signatures must be low-S; ed25519 signatures must have a canonical `R` (`y < p`, no sign bit
+  on `x = 0`) and `s < l` (native dalek-ng decodes `R` with `y >= p`, the SP1 guest does not, so
+  accepting it would split nodes from the prover); hand-written decoders accept only `0`/`1` as
+  an `Option` tag.
 - Normalize at construction, not at use: e.g. an uncompressed secp256k1 key is converted to
   compressed when parsed, so `as_ref()`, borsh and serde always agree.
 - Store one representation. Do not keep a parsed value next to its bytes unless the bytes are
@@ -122,8 +125,9 @@ consumes them in the same order.
 - Every hint is unverified until `Storage::compute_state_update` checks the reads against the
   previous state root. A missing or undecodable hint is an **invalid witness**: `get_hint`
   panics, which is the intended result (no proof), and must never become a recoverable error.
-  Leftover hints do not change the result; `Witness::ensure_consumed` reports them (whether
-  the guest calls it is decided with the NOMT backend).
+  Leftover hints do not change the result but make the witness malleable:
+  `Witness::ensure_consumed` reports them, and the guest's state transition must fail on them
+  after `materialize_update` (Phase 8; upstream asserts `witness.is_empty()` there).
 - `ArrayWitness` itself: borsh like `Vec<Vec<u8>>` (the remaining hints); serde a sequence of
   hints, each `0x` + lowercase hex in JSON and a byte sequence in binary formats.
 - Hint types: a read value is `Option<SlotValue>`; a size query's answer is the bare leaf,

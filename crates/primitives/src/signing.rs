@@ -14,7 +14,16 @@
 //!   transactions, `0xc0..=0xff` legacy RLP transactions, `0x19` EIP-191/EIP-712), so a
 //!   Selendra message signed with a secp256k1 key is never also a valid Ethereum payload.
 //!
-//! Transactions (Phase 5) and sequencer blobs (Phase 9) must sign through this module.
+//! Native transactions (Phase 5) and sequencer blobs (Phase 9) must sign through this module.
+//!
+//! Exception: Ethereum transactions (EIP-155 legacy/typed and EIP-712 typed data) keep their
+//! Ethereum signing rules, because browser and hardware Ethereum wallets cannot sign
+//! `0xB5…` bytes. Their domain separation comes from Ethereum's own rules: EIP-155 chain ID
+//! `SELENDRA_CHAIN_ID`, or the EIP-712 domain (chain ID, name, version, and a salt carrying
+//! the runtime commitment). So native secp256k1 transactions and `OffchainMessage` are for
+//! software keys only; wallet users sign transactions through EIP-712 and log in via
+//! EIP-4361 / `personal_sign`. Wallets and SDKs that show a native message to the user
+//! (clear signing) must show or prepend this header, not just the payload.
 
 use selendra_interface::crypto::{SigVerificationError, Signature};
 
@@ -37,6 +46,12 @@ pub enum SigningDomain {
     /// A rollup transaction.
     Transaction = 1,
     /// A batch blob posted to the DA layer by a sequencer.
+    ///
+    /// The payload is a fixed-size digest, not the blob: `sha256(blob) ‖ avail_block ‖
+    /// nonce`. ed25519 hashes the whole signed message with SHA-512, which SP1 does not
+    /// accelerate, so signing a multi-MB blob directly would cost the guest a software
+    /// SHA-512 over every byte (SHA-256 is accelerated). The Avail block number and nonce
+    /// stop a blob from being re-posted.
     SequencerBlob = 2,
     /// An off-chain message (e.g. wallet sign-in). Never valid on-chain.
     OffchainMessage = 3,

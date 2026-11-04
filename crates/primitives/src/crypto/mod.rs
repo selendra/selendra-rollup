@@ -8,7 +8,9 @@ use selendra_interface::zk::CryptoSpec;
 
 #[cfg(feature = "native")]
 pub use self::ed25519::Ed25519PrivateKey;
-pub use self::ed25519::{Ed25519PublicKey, Ed25519Signature, InvalidEd25519PublicKey};
+pub use self::ed25519::{
+    Ed25519PublicKey, Ed25519Signature, InvalidEd25519PublicKey, InvalidEd25519Signature,
+};
 #[cfg(feature = "native")]
 pub use self::secp256k1::EthereumPrivateKey;
 pub use self::secp256k1::{EthereumPublicKey, EthereumSignature};

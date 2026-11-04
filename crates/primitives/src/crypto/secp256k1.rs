@@ -315,9 +315,9 @@ mod private_key {
             Ok(Self { key, bytes })
         }
 
-        /// Returns the private key as a hex string (no `0x` prefix).
+        /// Returns the secret as `0x` + lowercase hex: the same string as its JSON form.
         pub fn as_hex(&self) -> String {
-            hex::encode(self.bytes)
+            HexString(self.bytes).to_string()
         }
     }
 
@@ -555,6 +555,12 @@ mod tests {
             sig
         );
 
+        assert_eq!(sk.as_hex(), format!("0x{}", hex::encode(sk.as_ref())));
+        assert_eq!(
+            serde_json::to_string(&sk).unwrap(),
+            format!("\"{}\"", sk.as_hex())
+        );
+
         let json = serde_json::to_string(&(&pk, &sig, &sk)).unwrap();
         let (pk2, sig2, sk2): (EthereumPublicKey, EthereumSignature, EthereumPrivateKey) =
             serde_json::from_str(&json).unwrap();
@@ -584,6 +590,6 @@ mod tests {
         assert!(EthereumPrivateKey::from_bytes(N).is_err());
         let sk = EthereumPrivateKey::generate();
         let debug = format!("{sk:?}");
-        assert!(debug.contains("REDACTED") && !debug.contains(&sk.as_hex()));
+        assert!(debug.contains("REDACTED") && !debug.contains(&hex::encode(sk.as_ref())));
     }
 }

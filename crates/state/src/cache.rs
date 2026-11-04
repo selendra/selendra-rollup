@@ -1,9 +1,11 @@
 //! The read/write cache of a provable namespace ([`ProvableStorageCache`]) and the ordered
 //! accesses it produces for the state update ([`StateAccesses`]).
 //!
-//! Every map here is a `BTreeMap` (upstream: `HashMap`), so nothing that reaches the witness,
-//! the state update or the root can depend on hash iteration order, and no hasher needs OS
-//! randomness in the guest.
+//! Every map here is a `BTreeMap` (upstream: `HashMap`, with the writes sorted at freeze, so
+//! upstream was deterministic too). This is a simplicity/performance trade: no hasher in the
+//! guest and no sort at freeze, but native lookups are about 3x slower.
+// TODO(Phase 11): benchmark the caches when the sequencer state is ported; if needed, use a
+// `HashMap` with a fixed, seedless hasher natively and sort at freeze (see TODO.md).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;

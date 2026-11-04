@@ -63,11 +63,14 @@ pub trait Witness:
 
     /// Checks that every hint was consumed.
     ///
-    /// Upstream never checks this. Leftover hints cannot change what the guest computes (hints
-    /// are read in order, and every read is checked against the state root), but they make the
-    /// witness for one execution malleable.
-    // TODO(Phase 4, NOMT item / SP1 guest): decide whether the guest calls this after
-    // `compute_state_update` (see TODO.md).
+    /// Leftover hints cannot change what the guest computes (hints are read in order, and every
+    /// read is checked against the state root), but they make the witness for one execution
+    /// malleable. Upstream's zk-guest state transition asserts that the witness is empty after
+    /// `materialize_update` (`sov-modules-stf-blueprint`); ours must do the same with this
+    /// check.
+    // TODO(Phase 8, STF): call this in the guest path after `materialize_update` and panic on
+    // `Err` (upstream: `assert!(witness.is_empty())`). The guest must never call
+    // `discard_revertable_storage_cache` (see TODO.md).
     fn ensure_consumed(&self) -> Result<(), InvalidWitness> {
         if self.is_empty() {
             Ok(())
