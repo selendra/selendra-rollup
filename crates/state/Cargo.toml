@@ -1,0 +1,23 @@
+[package]
+name = "selendra-state"
+description = "Selendra state: namespaces, storage keys/values, codecs and the StateValue/StateMap/StateVec containers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+borsh = { workspace = true }
+selendra-interface = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+postcard = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+test-strategy = { workspace = true }
+
+[lints]
+workspace = true

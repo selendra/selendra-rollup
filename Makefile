@@ -13,7 +13,8 @@ clippy:
 guest:
 	cargo clippy -p selendra-interface --no-default-features --locked -- -D warnings
 	cargo clippy -p selendra-primitives --no-default-features --locked -- -D warnings
-	! cargo tree -p selendra-interface -p selendra-primitives --no-default-features -e normal --locked | grep getrandom
+	cargo clippy -p selendra-state --no-default-features --locked -- -D warnings
+	! cargo tree -p selendra-interface -p selendra-primitives -p selendra-state --no-default-features -e normal --locked | grep getrandom
 
 test:
 	cargo test --workspace --all-features --locked

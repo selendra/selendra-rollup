@@ -78,9 +78,9 @@ From `crates/rollup-interface`:
 ## Phase 4 — State & storage ⚠️
 
 From `sov-state`, `sov-db`:
-- [ ] 🔁 State containers: `StateValue/Map/Vec` + Kernel + Accessory namespaces
-- [ ] 🔁 `Storage` trait, `StateCheckpoint`, witness (`ArrayWitness`)
-- [ ] 🔁 NOMT backend: `NomtProverStorage` (native) + `NomtVerifierStorage` (guest) — pin `nomt` 1.0.5
+- [x] 🔁 State containers: `StateValue/Map/Vec` + Kernel + Accessory namespaces — new crate `selendra-state`: namespaces, `Prefix`/`SlotKey`/`SlotValue`, `BorshCodec`/`EncodeLike`, `StateReader`/`StateWriter` per namespace (no gas yet), containers + `Borrowed`/`BorrowedMut`. Fixed: `StateVec` stored elements at item `+128` (panicked for item ≥ 128, collided with that item) → elements at `prefix ‖ u64 LE index`, layout pinned in `docs/serialization.md`; vec iterator's `ExactSizeIterator` panicked on 32-bit (`try_into().unwrap()`) and retried errors forever; `SlotKey::from_slice` panicked on < 2 bytes (now fallible `try_from_bytes`); `Namespace` JSON accepted `{"user":null}`; `BorrowedMut` drop guard needed `unsafe` (now `#[must_use]` + a debug-build panic when a modified borrow is dropped unsaved). `SlotKey` is one `Arc<[u8]>` (no inline/heap dual form). `vec.remove` shifts raw bytes. Fuzz target `state_keys`. Review fixes: vec ops order writes so a failed write (out of gas) never leaves a hole in `0..len` (upstream `clear`/`pop`/`set_all` could) and `vec.get` checks `len` (returned leftovers past `len`); container ops are not atomic → caller must revert on `Err` (Phase 5); decode-panic message capped at 32 bytes (hex-dumped whole values); write-only accessory access pinned by `compile_fail` doctests. Decode failure of stored bytes still panics — causes documented on `StateReader::get_decoded`: stored type breaks the round-trip precondition (`decode(encode(v))` must succeed; debug-asserted on every write), prefix collision/corruption, or an invalid witness in the guest (must stay a panic) — ⚠️ review in Phase 14. Deferred: raw/proof APIs (below), `TxState`/gas/events and `push_accessory` (Phase 5), `BcsCodec` (Phase 7), `VersionedStateValue` (Phase 8)
+- [ ] 🔁 `Storage` trait, `StateCheckpoint`, witness (`ArrayWitness`) — also port the deferred container APIs that need it: `get_with_proof`/`verify_proof` (value, map), native raw APIs (`get_raw`/`set_raw`/`remove_raw`, map `iter_raw`/`iter_raw_from_keys`, vec `push_raw`/`pop_raw`/`iter_raw`), `arbitrary_state_map`
+- [ ] 🔁 NOMT backend: `NomtProverStorage` (native) + `NomtVerifierStorage` (guest) — guest reads return unverified witness hints, so a stored value that fails to decode means an invalid witness: `decode_unwrap` must keep panicking there (never a recoverable error); pin `nomt` 1.0.5; add the NOMT `SlotValue` helpers left out of `selendra-state` (`combine_val_hash_and_size`, `NodeLeaf`; value size as `u32` without panicking)
 - [ ] 🔁 Two-root commitment `user_root || kernel_root` → `global_root()`
 - [ ] 🔁 `rockbound` (RocksDB wrapper) or plain `rocksdb`
 - [ ] 🔁 `NomtStorageManager` (fork-aware overlays, finalize, pruning)
@@ -94,12 +94,16 @@ From `sov-state`, `sov-db`:
 ## Phase 5 — Module system
 
 From `sov-modules-api`, `sov-modules-macros`:
-- [ ] 🔁 `Module` trait, `ModuleInfo`, `Context`, `TxState`, events, errors
+- [ ] 🔁 `Module` trait, `ModuleInfo`, `Context`, `TxState`, events, errors — accessors on `selendra-state`'s `StateReader`/`StateWriter` (`TxState`, `GenesisState`, `StateAccessor`, `VersionReader`, `PerBlockCache`, `EventContainer`/`TypeErasedEvent`); `ModuleInfo` assigns unique `Prefix`es
+  - ⚠️ Any accessor `Err` (out of gas) must revert **all** of the transaction's writes: container ops are not atomic (`selendra-state` docs); modules must not catch the error and keep going with the writes kept
+  - `push_accessory` (upstream: append to an `AccessoryStateVec` with a write-only accessory accessor, reading the length through the sealed `UniversalStateAccessor` that `selendra-state` dropped): needs a new capability, e.g. an unmetered accessory-length read implemented only by `TxState` that does **not** grant `StateReader<Accessory>` (that would let the STF read non-provable state → native/zk divergence). Upstream has no callers: drop it unless a module needs it
+  - Orphan rule: upstream's metering blanket impls (`impl<T: ProvableStateReader<User>> StateReader<User> for T`, same for `Kernel`/`Accessory`/writers) can't be written outside `selendra-state` (E0210: trait and namespace markers are foreign). Plan: add a metering hook trait to `selendra-state` (e.g. `MeteredAccess<N>` with raw get/set/delete + charge hooks) with the blanket `StateReader`/`StateWriter` impls next to the traits, so every accessor is metered in one place; fallback: a local `Metered<T>` newtype. Not per-type hand-written impls (easy to forget charging gas)
+  - State value types: no floats, infallible `BorshSerialize`, and the round-trip precondition (`decode(encode(v))` succeeds for every constructible `v`) — have the module derive macros reject float fields; fix `RawTx`/`FullyBakedTx` (private fields + fallible constructor bounded by `MAX_RAW_TX_SIZE`/`MAX_FULLY_BAKED_TX_SIZE`, or a size check in `BorshSerialize`) before any module stores them
 - [ ] 🔁 `Spec` trait (`sov-modules-api/src/module/spec.rs`)
 - [ ] ✍️ Selendra `Spec`: generic `SelendraSpec<Da, InnerZkvm, OuterZkvm>` with `Address = MultiAddressEvm`, `CryptoSpec`; mock DA + mock zkVM instance for M1; `Da = AvailDaSpec`, `InnerZkvm/OuterZkvm = SP1` instance in Phase 9
 - [ ] 🔁 Derive macros: `ModuleInfo`, `Genesis`, `DispatchCall`, `Event`, `Hooks`, `MessageCodec`
 - [ ] 🔁 Hooks: pre/post dispatch tx, begin/end block, finalize
-- [ ] 🔁 Gas metering (`SlotGasMeter`, per-tx gas, base fee)
+- [ ] 🔁 Gas metering (`SlotGasMeter`, per-tx gas, base fee) — metered accessors override `StateReader::get_decoded` to charge for decoding
 - [ ] 🔁 Capabilities traits: `GasEnforcer`, `TransactionAuthenticator`, `TransactionAuthorizer`, `SequencerAuthorization`, `SequencerRemuneration`, `ProofProcessor` ⚠️
 - [ ] 🔁 Authenticator that accepts both native (ed25519) and Ethereum (secp256k1 RLP / EIP-712) txs — native txs verify via `selendra_primitives::signing` with `SigningDomain::Transaction` (not upstream's `chain_hash`); Ethereum txs via EIP-155 with chain ID 1961
 - [ ] ✍️ Rename/re-namespace everything; remove `sov-revenue-share` coupling
@@ -182,6 +186,7 @@ From `sov-modules-api`, `sov-modules-macros`:
 
 From `sov-evm`, `sov-ethereum`, `sov-address` (feature `evm`):
 - [ ] 🔁 `sov-evm` module (revm) → `selendra-evm`; include in `Runtime<S>` by default
+- [ ] 🔁 State encoding for EVM items: upstream stores `accounts`, `account_storage` (incl. `EncodeLike<(&Address, &U256), AccountStorageKey>`), `code`, `block_hashes`, `pending_transactions` with `BcsCodec`, which `selendra-state` dropped. Port `BcsCodec` (canonical decoding: reject trailing bytes, non-canonical ULEB128 lengths) or give the revm/alloy types borsh encodings; either way document the layout in `docs/serialization.md` and add a fuzz target
 - [ ] ✍️ Gas token = EVM native balance (single SEL balance via `bank`, 18 decimals both sides, no dual accounts)
 - [ ] ✍️ EVM chain ID in genesis config (`1961`); EIP-155 replay protection
 - [ ] ✍️ Pin revm version; plan for Ethereum hard-fork upgrades (Cancun/Prague opcodes)
@@ -198,7 +203,7 @@ From `sov-modules-stf-blueprint`, `sov-kernels`, `sov-capabilities`:
 - [ ] 🔁 `StfBlueprint::apply_slot` flow (checkpoint → sync kernel → select blobs → user space → batches → close block → materialize)
 - [ ] 🔁 Registered vs unregistered (emergency/force-inclusion) batch paths — keep for censorship resistance
 - [ ] 🔁 Proof blob processing (`proof_processing.rs`)
-- [ ] 🔁 Kernel: start with `BasicKernel`; then `SoftConfirmationsKernel`
+- [ ] 🔁 Kernel: start with `BasicKernel`; then `SoftConfirmationsKernel` — with `VersionedStateValue` (deferred from Phase 4: needs kernel accessors / `PrivilegedKernelAccessor`)
 - [ ] 🔁 Standard capabilities struct wired to our modules
 - [ ] ✍️ `Runtime<S>` for Selendra (core modules + EVM)
 - [ ] ✍️ Genesis config format + `genesis.json` for devnet (`sel1…` and `0x…` balances)
@@ -297,7 +302,7 @@ From `sov-sequencer`, `sov-blob-sender`:
 
 - [ ] Unit tests for every copied file (port upstream tests too)
 - [ ] Integration tests: mock DA + mock zkVM end-to-end, then Avail + SP1
-- [ ] Fuzz: tx decoding (native + RLP), blob parsing, Avail cell decoding, STF with random txs (extend `fuzz/`; addresses, keys and `FullyBakedTx`/`RawTx` already covered in Phase 3)
+- [ ] Fuzz: tx decoding (native + RLP), blob parsing, Avail cell decoding, STF with random txs (extend `fuzz/`; addresses, keys and `FullyBakedTx`/`RawTx` already covered in Phase 3, state keys in Phase 4)
 - [ ] Property test: native vs zk execution give same root
 - [ ] Load test (port `sov-synthetic-load` / soak tools), incl. EVM-heavy load
 - [ ] Threat model doc (sequencer censorship, Avail data withholding, prover liveness, EVM exploits, bridge)

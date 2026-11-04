@@ -58,6 +58,58 @@ Every decoder may receive attacker-controlled bytes (from DA blobs, txs, RPC).
   borsh's `de_strict_order` feature. A "sorted `Vec`" needs its own strictly-increasing check.
 - No floats in consensus code (`float_arithmetic` is denied workspace-wide).
 
+## State keys
+
+Every value in state is stored under a `SlotKey` (`selendra-state`): a 2-byte `Prefix`
+`[module, item]` followed by the encoded item key. Each state item (container) has its own
+prefix, so different items can never share a key. Changing any layout below changes every
+state root (a fork).
+
+| Container | Key | Value |
+|---|---|---|
+| `StateValue` | `[module, item]` | `codec(value)` |
+| `StateMap` | `[module, item] ‖ key_codec(key)` | `codec(value)` |
+| `StateVec` length | `[module, item]` | `codec(len: u64)` |
+| `StateVec` element `i` | `[module, item] ‖ i` as `u64` LE (8 bytes, = borsh) | `codec(element)` |
+
+- The default codec is `BorshCodec` (borsh for keys and values). E.g. `StateMap<u64, _>` at
+  prefix `(1, 2)` stores key `5` under `[1, 2, 5, 0, 0, 0, 0, 0, 0, 0]`.
+- `StateVec` element keys use fixed little-endian bytes whatever the codec, so the 2-byte length
+  key and 10-byte element keys can never collide. Upstream Sovereign stored elements under item
+  `item + 128`, which panicked for `item ≥ 128` and collided with that other item.
+- A vec stores exactly elements `0..len` (`pop`, `remove`, `clear`, `set_all` delete what they
+  drop) **as long as no operation failed**. Container operations make several accessor calls and
+  are not atomic: when an accessor returns `Err` (e.g. out of gas) the caller must discard all
+  of that accessor's writes (Phase 5: the transaction is reverted), never catch the error and
+  keep them. Even so, `StateVec` shrinks its length before deleting and grows it after writing,
+  so after a failure every element in `0..len` is still present, and every read is
+  bounds-checked against `len` (a leftover element past `len` is never returned).
+- `User`, `Kernel` and `Accessory` are separate key spaces: the same key in two namespaces
+  is two different values.
+- Decoding a stored value panics on failure (`StateItemDecoder::decode_unwrap`; the message
+  shows at most 32 bytes). A failure means one of:
+  - the stored type breaks the **round-trip precondition**: for every value `v` that can be
+    constructed, `decode(encode(v))` must succeed and give `v`. A type whose decoder is stricter
+    than its encoder (`RawTx`/`FullyBakedTx` today: public fields, unbounded encoder, size-capped
+    decoder) must enforce its bound at construction or must not be stored, otherwise whoever
+    chooses the stored value can make every later read panic. Containers `debug_assert!` the
+    round trip on every write (debug builds only);
+  - two items share a prefix, or the database is corrupt (bugs);
+  - in the zk guest, an invalid witness: reads return the prover's unverified hints, which are
+    checked against the state root only later. Panicking (no proof) is the intended result; this
+    must never become a recoverable error, or control flow would depend on unverified bytes.
+- Encoding a stored key or value panics where borsh refuses it: a collection longer than
+  `u32::MAX` or of zero-sized types, a **NaN float**, or an error from a hand-written
+  `BorshSerialize`. So state key and value types contain **no floats** (see "Untrusted input")
+  and have infallible `BorshSerialize` impls.
+- Encodings of the key types (each has exactly one accepted encoding):
+  - `SlotKey`: borsh like `Vec<u8>` (the whole key, prefix included), at least 2 bytes. JSON and
+    `Display` use `0x` + lowercase hex. `SlotKey::try_from_bytes` rejects < 2 bytes and never panics.
+  - `SlotValue`: borsh like `Vec<u8>`; JSON `0x` + lowercase hex.
+  - `Prefix`: borsh the 2 bytes; JSON and `Display` `"0x0102"`.
+  - `Namespace` / `ProvableNamespace`: borsh one tag byte (`0` user, `1` kernel, `2` accessory);
+    JSON only the snake_case string (`"user"`). Serde's derived decoding would also accept `{"user":null}`.
+
 ## Signatures
 
 Never sign or verify a bare payload. Use `selendra_primitives::signing`, which signs
@@ -68,5 +120,5 @@ valid Ethereum transaction or EIP-191/712 message.
 ## Checking
 
 - `cargo test` — unit tests, including known-answer vectors and rejection tests.
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `tx_decoding`
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `state_keys`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

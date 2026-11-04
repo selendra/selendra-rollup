@@ -104,7 +104,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [addresses, keys, tx_decoding]
+        target: [addresses, keys, state_keys, tx_decoding]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

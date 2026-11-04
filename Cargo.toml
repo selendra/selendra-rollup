@@ -5,6 +5,7 @@ resolver = "2"
 members = [
     "crates/interface",
     "crates/primitives",
+    "crates/state",
 ]
 # Built separately: the SP1 guest with the SP1 toolchain, fuzz targets with nightly `cargo fuzz`.
 exclude = ["zk/sp1-guest", "fuzz"]
@@ -40,6 +41,7 @@ mem_forget = "deny"
 # Add `selendra-<name> = { path = "crates/<name>", default-features = false }` with each new crate.
 selendra-interface = { path = "crates/interface", default-features = false }
 selendra-primitives = { path = "crates/primitives", default-features = false }
+selendra-state = { path = "crates/state", default-features = false }
 
 # Use the newest releases. Exception: crates whose output is consensus-critical (encoding,
 # hashing, EVM) are pinned exactly (`=x.y.z`) and only upgraded deliberately.
