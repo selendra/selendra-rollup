@@ -11,6 +11,7 @@ publish.workspace = true
 anyhow = { workspace = true }
 arbitrary = { workspace = true, optional = true }
 borsh = { workspace = true }
+nomt-core = { workspace = true }
 selendra-interface = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -21,6 +22,13 @@ proptest = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 test-strategy = { workspace = true }
+
+# A real NOMT database for the verifier's tests (a test prover driving NOMT sessions). NOMT is
+# Unix-only and is not tested on 32-bit, so those tests are skipped there (and on 32-bit targets
+# such as `make test32`'s i686); everything else runs on every target.
+[target.'cfg(all(unix, target_pointer_width = "64"))'.dev-dependencies]
+nomt = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
 default = []

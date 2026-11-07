@@ -10,11 +10,14 @@ cargo-fuzz = true
 [dependencies]
 borsh = { version = "=1.8.1", features = ["derive", "de_strict_order"] }
 libfuzzer-sys = "0.4"
+# The version `selendra-state` pins (its proofs are fuzzed through nomt-core directly too).
+nomt-core = { version = "=1.0.5", default-features = false }
 selendra-interface = { path = "../crates/interface" }
 selendra-primitives = { path = "../crates/primitives" }
 selendra-state = { path = "../crates/state" }
 serde = "1"
 serde_json = "1"
+sha2 = { version = "=0.10.9", default-features = false }
 
 # Separate workspace: built with nightly + sanitizers by `cargo fuzz`, not by the main workspace.
 [workspace]

@@ -5,6 +5,12 @@
 //! [`Witness`] the native prover records for the zk guest, and the [`StateCheckpoint`] holding
 //! a block's reads and writes.
 //!
+//! The NOMT state trees: their root ([`StorageRoot`]), the canonical multi-proof
+//! ([`NomtProof`]), proof verification ([`verify_storage_proof`], [`verify_namespace`]) and the
+//! zk-guest storage ([`NomtVerifierStorage`]). All of it is in the guest build too. The native
+//! prover storage, which needs the NOMT database, will live in a node-only crate (not yet
+//! written).
+//!
 //! Containers do not hold data: they compute keys and encode values, and read and write through
 //! an accessor ([`StateReader`] / [`StateWriter`]) for their namespace. The storage key layout
 //! is specified in `docs/serialization.md` ("State keys").
@@ -23,8 +29,10 @@ mod checkpoint;
 pub mod codec;
 pub mod containers;
 pub mod namespaces;
+mod nomt;
 mod slot;
 mod storage;
+mod storage_root;
 #[cfg(test)]
 mod test_state;
 #[cfg(test)]
@@ -69,6 +77,11 @@ pub use namespaces::{
     Accessory, CompileTimeNamespace, Kernel, Namespace, ProvableCompileTimeNamespace,
     ProvableNamespace, User,
 };
+// `self::`: in test builds the `nomt` crate (a dev-dependency) has the same name.
+pub use self::nomt::{
+    InvalidNomtProof, NomtProof, NomtVerifierStorage, namespace_needs_proof, verify_namespace,
+    verify_storage_proof,
+};
 pub use slot::{Prefix, SlotKey, SlotKeyTooShort, SlotValue};
 pub use storage::{
     DefaultStorageSpec, MerkleProofSpec, NodeLeaf, NodeLeafAndMaybeValue, StateRoot, StateUpdate,
@@ -76,4 +89,5 @@ pub use storage::{
 };
 #[cfg(feature = "native")]
 pub use storage::{NativeStorage, ProofOutput};
+pub use storage_root::{GLOBAL_ROOT_TAG, StorageRoot};
 pub use witness::{ArrayWitness, InvalidWitness, Witness};

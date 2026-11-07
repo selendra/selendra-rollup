@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e71f7c5288add387434026d612492692affdb513609c506c72a8819ff18cc5d7 # shrinks to input = _VerifierReplaysTheNomtProverArgs { genesis: [], ops: [KernelRemove(0)] }
+cc a719a8cc4d4ca0d24835a186e39a434c5cb92951619fb090f74c3b5e5ea7f7ad # shrinks to input = _EveryNomtHintIsVerifiedArgs { genesis: [ValueRemove], ops: [KernelSet(0, 84)], position: 3576856511415540683, flip: 136 }

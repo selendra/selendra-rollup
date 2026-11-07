@@ -50,7 +50,7 @@ fn accessory_map() -> AccessoryStateMap<u8, u32> {
 // Replay: the verifier, fed only the prover's witness, must compute exactly what the prover did.
 
 /// Something the replayed operations run on: a checkpoint, or a model of one.
-trait Harness:
+pub(crate) trait Harness:
     InfallibleStateReaderAndWriter<User>
     + InfallibleStateReaderAndWriter<Kernel>
     + StateWriter<Accessory, Error = Infallible>
@@ -77,9 +77,9 @@ impl<St: Storage> Harness for StateCheckpoint<St> {
 /// A checkpoint modeled with plain maps: `pending` on top of `committed`. Accessory writes are
 /// not revertable, like in the checkpoint.
 #[derive(Debug, Default)]
-struct Model {
-    committed: InMemoryState,
-    pending: InMemoryState,
+pub(crate) struct Model {
+    pub(crate) committed: InMemoryState,
+    pub(crate) pending: InMemoryState,
 }
 
 macro_rules! impl_model {
@@ -131,7 +131,7 @@ impl Harness for Model {
 }
 
 #[derive(Debug, Clone, test_strategy::Arbitrary)]
-enum Op {
+pub(crate) enum Op {
     ValueSet(u32),
     ValueGet,
     ValueRemove,
@@ -156,7 +156,7 @@ enum Op {
 }
 
 /// Runs `ops`, returning every result.
-fn run<H: Harness>(ops: &[Op], state: &mut H) -> Vec<String> {
+pub(crate) fn run<H: Harness>(ops: &[Op], state: &mut H) -> Vec<String> {
     let (mut value, mut map, mut vec, mut kernel, mut accessory) =
         (value(), map(), vec(), kernel_map(), accessory_map());
     let mut out = Vec::new();
@@ -216,7 +216,7 @@ fn model_of(storage: &TestStorage) -> Model {
     }
 }
 
-fn borsh_roundtrip(witness: &ArrayWitness) -> ArrayWitness {
+pub(crate) fn borsh_roundtrip(witness: &ArrayWitness) -> ArrayWitness {
     borsh::from_slice(&borsh::to_vec(witness).unwrap()).unwrap()
 }
 
@@ -272,7 +272,7 @@ fn verifier_replays_the_prover(
     assert_eq!(written, model_accessory);
 }
 
-fn hints(witness: &ArrayWitness) -> Vec<Vec<u8>> {
+pub(crate) fn hints(witness: &ArrayWitness) -> Vec<Vec<u8>> {
     borsh::from_slice(&borsh::to_vec(witness).unwrap()).unwrap()
 }
 
@@ -282,7 +282,7 @@ thread_local! {
 
 /// Runs `f`, catching a panic without printing it (for the thousands of expected
 /// invalid-witness panics below; other panics, on any thread, still print).
-fn catch_quietly<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+pub(crate) fn catch_quietly<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
         let default = std::panic::take_hook();

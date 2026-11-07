@@ -1560,6 +1560,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "nomt-core"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19b43245e3ed2b32eaf8c062506ec16a4ff3f08e0373c29c2b0b202e8c325409"
+dependencies = [
+ "arrayvec",
+ "bitvec",
+ "borsh",
+ "digest 0.10.7",
+ "ruint",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2137,11 +2150,13 @@ version = "0.0.0"
 dependencies = [
  "borsh",
  "libfuzzer-sys",
+ "nomt-core",
  "selendra-interface",
  "selendra-primitives",
  "selendra-state",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2187,6 +2202,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "borsh",
+ "nomt-core",
  "selendra-interface",
  "serde",
  "thiserror 2.0.21",

@@ -10,6 +10,13 @@ ignore = [
   # `paste` is unmaintained (no fix exists). Compile-time proc-macro only, no runtime code.
   # Pulled in by alloy-primitives, which the EVM (revm) needs anyway. Re-check when alloy drops it.
   { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro via alloy-primitives, see comment" },
+  # Dev-only: `nomt` 1.0.5 is a dev-dependency of selendra-state (the test prover of the NOMT
+  # verifier tests, 64-bit Unix only); never in a node or guest build. The guest uses only
+  # `nomt-core`, which has none of these. They BLOCK `nomt` becoming a normal dependency (the
+  # planned node-only db crate's NomtProverStorage): re-check, upgrade or patch before that.
+  { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks double free on a panicking Drop: dev-only via nomt (test prover), see comment" },
+  { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained: dev-only via nomt -> imbl (test prover), see comment" },
+  { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained: dev-only via nomt (test prover), see comment" },
 ]
 
 [licenses]

@@ -21,7 +21,7 @@ Every value has exactly **one** accepted byte string. Decoders reject everything
 the fuzz targets check it: whenever decoding succeeds, re-encoding must give back the input.
 
 - Fixed-size types encode as raw bytes with no length prefix: `Address` (28), `EthereumAddress` (20),
-  `Ed25519PublicKey` (32), `EthereumPublicKey` (33, compressed SEC1), signatures (64), `CodeCommitmentHash` (32).
+  `Ed25519PublicKey` (32), `EthereumPublicKey` (33, compressed SEC1), signatures (64), `CodeCommitmentHash` (32), `StorageRoot` (64).
 - Decoding validates: public keys must be valid curve points in their canonical encoding
   (ed25519 keys must also not be of small order, or anyone could sign for them); secp256k1
   signatures must be low-S; ed25519 signatures must have a canonical `R` (`y < p`, no sign bit
@@ -151,6 +151,72 @@ when absent), `proof`, `namespace`; no unknown fields, no array form. Verify a p
 container's `verify_proof`, which checks the namespace, that the key belongs to that container
 (prefix, and for maps that the key bytes are the canonical encoding of the decoded key), then
 opens it against the root; `Storage::open_proof` alone does not check the container.
+
+## NOMT state trees, roots and proofs
+
+Each provable namespace (user, kernel) is one NOMT binary trie hashed with
+`BinaryHasher<Storage::Hasher>` (SHA-256): internal node `H(left ‖ right)` with the MSB cleared,
+leaf `H(key_path ‖ value_hash)` with the MSB set, `[0; 32]` the empty sub-trie. A slot is the
+leaf with:
+
+| Item | Value |
+|---|---|
+| `key_path` | `H(SlotKey bytes)`, the whole key including its prefix (nobody chooses a key's tree position) |
+| `value_hash` | `H(val_hash_and_size)` (NOMT stores the 36 bytes `val_hash_and_size` as the leaf's value) |
+
+Known answer (`crates/state/src/nomt/vectors.rs`, checked against real NOMT and recomputed with
+Python's `hashlib`): the slot keys `0x010101` → `0x0a000000` and `0x010102` → `0x14000000`
+(`StateMap<u8, u32>` at prefix `[1, 1]`, entries `1 → 10`, `2 → 20`) give the key path
+`0x75c8fd04ad916aec3e3d5cb76a452b116b3d4d0912a0a485e9fb8e3d240e210c` and value hash
+`0x8779dca21abd1566b0e17b01af2b08520fdd985127b1b8862e193a47d9adc843` for the first, and the
+tree root `0x41fb4b75571d866034946fd190e7baaa0e6e8add2e241bd666804ee9e8a50c92`.
+
+`StorageRoot` (the state root, `Storage::Root` of the NOMT storages):
+
+- borsh: `user_root ‖ kernel_root`, exactly 64 raw bytes (no length prefix). Stored by the node.
+- JSON / `Display`: one `0x` + lowercase hex string of the 64 bytes (binary serde formats: 64
+  bytes). Wrong length, missing `0x` and uppercase are rejected.
+- Pre-genesis: 64 zero bytes (both trees empty).
+- `global_root()` (what the zk proof commits to): `H("SELENDRA/state-root/v1" ‖ user_root ‖
+  kernel_root)`, tag `GLOBAL_ROOT_TAG`. Upstream hashed the untagged `user_root ‖ kernel_root`,
+  a 64-byte preimage with the exact shape of a NOMT internal node: the global root was (but for
+  one bit) the root of a tree with the user tree on the left and the kernel tree on the right.
+  Pinned: pre-genesis `0xf47d4e573e5b2d5c704dab9cf25e6e17c14c3675344d4cb0240709bb8c568ad2`.
+
+`NomtProof` (`Storage::Proof` of the NOMT storages, and their multi-proof hint): a nomt-core
+`MultiProof` that is well-formed. nomt-core's own type is malleable (a `TriePosition` compares
+only its first `depth` bits, so the bits past them and its `node_index` take any value) and its
+verification indexes unchecked (it panics on depth > 256, too few siblings, a path depth above
+its bisection, a path that is a prefix of another). Decoding therefore checks:
+
+- every terminator position has depth ≤ 256, equal to its path's depth, zero bits past the
+  depth and the `node_index` derived from its path (equal to `TriePosition::from_path_and_depth`
+  of its masked path; the root position at depth 0);
+- terminal paths strictly ascending, none a prefix of the next;
+- each path's depth where verification places its terminal, and exactly as many siblings as
+  verification consumes (a hash-free walk of nomt-core's `verify_range`);
+- the input is the re-encoding of the result.
+
+borsh: nomt-core 1.0.5's borsh encoding of the `MultiProof`: `paths` (`u32` LE count, then per
+path the terminal and `depth` as `u64` LE), then `siblings` (`u32` LE count, then 32 bytes each).
+A terminal is tag `0` + leaf (`key_path`, `value_hash`) or tag `1` + terminator position (32
+path bytes, `depth` `u16` LE, `node_index` `u64` LE). Pinned in `nomt/vectors.rs` (a real NOMT
+proof and a three-terminal one), so a nomt-core upgrade that changes it fails the tests. JSON:
+the borsh bytes as one `0x` + lowercase hex string (binary serde formats: the bytes);
+nomt-core's derived serde form is not accepted (unknown fields, array form).
+
+The verifier also rejects (as an invalid witness, not a decoding error) a multi-proof with a
+path that no access of the block needs, and an empty multi-proof for accesses (NOMT proves keys
+of an empty tree with one root terminator), so each execution has one witness.
+
+Witness hints of the NOMT storages, in order: one `Option<NodeLeaf>` per `get_leaf`, one
+`Option<SlotValue>` per `get` and per `put_in_witness` (the guest reads that one with `get`),
+then in `compute_state_update` one `NomtProof` for the user namespace and then one for the
+kernel namespace, each only if that namespace has a read or a write in the block
+(`namespace_needs_proof`, shared by prover and verifier). Historical and unbound reads add
+nothing. A namespace whose only access is a delete of an absent key is accessed: it gets a
+proof (the prover must still give NOMT such deletes as reads of the key's absence: NOMT 1.0.5
+panics committing a session whose only changes are such deletes into an empty database).
 
 ## Signatures
 

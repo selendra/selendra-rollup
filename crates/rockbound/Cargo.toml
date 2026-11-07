@@ -1,0 +1,37 @@
+[package]
+name = "rockbound"
+description = "A low level interface transforming RocksDB into a type-oriented data store (vendored from Sovereign Labs' rockbound, see README.md)"
+# Vendored from https://github.com/sovereign-labs/rockbound at rev
+# 0aa43d4e581e047ba8d8e7a662ec6ade32b2cae3 (crate version 0.1.0), with fixes; see README.md.
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+authors = ["Sovereign Labs <info@sovereign.xyz>", "Selendra"]
+publish.workspace = true
+# Some of the code is derived from Aptos <https://github.com/aptos-labs/aptos-core>, which is
+# licensed under Apache-2.0. See LICENSE and NOTICE.
+license = "Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+quick_cache = { workspace = true }
+rocksdb = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Integration tests (tests/) use the `test-utils` items.
+rockbound = { path = ".", features = ["test-utils"] }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = []
+# Test helpers: `rockbound::test` fields and `VersionedDB::{commit, set_cache_size, cache_hits,
+# cache_misses}`.
+test-utils = ["quick_cache/stats"]
+
+[lints]
+workspace = true

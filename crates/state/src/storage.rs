@@ -417,7 +417,7 @@ mod native {
             key: SlotKey,
         ) -> anyhow::Result<ProofOutput<Self>>;
 
-        /// Gets the *global* root hash of the tree at the requested version.
+        /// Gets the root (both namespace roots) of the tree at the requested version.
         ///
         /// `version` is interpreted as a post-commit version: the returned root is the state
         /// *after* the X-th commit was applied. Returns `Some(root)` iff a root has been
@@ -428,7 +428,7 @@ mod native {
         /// fallback should use `.unwrap_or(Self::PRE_GENESIS_ROOT)`.
         fn get_root_hash(&self, version: SlotNumber) -> Option<Self::Root>;
 
-        /// Gets the *global* root hash of the tree at the requested version.
+        /// Gets the root (both namespace roots) of the tree at the requested version.
         ///
         /// The requested version is not checked against the latest version of this instance.
         /// Returns the root committed at the largest committed version `<= version`, or `None`

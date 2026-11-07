@@ -6,3 +6,5 @@ provenance.md
 /fuzz/corpus
 /fuzz/artifacts
 /fuzz/coverage
+# Machine-local cargo settings (e.g. libclang paths in the Flatpak sandbox)
+/.cargo/config.toml
