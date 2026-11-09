@@ -1,11 +1,6 @@
 //! `StateCheckpoint` tests against the test storage: the prover/verifier replay, the
 //! revertable cache, first reads, invalid witnesses and accessory state.
 
-use std::cell::Cell;
-use std::convert::Infallible;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Once;
-
 use borsh::BorshSerialize;
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::{Strategy, any};
@@ -15,193 +10,14 @@ use sha2::Sha256;
 use super::*;
 use crate::test_state::{InMemoryState, UnwrapInfallible};
 use crate::test_storage::TestStorage;
-use crate::{
-    AccessoryStateMap, ArrayWitness, BorshCodec, InfallibleStateReaderAndWriter, InvalidWitness,
-    KernelStateMap, NodeLeaf, Prefix, StateMap, StateValue, StateVec, Witness,
+use crate::test_utils::{
+    Harness, Model, Op, accessory_map, borsh_roundtrip, catch_quietly, hints, kernel_map, map, run,
+    value,
 };
+use crate::{ArrayWitness, BorshCodec, InvalidWitness, NodeLeaf, Prefix, StateValue, Witness};
 
-const VALUE: Prefix = Prefix::new(1, 0);
-const MAP: Prefix = Prefix::new(1, 1);
-const VEC: Prefix = Prefix::new(1, 2);
-const KERNEL_MAP: Prefix = Prefix::new(2, 0);
-const ACCESSORY_MAP: Prefix = Prefix::new(3, 0);
-
-fn value() -> StateValue<u32> {
-    StateValue::with_codec(VALUE, BorshCodec)
-}
-
-fn map() -> StateMap<u8, u32> {
-    StateMap::with_codec(MAP, BorshCodec)
-}
-
-fn vec() -> StateVec<u32> {
-    StateVec::with_codec(VEC, BorshCodec)
-}
-
-fn kernel_map() -> KernelStateMap<u8, u32> {
-    KernelStateMap::with_codec(KERNEL_MAP, BorshCodec)
-}
-
-fn accessory_map() -> AccessoryStateMap<u8, u32> {
-    AccessoryStateMap::with_codec(ACCESSORY_MAP, BorshCodec)
-}
-
-// ---------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------
 // Replay: the verifier, fed only the prover's witness, must compute exactly what the prover did.
-
-/// Something the replayed operations run on: a checkpoint, or a model of one.
-pub(crate) trait Harness:
-    InfallibleStateReaderAndWriter<User>
-    + InfallibleStateReaderAndWriter<Kernel>
-    + StateWriter<Accessory, Error = Infallible>
-{
-    fn size(&mut self, namespace: ProvableNamespace, key: &SlotKey) -> Option<u32>;
-    fn commit(&mut self);
-    fn discard(&mut self);
-}
-
-impl<St: Storage> Harness for StateCheckpoint<St> {
-    fn size(&mut self, namespace: ProvableNamespace, key: &SlotKey) -> Option<u32> {
-        self.get_size(namespace, key)
-    }
-
-    fn commit(&mut self) {
-        self.commit_revertable_storage_cache();
-    }
-
-    fn discard(&mut self) {
-        self.discard_revertable_storage_cache();
-    }
-}
-
-/// A checkpoint modeled with plain maps: `pending` on top of `committed`. Accessory writes are
-/// not revertable, like in the checkpoint.
-#[derive(Debug, Default)]
-pub(crate) struct Model {
-    pub(crate) committed: InMemoryState,
-    pub(crate) pending: InMemoryState,
-}
-
-macro_rules! impl_model {
-    ($namespace:ty) => {
-        impl StateReader<$namespace> for Model {
-            type Error = Infallible;
-
-            fn get(&mut self, key: &SlotKey) -> Result<Option<SlotValue>, Self::Error> {
-                StateReader::<$namespace>::get(&mut self.pending, key)
-            }
-        }
-
-        impl StateWriter<$namespace> for Model {
-            type Error = Infallible;
-
-            fn set(&mut self, key: &SlotKey, value: SlotValue) -> Result<(), Self::Error> {
-                StateWriter::<$namespace>::set(&mut self.pending, key, value)
-            }
-
-            fn delete(&mut self, key: &SlotKey) -> Result<(), Self::Error> {
-                StateWriter::<$namespace>::delete(&mut self.pending, key)
-            }
-        }
-    };
-}
-
-impl_model!(User);
-impl_model!(Kernel);
-impl_model!(Accessory);
-
-impl Harness for Model {
-    fn size(&mut self, namespace: ProvableNamespace, key: &SlotKey) -> Option<u32> {
-        let state = match namespace {
-            ProvableNamespace::User => &self.pending.user,
-            ProvableNamespace::Kernel => &self.pending.kernel,
-        };
-        state.get(key).map(SlotValue::size)
-    }
-
-    fn commit(&mut self) {
-        self.committed = self.pending.clone();
-    }
-
-    fn discard(&mut self) {
-        let accessory = std::mem::take(&mut self.pending.accessory);
-        self.pending = self.committed.clone();
-        self.pending.accessory = accessory;
-    }
-}
-
-#[derive(Debug, Clone, test_strategy::Arbitrary)]
-pub(crate) enum Op {
-    ValueSet(u32),
-    ValueGet,
-    ValueRemove,
-    ValueDelete,
-    MapSet(#[strategy(0u8..6)] u8, u32),
-    MapGet(#[strategy(0u8..6)] u8),
-    MapRemove(#[strategy(0u8..6)] u8),
-    MapSetIfAbsent(#[strategy(0u8..6)] u8, u32),
-    MapSize(#[strategy(0u8..6)] u8),
-    KernelSet(#[strategy(0u8..6)] u8, u32),
-    KernelGet(#[strategy(0u8..6)] u8),
-    KernelRemove(#[strategy(0u8..6)] u8),
-    KernelSize(#[strategy(0u8..6)] u8),
-    VecPush(u32),
-    VecPop,
-    VecGet(#[strategy(0u64..6)] u64),
-    VecRemove(#[strategy(0u64..6)] u64),
-    AccessorySet(#[strategy(0u8..4)] u8, u32),
-    AccessoryDelete(#[strategy(0u8..4)] u8),
-    Commit,
-    Discard,
-}
-
-/// Runs `ops`, returning every result.
-pub(crate) fn run<H: Harness>(ops: &[Op], state: &mut H) -> Vec<String> {
-    let (mut value, mut map, mut vec, mut kernel, mut accessory) =
-        (value(), map(), vec(), kernel_map(), accessory_map());
-    let mut out = Vec::new();
-    for op in ops {
-        let result = match op {
-            Op::ValueSet(v) => format!("{:?}", value.set(v, state)),
-            Op::ValueGet => format!("{:?}", value.get(state)),
-            Op::ValueRemove => format!("{:?}", value.remove(state)),
-            Op::ValueDelete => format!("{:?}", value.delete(state)),
-            Op::MapSet(k, v) => format!("{:?}", map.set(k, v, state)),
-            Op::MapGet(k) => format!("{:?}", map.get(k, state)),
-            Op::MapRemove(k) => format!("{:?}", map.remove(k, state)),
-            Op::MapSetIfAbsent(k, v) => format!("{:?}", map.set_if_absent(k, v, state)),
-            Op::MapSize(k) => format!(
-                "{:?}",
-                state.size(ProvableNamespace::User, &map.slot_key(k))
-            ),
-            Op::KernelSet(k, v) => format!("{:?}", kernel.set(k, v, state)),
-            Op::KernelGet(k) => format!("{:?}", kernel.get(k, state)),
-            Op::KernelRemove(k) => format!("{:?}", kernel.remove(k, state)),
-            Op::KernelSize(k) => {
-                format!(
-                    "{:?}",
-                    state.size(ProvableNamespace::Kernel, &kernel.slot_key(k))
-                )
-            }
-            Op::VecPush(v) => format!("{:?}", vec.push(v, state)),
-            Op::VecPop => format!("{:?}", vec.pop(state)),
-            Op::VecGet(i) => format!("{:?}", vec.get(*i, state)),
-            Op::VecRemove(i) => format!("{:?}", vec.remove(*i, state)),
-            Op::AccessorySet(k, v) => format!("{:?}", accessory.set(k, v, state)),
-            Op::AccessoryDelete(k) => format!("{:?}", accessory.delete(k, state)),
-            Op::Commit => {
-                state.commit();
-                "commit".into()
-            }
-            Op::Discard => {
-                state.discard();
-                "discard".into()
-            }
-        };
-        out.push(result);
-    }
-    out
-}
 
 fn model_of(storage: &TestStorage) -> Model {
     let committed = storage.committed();
@@ -214,10 +30,6 @@ fn model_of(storage: &TestStorage) -> Model {
         committed: state.clone(),
         pending: state,
     }
-}
-
-pub(crate) fn borsh_roundtrip(witness: &ArrayWitness) -> ArrayWitness {
-    borsh::from_slice(&borsh::to_vec(witness).unwrap()).unwrap()
 }
 
 /// Random operations (with commits and discards) run through a prover checkpoint over a
@@ -270,32 +82,6 @@ fn verifier_replays_the_prover(
         .filter_map(|(k, v)| v.map(|v| (k, v)))
         .collect();
     assert_eq!(written, model_accessory);
-}
-
-pub(crate) fn hints(witness: &ArrayWitness) -> Vec<Vec<u8>> {
-    borsh::from_slice(&borsh::to_vec(witness).unwrap()).unwrap()
-}
-
-thread_local! {
-    static QUIET: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Runs `f`, catching a panic without printing it (for the thousands of expected
-/// invalid-witness panics below; other panics, on any thread, still print).
-pub(crate) fn catch_quietly<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
-    static HOOK: Once = Once::new();
-    HOOK.call_once(|| {
-        let default = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !QUIET.with(Cell::get) {
-                default(info);
-            }
-        }));
-    });
-    QUIET.with(|quiet| quiet.set(true));
-    let result = catch_unwind(AssertUnwindSafe(f));
-    QUIET.with(|quiet| quiet.set(false));
-    result
 }
 
 /// Every hint the verifier consumes must be verified. Prover and verifier share the cache, so

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rockbound::schema::{ColumnFamilyName, Result};
 use rockbound::test::TestField;
-use rockbound::{define_schema, Schema, SchemaBatch, DB};
+use rockbound::{DB, Schema, SchemaBatch, define_schema};
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
 
@@ -344,65 +344,20 @@ fn test_checkpoint() {
     }
 }
 
-mod async_tests {
-    use super::*;
+// Upstream's async tests (`*_async` wrappers, dropped here) as sync; its async checkpoint test
+// duplicated `test_checkpoint`.
+#[test]
+fn test_put_get_delete() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = open_db(tmpdir);
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_async_ops() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let db = open_db(tmpdir);
+    db.put::<TestSchema1>(&TestField(1), &TestField(55))
+        .unwrap();
+    assert_eq!(
+        db.get::<TestSchema1>(&TestField(1)).unwrap(),
+        Some(TestField(55)),
+    );
 
-        db.put_async::<TestSchema1>(&TestField(1), &TestField(55))
-            .await
-            .unwrap();
-        assert_eq!(
-            db.get_async::<TestSchema1>(&TestField(1)).await.unwrap(),
-            Some(TestField(55)),
-        );
-
-        db.delete_async::<TestSchema1>(&TestField(1)).await.unwrap();
-        assert!(db
-            .get_async::<TestSchema1>(&TestField(1))
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_checkpoint() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let checkpoint_parent = tempfile::tempdir().unwrap();
-        let checkpoint = checkpoint_parent.path().join("checkpoint");
-        {
-            let db = open_db(&tmpdir);
-            db.put_async::<TestSchema1>(&TestField(0), &TestField(0))
-                .await
-                .unwrap();
-            db.create_checkpoint_async(&checkpoint).await.unwrap();
-        }
-        {
-            let db = open_db(&tmpdir);
-            assert_eq!(
-                db.get_async::<TestSchema1>(&TestField(0)).await.unwrap(),
-                Some(TestField(0)),
-            );
-
-            let cp = open_db(&checkpoint);
-            assert_eq!(
-                cp.get_async::<TestSchema1>(&TestField(0)).await.unwrap(),
-                Some(TestField(0)),
-            );
-            cp.put_async::<TestSchema1>(&TestField(1), &TestField(1))
-                .await
-                .unwrap();
-            assert_eq!(
-                cp.get_async::<TestSchema1>(&TestField(1)).await.unwrap(),
-                Some(TestField(1)),
-            );
-            assert_eq!(
-                db.get_async::<TestSchema1>(&TestField(1)).await.unwrap(),
-                None
-            );
-        }
-    }
+    db.delete::<TestSchema1>(&TestField(1)).unwrap();
+    assert!(db.get::<TestSchema1>(&TestField(1)).unwrap().is_none());
 }

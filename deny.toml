@@ -10,13 +10,21 @@ ignore = [
   # `paste` is unmaintained (no fix exists). Compile-time proc-macro only, no runtime code.
   # Pulled in by alloy-primitives, which the EVM (revm) needs anyway. Re-check when alloy drops it.
   { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro via alloy-primitives, see comment" },
-  # Dev-only: `nomt` 1.0.5 is a dev-dependency of selendra-state (the test prover of the NOMT
-  # verifier tests, 64-bit Unix only); never in a node or guest build. The guest uses only
-  # `nomt-core`, which has none of these. They BLOCK `nomt` becoming a normal dependency (the
-  # planned node-only db crate's NomtProverStorage): re-check, upgrade or patch before that.
-  { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks double free on a panicking Drop: dev-only via nomt (test prover), see comment" },
-  { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained: dev-only via nomt -> imbl (test prover), see comment" },
-  { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained: dev-only via nomt (test prover), see comment" },
+  # Via `nomt` 1.0.5 (exact pin, consensus-critical), a normal dependency of `selendra-db`: the
+  # node's state trees (and a dev-dependency of selendra-state's NOMT tests). Node-only: the zk
+  # guest uses only `nomt-core`, which pulls none of these, and nomt is not built for 32-bit
+  # targets. `imbl` 3.0.0 (nomt's) requires `imbl-sized-chunks` 0.1, so the fixed 0.2.0 cannot
+  # be used until nomt upgrades `imbl`.
+  # RUSTSEC-2026-0292: `Chunk::{clear, drop_left, drop_right}` / `InlineArray::{clear, truncate}`
+  # double-free only when an element's `Drop` panics. nomt 1.0.5 keeps in `imbl` collections only
+  # `KeyPath`/`Key` ([u8; 32]), `u64`, `PageId` (an `ArrayVec<u8, _>`), `ValueChange` (`Vec<u8>`
+  # and a hash), none of which has a `Drop` that can panic, and `Arc<BranchNode>` (beatree index),
+  # whose last drop runs `FatPage::drop` -> `PagePool::dealloc`: a push onto a thread-local free
+  # list (a `RefCell` borrow that `dealloc` never re-enters) and a move to the global list under
+  # a lock. No panic there (allocation failure aborts). Re-check on every nomt upgrade.
+  { id = "RUSTSEC-2026-0292", reason = "imbl-sized-chunks double free needs a panicking element Drop; nomt's imbl elements have none (node-only via nomt in selendra-db), see comment" },
+  { id = "RUSTSEC-2026-0247", reason = "bitmaps unmaintained: via nomt -> imbl, node-only (selendra-db), see comment" },
+  { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained: via nomt (page cache hashing), node-only (selendra-db), see comment" },
 ]
 
 [licenses]

@@ -218,6 +218,37 @@ nothing. A namespace whose only access is a delete of an absent key is accessed:
 proof (the prover must still give NOMT such deletes as reads of the key's absence: NOMT 1.0.5
 panics committing a session whose only changes are such deletes into an empty database).
 
+## Node state databases (on disk)
+
+What a node stores (`selendra-db`; node-only, not consensus: a format change needs a migration
+or a resync, never a fork). Under the database directory: the NOMT trees `user_nomt/` and
+`kernel_nomt/` (key path `H(SlotKey)` → the 36 bytes `val_hash_and_size`, as above; NOMT's own
+file format), and three RocksDB instances. Versions (slot numbers) are `u64` big-endian (8
+bytes), so byte order is version order.
+
+| Column family | RocksDB | Key | Value |
+|---|---|---|---|
+| `user_state_values`, `kernel_state_values` | `state-db/` (live) | the raw `SlotKey` bytes | the raw `SlotValue` bytes; a deleted key is absent |
+| `user_state_historical_values`, `kernel_state_historical_values` | `archival-state-db/` | `SlotKey` bytes ‖ version | `0x01 ‖ value` for a write, `0x00` for a delete |
+| `user_state_pruning`, `kernel_state_pruning` | `archival-state-db/` | version ‖ `SlotKey` bytes | empty |
+| `user_state_version_metadata`, `kernel_state_version_metadata` | both | `[0]` committed version (live), `[1]` pruned version (archival) | version |
+| `state_root_hashes` | both, and `accessory/` | version | the 64 bytes `user_root ‖ kernel_root` (= `StorageRoot` borsh) |
+| `module_accessory_state` | `accessory/` | borsh `Vec<u8>` key ‖ version | borsh `Option<Vec<u8>>` (`None`: deleted) |
+| `accessory_keys_by_version` | `accessory/` | version ‖ borsh `Vec<u8>` key | empty |
+
+- The archival value is tagged so an empty value (e.g. a `StateValue<()>`, borsh of `()` is
+  empty) is not read back as a delete; upstream rockbound archived deletes as the empty string,
+  so its databases are not readable by ours (any other archival value is reported as
+  corruption).
+- A historical read of a key at version `v` takes the row `key ‖ v'` with the largest `v' <= v`
+  and skips rows of other keys that start with the same bytes (a `StateVec`'s length at `P` and
+  its element 0 at `P ‖ 0u64`; upstream rockbound returned "absent" there).
+- Every decoder rejects data that is not exactly an encoding (wrong length, trailing bytes):
+  stored data that does not decode is an error, never a panic.
+- Every committed version stores its root in all three RocksDB instances, and the NOMT trees
+  hold the newest one, so the databases are checked against each other when opened.
+- Upstream's legacy `*_jmt_values` column-family names are not used (fresh chain).
+
 ## Signatures
 
 Never sign or verify a bare payload. Use `selendra_primitives::signing`, which signs

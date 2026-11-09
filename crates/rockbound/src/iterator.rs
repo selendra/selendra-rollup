@@ -273,17 +273,17 @@ impl<Item> Iterator for RawDbIter<'_, Item> {
         let next_item = self.db_iter.item().expect("db_iter.key() failed.");
         // Have to allocate to fix lifetime issue
         // If next item is larger than upper bound, we're done
-        if let std::ops::Bound::Included(upper) = self.upper_bound.as_ref() {
-            if next_item.0 > upper.as_slice() {
-                // That we're moving forward!!!
-                assert_eq!(
-                    &ScanDirection::Forward,
-                    &self.direction,
-                    "Upper bound exceeded, while moving backward: {next_item:?} {upper:?}",
-                );
-                self.done = true;
-                return None;
-            }
+        if let std::ops::Bound::Included(upper) = self.upper_bound.as_ref()
+            && next_item.0 > upper.as_slice()
+        {
+            // That we're moving forward!!!
+            assert_eq!(
+                &ScanDirection::Forward,
+                &self.direction,
+                "Upper bound exceeded, while moving backward: {next_item:?} {upper:?}",
+            );
+            self.done = true;
+            return None;
         }
         let next_item = (self.decode_fn)(next_item);
 
@@ -307,7 +307,7 @@ mod tests {
     use crate::schema::ColumnFamilyName;
     use crate::schema::KeyEncoder;
     use crate::test::TestField;
-    use crate::{define_schema, DB};
+    use crate::{DB, define_schema};
     use proptest::prelude::*;
 
     define_schema!(TestSchema1, TestField, TestField, "TestCF1");

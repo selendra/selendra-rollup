@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
+use rockbound::SchemaBatch;
 use rockbound::versioned_db::{
     HistoricalValueError, VersionedDB, VersionedDeltaReader, VersionedSchemaBatch,
 };
-use rockbound::SchemaBatch;
 use tempfile::TempDir;
 
-use super::{commit_batch, LiveKeys, TestDB, TestField, TestKey, VersionedDbCache};
+use super::{LiveKeys, TestDB, TestField, TestKey, VersionedDbCache, commit_batch};
 
 type V = VersionedDB<LiveKeys, VersionedDbCache<LiveKeys>>;
 
@@ -494,7 +494,7 @@ fn capped_prune_clears_exactly_the_collected_prefix() {
     let remaining: Vec<u64> = db
         .iter_pruning_keys_up_to_version(6)
         .unwrap()
-        .map(|p| p.version_and_key().0)
+        .map(|p| p.unwrap().version_and_key().0)
         .collect();
     assert_eq!(remaining, vec![3, 4, 5, 6]);
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use rockbound::versioned_db::{VersionedDB, VersionedDeltaReader, VersionedSchemaBatch};
 
-use crate::versioned_db_inner::{commit_batch, put_keys, TestDB, VersionedDbCache};
+use crate::versioned_db_inner::{TestDB, VersionedDbCache, commit_batch, put_keys};
 
 use super::{LiveKeys, TestField, TestKey};
 
@@ -30,13 +30,15 @@ fn check_iterator_with_cursor(
         .unwrap();
     for (key, value) in expected_values {
         let next = iter.next();
-        let next = next.unwrap_or_else(|| {
-            panic!(
-                "Expected key {} with value {} in iterator, but got None",
-                std::str::from_utf8(key).unwrap(),
-                value
-            )
-        });
+        let next = next
+            .unwrap_or_else(|| {
+                panic!(
+                    "Expected key {} with value {} in iterator, but got None",
+                    std::str::from_utf8(key).unwrap(),
+                    value
+                )
+            })
+            .unwrap();
         assert_eq!(
             next.0,
             TestKey::from(key.to_vec()),
@@ -47,14 +49,14 @@ fn check_iterator_with_cursor(
         );
         assert_eq!(
             next.1,
-            Some(TestField::new(*value)),
+            TestField::new(*value),
             "Expected value {} for key {} in iterator, but got {}",
             value,
             std::str::from_utf8(key).unwrap(),
-            next.1.unwrap()
+            next.1
         );
     }
-    assert_eq!(iter.next(), None);
+    assert!(iter.next().is_none());
 }
 
 #[test]
@@ -83,7 +85,7 @@ fn test_iteration() {
     let mut iter = delta_reader
         .iter_with_prefix(TestKey::from(b"key".to_vec()))
         .unwrap();
-    assert_eq!(iter.next(), None);
+    assert!(iter.next().is_none());
     drop(iter);
 
     put_keys(
@@ -169,9 +171,11 @@ fn test_iteration() {
         &VersionedSchemaBatch::<LiveKeys>::default(),
         3,
     );
-    assert!(delta_reader
-        .iter_with_prefix(TestKey::from(b"key".to_vec()))
-        .is_err());
+    assert!(
+        delta_reader
+            .iter_with_prefix(TestKey::from(b"key".to_vec()))
+            .is_err()
+    );
 }
 
 #[test]
@@ -200,7 +204,7 @@ fn test_iteration_with_cursor() {
     let mut iter = delta_reader
         .iter_with_prefix(TestKey::from(b"key".to_vec()))
         .unwrap();
-    assert_eq!(iter.next(), None);
+    assert!(iter.next().is_none());
     drop(iter);
     let mut iter = delta_reader
         .iter_with_prefix_and_cursor(
@@ -208,7 +212,7 @@ fn test_iteration_with_cursor() {
             Some(TestKey::from(b"key11".to_vec())),
         )
         .unwrap();
-    assert_eq!(iter.next(), None);
+    assert!(iter.next().is_none());
     drop(iter);
 
     put_keys(
@@ -381,9 +385,11 @@ fn test_iteration_with_cursor() {
         &VersionedSchemaBatch::<LiveKeys>::default(),
         3,
     );
-    assert!(delta_reader
-        .iter_with_prefix(TestKey::from(b"key".to_vec()))
-        .is_err());
+    assert!(
+        delta_reader
+            .iter_with_prefix(TestKey::from(b"key".to_vec()))
+            .is_err()
+    );
 }
 
 #[test]

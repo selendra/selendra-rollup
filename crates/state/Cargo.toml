@@ -12,8 +12,11 @@ anyhow = { workspace = true }
 arbitrary = { workspace = true, optional = true }
 borsh = { workspace = true }
 nomt-core = { workspace = true }
+proptest = { workspace = true, optional = true }
+rockbound = { workspace = true, optional = true }
 selendra-interface = { workspace = true }
 serde = { workspace = true }
+test-strategy = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
@@ -35,8 +38,14 @@ default = []
 # Node-only code (never in the zk guest): `NativeStorage` (accessory and historical reads),
 # raw container APIs and storage proofs.
 native = ["selendra-interface/native"]
+# rockbound's key traits for `SlotKey` (the node's flat store keys values by `SlotKey`; the impls
+# must live here, orphan rule). Separate from `native` so that `native` alone doesn't build RocksDB.
+rockbound = ["native", "dep:rockbound"]
 # `NamespacedStateMap::arbitrary_state_map`.
 arbitrary = ["dep:arbitrary"]
+# `test_utils`: helpers for the node's storage tests (`selendra-db` dev-dependency). Never in a node
+# or guest build.
+test-utils = ["dep:proptest", "dep:test-strategy"]
 
 [lints]
 workspace = true

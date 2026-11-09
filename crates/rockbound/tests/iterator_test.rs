@@ -4,7 +4,7 @@
 use rockbound::schema::{KeyDecoder, KeyEncoder, ValueCodec};
 use rockbound::test::{KeyPrefix1, KeyPrefix2, TestCompositeField, TestField};
 use rockbound::{
-    define_schema, Operation, Schema, SchemaBatch, SchemaIterator, SeekKeyEncoder, DB,
+    DB, Operation, Schema, SchemaBatch, SchemaIterator, SeekKeyEncoder, define_schema,
 };
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;

@@ -1,7 +1,5 @@
 # Sovereign SDK — Architecture Breakdown
 
-Nov 2, 2026 · @Vuthy · Live version: https://claude.ai/artifact/Fzwk94GDbWqqh8hJrjbqyf
-
 ## Overview
 
 The Sovereign SDK is a Rust toolkit for building app-specific rollups. It splits a chain into four swappable parts: a **DA layer**, a **zkVM**, a **state transition function (STF)** made of modules, and a **full node / sequencer** that runs them. This breakdown covers [sovereign-labs/sovereign-sdk](https://github.com/sovereign-labs/sovereign-sdk) at commit `c7046e2` (30 Oct 2026).

@@ -1,7 +1,4 @@
 // Adapted from Aptos::storage::schemadb;
-// While most of the Sovereign SDK will be available under both
-// MIT and APACHE 2.0 licenses, this file is
-// licensed under APACHE 2.0 only.
 
 //! A type-safe interface over [`DB`](crate::DB) column families.
 

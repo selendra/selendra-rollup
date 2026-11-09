@@ -2740,6 +2740,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "selendra-db"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "borsh",
+ "nomt",
+ "parking_lot",
+ "proptest",
+ "rockbound",
+ "selendra-interface",
+ "selendra-state",
+ "sha2 0.10.9",
+ "tempfile",
+ "test-strategy",
+ "tracing",
+]
+
+[[package]]
 name = "selendra-interface"
 version = "0.1.0"
 dependencies = [
@@ -2802,6 +2820,7 @@ dependencies = [
  "nomt-core",
  "postcard",
  "proptest",
+ "rockbound",
  "selendra-interface",
  "serde",
  "serde_json",

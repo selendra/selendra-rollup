@@ -1,5 +1,6 @@
 mod cache;
 mod delta_reader;
+mod fixes;
 mod iterator;
 mod pruning;
 
@@ -11,8 +12,8 @@ use rockbound::versioned_db::{
     CacheForVersionedDB, HasPrefix, SchemaWithVersion, VersionedDB, VersionedSchemaBatch,
     VersionedSchemaKeyMarker,
 };
-use rockbound::{default_cf_descriptor, new_cache_for_schema, CodecError};
 use rockbound::{CacheForSchema, DB};
+use rockbound::{CodecError, default_cf_descriptor, new_cache_for_schema};
 use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
 use tempfile::TempDir;
 

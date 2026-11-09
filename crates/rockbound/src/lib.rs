@@ -24,7 +24,7 @@ mod config;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test;
 
-pub use config::{gen_rocksdb_options, gen_rocksdb_options_with, RocksdbConfig};
+pub use config::{RocksdbConfig, gen_rocksdb_options, gen_rocksdb_options_with};
 pub use versioned_db::VersionedColumnFamilyKind;
 
 use std::{path::Path, sync::Arc};
@@ -32,10 +32,10 @@ use std::{path::Path, sync::Arc};
 use anyhow::format_err;
 use iterator::ScanDirection;
 pub use iterator::{SchemaIterator, SeekKeyEncoder};
-use quick_cache::{sync::Cache, Weighter};
+use quick_cache::{Weighter, sync::Cache};
 pub use rocksdb;
-use rocksdb::ReadOptions;
 pub use rocksdb::DEFAULT_COLUMN_FAMILY_NAME;
+use rocksdb::ReadOptions;
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -276,7 +276,6 @@ impl DB {
         )
     }
 
-
     /// Writes single record.
     #[tracing::instrument(skip_all, level = "error")]
     pub fn put<S: Schema>(
@@ -296,7 +295,6 @@ impl DB {
         )
     }
 
-
     /// Delete a single key from the database.
     #[tracing::instrument(skip_all, level = "error")]
     pub fn delete<S: Schema>(&self, key: &impl KeyCodec<S>) -> anyhow::Result<()> {
@@ -311,7 +309,6 @@ impl DB {
             "delete",
         )
     }
-
 
     /// Removes the database entries in the range `["from", "to")` using default write options.
     ///
@@ -335,7 +332,6 @@ impl DB {
             "delete_range",
         )
     }
-
 
     fn iter_with_direction<S: Schema>(
         &self,
@@ -590,7 +586,6 @@ impl DB {
         )
     }
 
-
     pub(crate) fn write_opt(
         &self,
         batch: rocksdb::WriteBatch,
@@ -650,12 +645,11 @@ impl<K, V: AsRef<[u8]>> Operation<K, V> {
 
 fn is_range_bounds_inverse(range: &impl std::ops::RangeBounds<SchemaKey>) -> bool {
     match (range.start_bound(), range.end_bound()) {
-        (std::ops::Bound::Included(start), std::ops::Bound::Included(end)) => start > end,
-        (std::ops::Bound::Included(start), std::ops::Bound::Excluded(end)) => start > end,
-        (std::ops::Bound::Excluded(start), std::ops::Bound::Included(end)) => start > end,
-        (std::ops::Bound::Excluded(start), std::ops::Bound::Excluded(end)) => start > end,
-        (std::ops::Bound::Unbounded, _) => false,
-        (_, std::ops::Bound::Unbounded) => false,
+        (
+            std::ops::Bound::Included(start) | std::ops::Bound::Excluded(start),
+            std::ops::Bound::Included(end) | std::ops::Bound::Excluded(end),
+        ) => start > end,
+        (std::ops::Bound::Unbounded, _) | (_, std::ops::Bound::Unbounded) => false,
     }
 }
 

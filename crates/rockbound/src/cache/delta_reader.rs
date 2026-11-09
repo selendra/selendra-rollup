@@ -2,7 +2,7 @@
 use crate::cache::PaginatedResponse;
 use crate::iterator::{RawDbIter, ScanDirection};
 use crate::schema::{KeyCodec, KeyDecoder, ValueCodec};
-use crate::{Operation, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder, DB};
+use crate::{DB, Operation, Schema, SchemaBatch, SchemaKey, SchemaValue, SeekKeyEncoder};
 use std::cmp::Ordering;
 use std::collections::btree_map;
 use std::iter::{Peekable, Rev};
@@ -48,7 +48,6 @@ impl DeltaReader {
         self.db.get(key)
     }
 
-
     /// Get the value of the smallest key written value for given [`Schema`].
     pub fn get_smallest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         let mut iterator = self.iter::<S>()?;
@@ -60,7 +59,6 @@ impl DeltaReader {
         Ok(None)
     }
 
-
     /// Get a value of the largest key written value for given [`Schema`].
     pub fn get_largest<S: Schema>(&self) -> anyhow::Result<Option<(S::Key, S::Value)>> {
         let mut iterator = self.iter_rev::<S>()?;
@@ -71,7 +69,6 @@ impl DeltaReader {
         }
         Ok(None)
     }
-
 
     /// Get the largest value in [`Schema`] that is smaller or equal given `seek_key`.
     pub fn get_prev<S: Schema>(
@@ -89,7 +86,6 @@ impl DeltaReader {
         }
         Ok(None)
     }
-
 
     /// Get `n` keys >= `seek_key`, paginated.
     pub fn get_n_from_first_match<S: Schema>(
@@ -121,7 +117,6 @@ impl DeltaReader {
         })
     }
 
-
     /// Collects all key-value pairs in given range: `smallest..largest`.
     pub fn collect_in_range<S: Schema, Sk: SeekKeyEncoder<S>>(
         &self,
@@ -138,7 +133,6 @@ impl DeltaReader {
             })
             .collect()
     }
-
 
     #[allow(dead_code)]
     fn iter<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<'_, SnapshotIter<'_>>> {
@@ -375,7 +369,7 @@ mod tests {
     use super::*;
     use crate::schema::KeyEncoder;
     use crate::test::{TestCompositeField, TestField};
-    use crate::{define_schema, SchemaKey, SchemaValue, DB};
+    use crate::{DB, SchemaKey, SchemaValue, define_schema};
     use proptest::prelude::*;
 
     define_schema!(TestSchema, TestCompositeField, TestField, "TestCF");
@@ -481,7 +475,11 @@ mod tests {
         let value_1 = delta_reader.get::<S>(&FIELD_1).unwrap();
         assert!(value_1.is_none());
 
-        let values: Vec<_> = delta_reader.iter::<S>().unwrap().map(Result::unwrap).collect();
+        let values: Vec<_> = delta_reader
+            .iter::<S>()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert!(values.is_empty());
 
         let full_range =
@@ -492,7 +490,11 @@ mod tests {
             .collect();
         assert!(values.is_empty());
 
-        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().map(Result::unwrap).collect();
+        let values: Vec<_> = delta_reader
+            .iter_rev::<S>()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert!(values.is_empty());
         let values: Vec<_> = delta_reader
             .iter_rev_range::<S>(full_range)
@@ -503,7 +505,6 @@ mod tests {
 
         let paginated_response = delta_reader
             .get_n_from_first_match::<S>(&TestCompositeField::MAX, 100)
-            
             .unwrap();
         assert!(paginated_response.key_value.is_empty());
         assert!(paginated_response.next.is_none());
@@ -512,7 +513,6 @@ mod tests {
             .collect_in_range::<S, TestCompositeField>(
                 TestCompositeField::MIN..TestCompositeField::MAX,
             )
-            
             .unwrap();
         assert!(values.is_empty());
     }
@@ -543,20 +543,11 @@ mod tests {
         assert!(value.is_none());
 
         // Not found
-        let value = delta_reader
-            .get::<S>(&TestCompositeField::MIN)
-            
-            .unwrap();
+        let value = delta_reader.get::<S>(&TestCompositeField::MIN).unwrap();
         assert!(value.is_none());
-        let value = delta_reader
-            .get::<S>(&TestCompositeField::MAX)
-            
-            .unwrap();
+        let value = delta_reader.get::<S>(&TestCompositeField::MAX).unwrap();
         assert!(value.is_none());
-        let value = delta_reader
-            .get::<S>(&TestCompositeField(3, 5, 1))
-            
-            .unwrap();
+        let value = delta_reader.get::<S>(&TestCompositeField(3, 5, 1)).unwrap();
         assert!(value.is_none());
     }
 
@@ -568,6 +559,7 @@ mod tests {
         let values: Vec<_> = delta_reader
             .iter_range::<S>(range.clone())
             .unwrap()
+            .map(Result::unwrap)
             .collect();
         assert_eq!(
             expected_len,
@@ -581,6 +573,7 @@ mod tests {
         let values_rev: Vec<_> = delta_reader
             .iter_rev_range::<S>(range.clone())
             .unwrap()
+            .map(Result::unwrap)
             .collect();
         assert_eq!(
             expected_len,
@@ -595,14 +588,22 @@ mod tests {
 
     // Checks that values returned by iterator are sorted.
     fn basic_check_iterator(delta_reader: &DeltaReader, expected_len: usize) {
-        let values: Vec<_> = delta_reader.iter::<S>().unwrap().map(Result::unwrap).collect();
+        let values: Vec<_> = delta_reader
+            .iter::<S>()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(expected_len, values.len());
         assert!(
             values.windows(2).all(|w| w[0].0 <= w[1].0),
             "iter should be sorted"
         );
 
-        let values_rev: Vec<_> = delta_reader.iter_rev::<S>().unwrap().map(Result::unwrap).collect();
+        let values_rev: Vec<_> = delta_reader
+            .iter_rev::<S>()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(expected_len, values_rev.len());
         assert!(
             values_rev.windows(2).all(|w| w[0].0 >= w[1].0),
@@ -663,7 +664,6 @@ mod tests {
         // MIN, should not find anything
         let prev = delta_reader
             .get_prev::<S>(&TestCompositeField::MIN)
-            
             .unwrap();
         assert!(prev.is_none());
 
@@ -677,18 +677,13 @@ mod tests {
         assert_eq!(TestField(200), prev_value);
 
         // Some value in the middle
-        let (prev_key, prev_value) = delta_reader
-            .get_prev::<S>(&FIELD_3)
-            
-            .unwrap()
-            .unwrap();
+        let (prev_key, prev_value) = delta_reader.get_prev::<S>(&FIELD_3).unwrap().unwrap();
         assert_eq!(FIELD_3, prev_key);
         assert_eq!(TestField(3000), prev_value);
 
         // Value in between
         let (prev_key, prev_value) = delta_reader
             .get_prev::<S>(&TestCompositeField(3, 5, 8))
-            
             .unwrap()
             .unwrap();
         assert_eq!(FIELD_3, prev_key);
@@ -702,7 +697,6 @@ mod tests {
 
         let paginated_response = delta_reader
             .get_n_from_first_match::<S>(&TestCompositeField::MIN, 2)
-            
             .unwrap();
         assert_eq!(2, paginated_response.key_value.len());
         let expected_first_page = vec![(FIELD_2, TestField(200)), (FIELD_3, TestField(3000))];
@@ -711,7 +705,6 @@ mod tests {
 
         let paginated_response = delta_reader
             .get_n_from_first_match::<S>(&FIELD_4, 2)
-            
             .unwrap();
         assert_eq!(2, paginated_response.key_value.len());
         let expected_first_page = vec![(FIELD_4, TestField(4)), (FIELD_6, TestField(6000))];
@@ -743,14 +736,13 @@ mod tests {
         for (field_range, expected_range) in test_cases {
             let range_values = delta_reader
                 .collect_in_range::<S, TestCompositeField>(field_range.clone())
-                
                 .unwrap();
 
             assert_eq!(
                 all_values[expected_range].to_vec(),
                 range_values,
                 "failed for range {field_range:?}"
-            )
+            );
         }
     }
 
@@ -815,12 +807,16 @@ mod tests {
 
         let delta_reader = DeltaReader::new(db, schema_batches);
 
-        let values: Vec<_> = delta_reader.iter_rev::<S>().unwrap().map(Result::unwrap).collect();
+        let values: Vec<_> = delta_reader
+            .iter_rev::<S>()
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         values
     }
 
-    fn generate_db_entries_and_snapshots(
-    ) -> impl Strategy<Value = (Vec<TestItem>, Vec<Vec<TestItem>>)> {
+    fn generate_db_entries_and_snapshots()
+    -> impl Strategy<Value = (Vec<TestItem>, Vec<Vec<TestItem>>)> {
         let entries = prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 50);
         let snapshots = prop::collection::vec(
             prop::collection::vec((any::<TestCompositeField>(), any::<TestField>()), 10),
@@ -953,7 +949,8 @@ mod tests {
                     TestCompositeField::MIN..TestCompositeField::MAX,
                     min_key.clone()..TestCompositeField::MAX,
                 ];
-                // last key is definitely excluded
+                // last key is definitely excluded (upstream expected `all_values[..len]` here and
+                // for a `MAX` last key below; never noticed since the check never ran)
                 let def_chopped_ranges = vec![
                     TestCompositeField::MIN..max_key.clone(),
                     min_key.clone()..max_key.clone(),
@@ -966,7 +963,7 @@ mod tests {
                     prop_assert!(range_values.is_ok());
                     let range_values = range_values.unwrap();
                     prop_assert_eq!(
-                        &all_values[..all_values.len()],
+                        &all_values[..all_values.len() - 1],
                         &range_values[..]
                     );
                 }
@@ -980,7 +977,7 @@ mod tests {
 
                     let last_key = all_values.iter().last().map(|(k, _v)| k);
                     let expected_values = if last_key == Some(&TestCompositeField::MAX) {
-                        &all_values[..all_values.len()]
+                        &all_values[..all_values.len() - 1]
                     } else {
                         &all_values[..]
                     };

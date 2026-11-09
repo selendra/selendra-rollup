@@ -1,8 +1,8 @@
 //! The zk-guest half of the storage based on [NOMT](https://github.com/thrumdev/nomt/) (Nearly
 //! Optimal Merkle Trie): proof verification ([`verify_storage_proof`], [`verify_namespace`]),
 //! the canonical proof type ([`NomtProof`]) and the guest storage ([`NomtVerifierStorage`]).
-//! The native prover storage, which drives a NOMT database, will build on these (not yet
-//! written).
+//! The native prover storage, which drives the NOMT databases, builds on these:
+//! `NomtProverStorage` in the node-only `selendra-db` crate.
 //!
 //! # What the trees commit to
 //! Each provable namespace (user, kernel) is one NOMT binary trie, hashed with

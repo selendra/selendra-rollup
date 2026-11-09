@@ -26,13 +26,13 @@
 //! `VersionedDB::get_versioned_internal`).
 
 use std::{
-    collections::{btree_map, BTreeMap},
+    collections::{BTreeMap, btree_map},
     hash::Hash,
     iter::Peekable,
     marker::PhantomData,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -42,11 +42,11 @@ use quick_cache::sync::Cache;
 use rocksdb::ColumnFamilyDescriptor;
 
 use crate::{
+    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, DB, Schema, SchemaBatch,
     default_cf_descriptor_with,
     iterator::{RawDbIter, ScanDirection},
     schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec},
     schema_batch::RangeDeleteKey,
-    BasicWeighter, CacheForSchema, CfDescriptorBuilder, CodecError, Schema, SchemaBatch, DB,
 };
 
 #[derive(Debug, Default)]
@@ -100,7 +100,7 @@ impl VersionedTableMetadataKey {
                 return Err(CodecError::Wrapped(anyhow::anyhow!(
                     "Invalid versioned table metadata key: {}",
                     data[0]
-                )))
+                )));
             }
         })
     }
@@ -582,8 +582,7 @@ where
     pub fn iter_pruning_keys_up_to_version(
         &self,
         version: u64,
-    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<PrunableKey<V>>> + use<'_, V, C>>
-    {
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<PrunableKey<V>>> + use<'_, V, C>> {
         // Because some keys are longer than 8 bytes, we use an exclusive range
         let first_version_to_keep = version.saturating_add(1);
         let range = ..first_version_to_keep.to_be_bytes().to_vec();
@@ -594,8 +593,7 @@ where
     pub fn iter_pruning_keys_at_version(
         &self,
         version: u64,
-    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<PrunableKey<V>>> + use<'_, V, C>>
-    {
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<PrunableKey<V>>> + use<'_, V, C>> {
         let start = version.to_be_bytes().to_vec();
         let Some(end) = version.checked_add(1) else {
             anyhow::bail!("Unable to create iterator: upper bound overflow detected.")
@@ -609,10 +607,10 @@ where
 
     /// Iterates over the pruning keys in `range`. Yields `Err` on a RocksDB error or an
     /// undecodable key (DB corruption; upstream panicked).
-    fn iter_pruning_keys(
+    fn iter_pruning_keys<R: std::ops::RangeBounds<Vec<u8>>>(
         &self,
-        range: impl std::ops::RangeBounds<Vec<u8>>,
-    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<PrunableKey<V>>> + use<'_, V, C>>
+        range: R,
+    ) -> anyhow::Result<impl Iterator<Item = anyhow::Result<PrunableKey<V>>> + use<'_, V, C, R>>
     {
         let iter = self
             .archival_db
@@ -1255,13 +1253,12 @@ where
                 }
             }
             // 1.2 Look at the Db, doing the same thing
-            if let Some(key) = self.peek_db_key()? {
-                if smallest_key
+            if let Some(key) = self.peek_db_key()?
+                && smallest_key
                     .as_ref()
                     .is_none_or(|(_smallest_idx, smallest_key)| key < *smallest_key)
-                {
-                    smallest_key = Some((LocationOfSmallestKey::Db, key));
-                }
+            {
+                smallest_key = Some((LocationOfSmallestKey::Db, key));
             }
 
             // If we didn't find any keys that matches our prefix, we're done.
@@ -1285,10 +1282,10 @@ where
             // we want to return the k/v pair from the newest snapshot and advance the other two iterators so that we don't return stale values of `A` on the next call to `next`.
             // Step 3.1: advance any snapshot iterators
             for snapshot in self.snapshots.iter_mut() {
-                if let Some((key, _value)) = snapshot.as_mut().and_then(|s| s.peek()) {
-                    if *key == &smallest_key {
-                        let _ = snapshot.as_mut().and_then(|s| s.next());
-                    }
+                if let Some((key, _value)) = snapshot.as_mut().and_then(|s| s.peek())
+                    && *key == &smallest_key
+                {
+                    let _ = snapshot.as_mut().and_then(|s| s.next());
                 }
             }
             // Step 3.2 advance the db iterator
@@ -1380,8 +1377,13 @@ where
         };
 
         let latest_version = self.latest_version();
-        if version_on_disk.is_some_and(|v| v > latest_version.unwrap_or(0)) {
-            return Err(anyhow::anyhow!("Version on disk is newer than the latest version in the reader. Cannot create an iterator which is guaranteed to be consistent with the version of this storage."));
+        // Compared as options: a reader of the empty DB (`None`) is older than any committed
+        // version. (Upstream compared `v > latest_version.unwrap_or(0)`, so a reader taken
+        // before version 0 was committed iterated version 0's rows.)
+        if version_on_disk > latest_version {
+            return Err(anyhow::anyhow!(
+                "Version on disk is newer than the latest version in the reader. Cannot create an iterator which is guaranteed to be consistent with the version of this storage."
+            ));
         }
         // Setup: get a list of all the in-memory snapshots that are newer than the version on disk.
         // Our goal is to provide a consistent view of the state in this reader to the caller - so for each key that we discover we'll take the version from the newest snapshot,
@@ -1448,7 +1450,11 @@ where
         // - It's not safe to fetch from the live table (that is probably also newer)
         // - The value we want is guaranteed to be in the archival DB, so we can fetch it from there.
         if min_safe_db_version.is_some_and(|v| v > own_version) {
-            tracing::trace!(?min_safe_db_version, "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}", own_version);
+            tracing::trace!(
+                ?min_safe_db_version,
+                "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}",
+                own_version
+            );
             // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
             return Ok(self.get_historical_borrowed(key, own_version)?);
         }
@@ -1459,7 +1465,8 @@ where
         // If a write happened while we were fetching from the db, the results are unknown. Now that the state we want is guaranteed to be in the archival DB, we can fetch it safely from there.
         if safe_db_version.is_some_and(|v| v > own_version) {
             tracing::trace!(
-                ?safe_db_version, "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
+                ?safe_db_version,
+                "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
                 own_version
             );
             Ok(self.get_historical_borrowed(key, own_version)?)
@@ -1563,7 +1570,9 @@ where
 /// An error that occurs when querying for a historical value.
 #[derive(Debug, thiserror::Error)]
 pub enum HistoricalValueError {
-    #[error("The requested version {requested_version} is newer than the newest version in the reader {latest_version:?}")]
+    #[error(
+        "The requested version {requested_version} is newer than the newest version in the reader {latest_version:?}"
+    )]
     /// The requested version is newer than the latest version in the reader.
     FutureVersion {
         /// The requested version.
@@ -1571,7 +1580,9 @@ pub enum HistoricalValueError {
         /// The latest version in the reader.
         latest_version: Option<u64>,
     },
-    #[error("The requested version {requested_version} has been pruned. The oldest available version is {oldest_available_version:?}")]
+    #[error(
+        "The requested version {requested_version} has been pruned. The oldest available version is {oldest_available_version:?}"
+    )]
     /// The requested version is older than the oldest available version.
     PrunedVersion {
         /// The requested version.

@@ -7,9 +7,9 @@ use proptest::prelude::{Strategy, any};
 use proptest::prop_assert;
 
 use super::test_prover::{NomtTestProver, Root, Spec};
-use crate::checkpoint::tests::{Harness, Model, Op, borsh_roundtrip, catch_quietly, hints, run};
 use crate::namespaces::ProvableNamespace;
 use crate::test_state::InMemoryState;
+use crate::test_utils::{Harness, Model, Op, borsh_roundtrip, catch_quietly, hints, run};
 use crate::{
     ArrayWitness, BorshCodec, KernelStateMap, NomtVerifierStorage, OrderedReadsAndWrites, Prefix,
     SlotKey, SlotValue, StateAccesses, StateCheckpoint, StateMap, StateRoot, Storage, Witness,
@@ -475,9 +475,10 @@ fn absent_deletes_and_writes<St: Storage>(state: &mut StateCheckpoint<St>) {
 }
 
 /// Deterministic cover of the NOMT 1.0.5 workaround (deletes of absent keys become reads of
-/// their absence, `test_prover::to_nomt_accesses`; the real prover must do the same) and of the
-/// proof-hint rule (one proof per accessed namespace, `namespace_needs_proof`: a namespace whose
-/// only access is such a delete is accessed). The proptests reach these cases only at random.
+/// their absence, `test_prover::to_nomt_accesses`; `selendra-db`'s prover does the same) and of
+/// the proof-hint rule (one proof per accessed namespace, `namespace_needs_proof`: a namespace
+/// whose only access is such a delete is accessed). The proptests reach these cases only at
+/// random.
 #[test]
 fn deletes_of_absent_keys_commit_and_replay() {
     // Empty databases: only a delete (blind, or after a read) in one namespace.
@@ -507,7 +508,8 @@ fn deletes_of_absent_keys_commit_and_replay() {
 /// What the workaround is for: NOMT 1.0.5 panics committing a session whose only value change
 /// is a delete of an absent key into an empty database (an underflow in
 /// `beatree/ops/update/leaf_stage.rs`, `filter_leaves_changeset`). If this test fails, a NOMT
-/// upgrade fixed it: review the workaround (`test_prover::to_nomt_accesses`, and the prover's).
+/// upgrade fixed it: review the workaround (`test_prover::to_nomt_accesses`, and `selendra-db`'s
+/// `to_nomt_accesses`).
 #[test]
 fn nomt_still_panics_on_deleting_an_absent_key_from_an_empty_database() {
     use ::nomt::{KeyReadWrite, SessionParams};

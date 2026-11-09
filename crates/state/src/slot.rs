@@ -159,6 +159,19 @@ impl AsRef<[u8]> for SlotKey {
     }
 }
 
+// rockbound stores a versioned key as its raw `as_ref()` bytes (the marker promises that
+// encoding is a no-op), and merges in-memory and on-disk entries assuming that `Ord` is the
+// byte order of those bytes (tested below).
+#[cfg(feature = "rockbound")]
+impl rockbound::versioned_db::VersionedSchemaKeyMarker for SlotKey {}
+
+#[cfg(feature = "rockbound")]
+impl rockbound::versioned_db::HasPrefix for SlotKey {
+    fn has_prefix(&self, prefix: &Self) -> bool {
+        self.as_ref().starts_with(prefix.as_ref())
+    }
+}
+
 impl TryFrom<&[u8]> for SlotKey {
     type Error = SlotKeyTooShort;
 
@@ -388,6 +401,31 @@ mod tests {
         let lowest_key = build_key(Prefix::new(0, 0), b"xylophone");
         assert!(lowest_key < key2);
         assert!(lowest_key < key3);
+    }
+
+    /// `Ord` is the byte order of `as_ref()`, prefix included: rockbound's iterators merge
+    /// in-memory writes (by `Ord`) with RocksDB entries (by bytes).
+    #[test_strategy::proptest]
+    fn ord_is_byte_order(a: (u8, u8, Vec<u8>), b: (u8, u8, Vec<u8>)) {
+        let a = SlotKey::from_parts(&Prefix::new(a.0, a.1), &a.2);
+        let b = SlotKey::from_parts(&Prefix::new(b.0, b.1), &b.2);
+        assert_eq!(a.cmp(&b), a.as_ref().cmp(b.as_ref()));
+        assert_eq!(a == b, a.as_ref() == b.as_ref());
+        // Also when one key extends the other.
+        let longer = SlotKey::from_parts(&a.prefix(), &[a.without_prefix(), &[0]].concat());
+        assert!(a < longer);
+    }
+
+    #[cfg(feature = "rockbound")]
+    #[test]
+    fn rockbound_has_prefix() {
+        use rockbound::versioned_db::HasPrefix;
+        let key = build_key(Prefix::new(1, 2), b"hello");
+        assert!(key.has_prefix(&SlotKey::singleton(&Prefix::new(1, 2))));
+        assert!(key.has_prefix(&build_key(Prefix::new(1, 2), b"he")));
+        assert!(key.has_prefix(&key));
+        assert!(!key.has_prefix(&build_key(Prefix::new(1, 2), b"hello!")));
+        assert!(!key.has_prefix(&SlotKey::singleton(&Prefix::new(1, 3))));
     }
 
     #[test]

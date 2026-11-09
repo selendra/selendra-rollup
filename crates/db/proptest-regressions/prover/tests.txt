@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ce281644f387eff37b30d11682939964c9579515bd0d18d5f6c8485efa7b990f # shrinks to input = _VerifierReplaysTheProverStorageArgs { blocks: [[KernelRemove(0)]] }
+cc c1d0def3649849a32f454ee4a0607bf9b044151bf23598d7f72df03bc6909eb4 # shrinks to input = _EveryHintOfTheProverStorageIsVerifiedArgs { genesis: [KernelRemove(0)], ops: [KernelSet(0, 41081754)], position: 17072565184186527065, flip: 248 }

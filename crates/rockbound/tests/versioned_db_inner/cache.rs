@@ -9,7 +9,7 @@ use crate::versioned_db_inner::VersionedDbCache;
 
 #[cfg(feature = "test-utils")]
 use crate::versioned_db_inner::TestDB;
-use crate::versioned_db_inner::{delete_keys, put_keys, LiveKeys, TestField, TestKey};
+use crate::versioned_db_inner::{LiveKeys, TestField, TestKey, delete_keys, put_keys};
 
 #[test]
 fn test_basic_cache_consistency() {
@@ -121,10 +121,20 @@ fn test_cache_behavior_under_concurrency() {
                         // We delete in batches. If we deleted some keys, then all keys should have been deleted - so no
                         // more reads from the current generation are allowed
                         if current_generation_is_active {
-                            assert!(value.value() >= generation, "Value {} is less than generation {}. A reader went backwards! This means the cache is buggy!", value.value(), generation);
+                            assert!(
+                                value.value() >= generation,
+                                "Value {} is less than generation {}. A reader went backwards! This means the cache is buggy!",
+                                value.value(),
+                                generation
+                            );
                             generation = value.value();
                         } else {
-                            assert!(value.value() > generation, "Value {} is not greater than generation {}. A reader went backwards! This means the cache is buggy!", value.value(), generation);
+                            assert!(
+                                value.value() > generation,
+                                "Value {} is not greater than generation {}. A reader went backwards! This means the cache is buggy!",
+                                value.value(),
+                                generation
+                            );
                             current_generation_is_active = true;
                             generation = value.value();
                         }

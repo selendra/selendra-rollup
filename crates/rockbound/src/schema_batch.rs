@@ -1,4 +1,4 @@
-use std::collections::{btree_map, BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, btree_map};
 
 use crate::schema::{ColumnFamilyName, KeyCodec, KeyEncoder, ValueCodec};
 use crate::{Operation, Schema, SchemaKey, SchemaValue, SeekKeyEncoder};

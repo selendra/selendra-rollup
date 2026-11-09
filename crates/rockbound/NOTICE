@@ -1,0 +1,10 @@
+Rockbound
+Copyright Sovereign Labs <info@sovereign.xyz> and contributors.
+
+Some of this code is derived from the `schemadb` crate of Aptos Core
+(https://github.com/aptos-labs/aptos-core), Copyright (c) Aptos, licensed under
+the Apache License, Version 2.0.
+
+This copy is based on https://github.com/sovereign-labs/rockbound at revision
+0aa43d4e581e047ba8d8e7a662ec6ade32b2cae3. It has been modified by Selendra;
+README.md ("Changes from upstream") lists the modifications.

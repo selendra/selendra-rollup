@@ -372,6 +372,20 @@ mod native {
     /// another version would shadow current state natively (the guest reads the current value
     /// from the witness) or fail the state update. Upstream's cache `*_historical` methods,
     /// which did exactly that, were never called and are not ported.
+    ///
+    /// # Panics
+    /// Methods that return a bare `Option` or value (`get_accessory`, `get_root_hash*`,
+    /// `get_unbound`, `get_accessory_unbound`, `latest_version_unbound`, and [`Storage::get`] /
+    /// [`Storage::get_leaf`]) and the iterators of `maybe_iter_*` panic if a database read fails,
+    /// including a read of a pruned version: `None` means "absent", so an error cannot be
+    /// returned as one. The methods returning `anyhow::Result` return such errors.
+    ///
+    /// # Locking (database-backed storages)
+    /// A database commit waits for the readers of the same databases: drop the storage's
+    /// iterators (and any database session) before committing on the same thread, and keep one
+    /// live iterator per thread (a second one can wait behind a queued commit that waits for
+    /// the first). [`get_with_proof`](Self::get_with_proof) may sleep and retry while a commit
+    /// is in progress: call it from a blocking context in async code.
     pub trait NativeStorage: Storage {
         /// Gets the latest version available in the current instance storage.
         fn latest_version(&self) -> SlotNumber;
@@ -380,7 +394,13 @@ mod native {
         /// storage.
         fn latest_version_unbound(&self) -> SlotNumber;
 
-        /// Returns the value corresponding to the key or `None` if the key is absent.
+        /// Returns the value corresponding to the key or `None` if the key is absent, at
+        /// `version` (`None`: this storage's version).
+        ///
+        /// # Errors
+        /// If `version` is after the newest version of this storage (a future version is an
+        /// error, not "absent"; upstream returned `Ok(None)`), if it has been pruned, or if the
+        /// read fails.
         fn get_historical<N: ProvableCompileTimeNamespace>(
             &self,
             key: &SlotKey,
@@ -390,6 +410,11 @@ mod native {
 
         /// Gets the leaf of the value at the given version. This method does not need to load
         /// the full value into memory.
+        ///
+        /// # Errors
+        /// If `version` is after the newest version of this storage (a future version is an
+        /// error, not "absent"; upstream returned `Ok(None)`), if it has been pruned, or if the
+        /// read fails.
         fn get_leaf_historical<N: ProvableCompileTimeNamespace>(
             &self,
             key: &SlotKey,
@@ -401,6 +426,11 @@ mod native {
         fn get_accessory(&self, key: &SlotKey) -> Option<SlotValue>;
 
         /// Gets the accessory value at the given version or `None` if the key is absent.
+        ///
+        /// # Errors
+        /// If `version` is after the newest version of this storage (a future version is an
+        /// error, not "absent"; upstream returned `Ok(None)`), if it has been pruned, or if the
+        /// read fails.
         fn get_accessory_historical(
             &self,
             key: &SlotKey,
@@ -409,6 +439,10 @@ mod native {
 
         /// Returns the value corresponding to the key or `None` if the key is absent, and a
         /// proof to get the value.
+        ///
+        /// The value may be of a newer committed version than this storage's (a storage that
+        /// keeps no tree history, like the NOMT one, proves the newest committed state): the
+        /// returned slot number and root say which version and root it is proven against.
         ///
         /// # Errors
         /// If storage is empty or the version is not yet available.

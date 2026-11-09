@@ -33,6 +33,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
+      # RocksDB (`rockbound`, used by `selendra-db`) is built from source: bindgen needs libclang.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   # The zk guest builds without `native`: lint that configuration, and make sure no OS
@@ -54,9 +56,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
+      # RocksDB (`rockbound`, used by `selendra-db`) is built from source: bindgen needs libclang.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
       - run: cargo test --workspace --all-features --locked
 
-  # The SP1 guest is 32-bit (`usize` = 32 bits): run the tests with a 32-bit `usize` too.
+  # The SP1 guest is 32-bit (`usize` = 32 bits): run the tests with a 32-bit `usize` too
+  # (without the RocksDB/NOMT storage stack, see the Makefile).
   test-32bit:
     runs-on: ubuntu-24.04
     if: hashFiles('crates/**/Cargo.toml') != ''
@@ -95,6 +100,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-udeps
+      # RocksDB (`rockbound`, used by `selendra-db`) is built from source: bindgen needs libclang.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
       - run: cargo +nightly udeps --workspace --all-targets --all-features --locked
         env:
           RUSTFLAGS: "" # nightly may add new warnings unrelated to unused deps

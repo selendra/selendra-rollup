@@ -1,0 +1,35 @@
+[package]
+name = "selendra-db"
+description = "The node's state databases: the NOMT state trees, the versioned flat value store (RocksDB) and the accessory store, and the commit order across them. Node-only, Unix-only."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Never in the zk guest. NOMT is Unix-only (io_uring on Linux), and RocksDB and NOMT are not built
+# for 32-bit targets (`make test32` leaves this crate out).
+[dependencies]
+anyhow = { workspace = true }
+borsh = { workspace = true }
+nomt = { workspace = true }
+parking_lot = { workspace = true }
+rockbound = { workspace = true }
+selendra-interface = { workspace = true, features = ["native"] }
+selendra-state = { workspace = true, features = ["native", "rockbound"] }
+tempfile = { workspace = true, optional = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+selendra-state = { workspace = true, features = ["native", "rockbound", "test-utils"] }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+test-strategy = { workspace = true }
+
+[features]
+# `harness`: the state databases in a temporary directory, for tests (of this crate and others).
+test-utils = ["dep:tempfile"]
+
+[lints]
+workspace = true

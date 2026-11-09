@@ -82,13 +82,15 @@ mod tests {
         let writable_db_path = tmpdir.path().join("writable-db");
         let column_families = vec![DEFAULT_COLUMN_FAMILY_NAME];
 
-        assert!(DB::open(
-            &missing_db_path,
-            "missing-db",
-            column_families.clone(),
-            &gen_rocksdb_options(&config, true),
-        )
-        .is_err());
+        assert!(
+            DB::open(
+                &missing_db_path,
+                "missing-db",
+                column_families.clone(),
+                &gen_rocksdb_options(&config, true),
+            )
+            .is_err()
+        );
 
         let writable_config = gen_rocksdb_options_with(&config, false, |opts| {
             opts.set_keep_log_file_num(7);

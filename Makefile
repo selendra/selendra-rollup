@@ -23,9 +23,12 @@ test:
 	cargo test --workspace --all-features --locked
 
 # Tests with a 32-bit `usize`, like the SP1 guest (musl: no 32-bit system libraries needed).
+# Every feature except the node's storage stack (RocksDB and NOMT are not built for 32-bit
+# targets): the `rockbound` and `selendra-db` crates and `selendra-state/rockbound` are left out.
+TEST32_FEATURES := selendra-interface/native,selendra-interface/arbitrary,selendra-primitives/native,selendra-state/native,selendra-state/arbitrary
 test32:
 	rustup target add i686-unknown-linux-musl
-	cargo test --workspace --all-features --locked --target i686-unknown-linux-musl
+	cargo test --workspace --exclude rockbound --exclude selendra-db --features $(TEST32_FEATURES) --locked --target i686-unknown-linux-musl
 	cargo test -p selendra-state --no-default-features --locked --target i686-unknown-linux-musl
 
 deny:
