@@ -16,8 +16,11 @@ use selendra_interface::common::HexString;
 use selendra_interface::reexports::digest::Digest;
 use selendra_interface::reexports::digest::typenum::U32;
 use selendra_state::StorageRoot;
+use selendra_state::namespaces::ProvableNamespace;
 
 use crate::config::{NomtNamespaceConfig, StateDbConfig};
+use crate::faults::{CommitPoint, Faults};
+use crate::recovery::RecoveryStep;
 
 const KERNEL: &str = "kernel";
 const USER: &str = "user";
@@ -134,14 +137,14 @@ impl WitnessMode {
 ///
 /// ```compile_fail,E0624
 /// # fn f(config: &selendra_db::StateDbConfig) {
-/// let _ = selendra_db::NomtStateDb::<selendra_state::StateHasher>::new(config);
+/// let _ = selendra_db::NomtStateDb::<selendra_state::StateHasher>::open_no_grow(config);
 /// # }
 /// ```
 ///
 /// ```compile_fail,E0624
 /// # use selendra_db::{NomtStateDb, StateOverlay};
 /// # fn f(trees: &NomtStateDb<selendra_state::StateHasher>, overlay: StateOverlay) {
-/// let _ = trees.commit(overlay);
+/// let _ = trees.commit(overlay, &Default::default());
 /// # }
 /// ```
 ///
@@ -184,9 +187,11 @@ impl<H> fmt::Debug for NomtStateDb<H> {
 }
 
 impl<H: Digest<OutputSize = U32> + Send + Sync> NomtStateDb<H> {
-    /// Opens (or creates) both trees under [`StateDbConfig::path`].
+    /// Opens (or creates) both trees under [`StateDbConfig::path`], without growing their hash
+    /// tables ([`grow_to_config`](Self::grow_to_config) does, once crash recovery is done).
     ///
-    /// A tree with fewer hash-table buckets than configured is grown first.
+    /// Opening writes nothing hashed with `H` (NOMT finishes its own write-ahead-log replay or
+    /// an interrupted rehash).
     ///
     /// # Errors
     /// - On Linux, if io_uring is unavailable: NOMT has no other I/O backend there (its I/O
@@ -194,20 +199,48 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> NomtStateDb<H> {
     ///   Linux 6.0 or later.
     /// - If a tree has more buckets than configured (shrinking is not supported), or on I/O
     ///   errors.
-    pub(crate) fn new(config: &StateDbConfig) -> anyhow::Result<Self> {
+    pub(crate) fn open_no_grow(config: &StateDbConfig) -> anyhow::Result<Self> {
         check_io_uring()?;
         let kernel = open_tree(KERNEL, &config.kernel, &config.kernel_nomt_path())?;
         let user = open_tree(USER, &config.user, &config.user_nomt_path())?;
         Ok(Self { user, kernel })
     }
 
-    /// Commits a block's changes: the kernel tree first, then the user tree.
+    /// Opens both trees and grows them to the configured bucket count (tests of this module).
+    #[cfg(test)]
+    pub(crate) fn new(config: &StateDbConfig) -> anyhow::Result<Self> {
+        Self::open_no_grow(config)?.grow_to_config(config, &Faults::default())
+    }
+
+    /// Grows a tree whose hash table has fewer buckets than configured (closing, growing and
+    /// reopening it). `faults` is called once before the first tree is grown
+    /// ([`RecoveryStep::Grow`]).
+    ///
+    /// # Errors
+    /// If growing or reopening a tree fails. Growing is crash-safe (NOMT finishes an
+    /// interrupted rehash when the tree is opened again).
+    pub(crate) fn grow_to_config(
+        self,
+        config: &StateDbConfig,
+        faults: &Faults,
+    ) -> anyhow::Result<Self> {
+        let Self { user, kernel } = self;
+        if needs_growing(&kernel, &config.kernel)? || needs_growing(&user, &config.user)? {
+            faults.hit(CommitPoint::Recovery(RecoveryStep::Grow))?;
+        }
+        let kernel = grow_tree(KERNEL, kernel, &config.kernel, &config.kernel_nomt_path())?;
+        let user = grow_tree(USER, user, &config.user, &config.user_nomt_path())?;
+        Ok(Self { user, kernel })
+    }
+
+    /// Commits a block's changes: the kernel tree first, then the user tree. `faults` is
+    /// called in between ([`CommitPoint::BeforeUserNomt`]).
     ///
     /// # Errors
     /// If `overlay` does not build on the committed roots (checked before anything is written),
     /// or if NOMT fails. If the user commit fails after the kernel commit succeeded, the trees
     /// are out of step: the caller must stop (crash recovery rolls the kernel tree back).
-    pub(crate) fn commit(&self, overlay: StateOverlay) -> anyhow::Result<()> {
+    pub(crate) fn commit(&self, overlay: StateOverlay, faults: &Faults) -> anyhow::Result<()> {
         let StateOverlay {
             user,
             kernel,
@@ -222,9 +255,30 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> NomtStateDb<H> {
             .commit(&self.kernel)
             .context("kernel namespace commit")?;
         warn_if_nearly_full(KERNEL, &self.kernel);
+        faults.hit(CommitPoint::BeforeUserNomt)?;
         user.commit(&self.user).context("user namespace commit")?;
         warn_if_nearly_full(USER, &self.user);
         Ok(())
+    }
+
+    /// Rolls back the newest commit in one tree's rollback log (NOMT's `rollback(1)`, for
+    /// startup crash recovery), and removes it from the log.
+    ///
+    /// A second call without a commit in between can succeed too: after a restart, NOMT 1.0.5's
+    /// log can hold more than the last commit, although `max_rollback_log_len(1)` is set (it
+    /// prunes its on-disk range one sync late: the last two commits, and one more for every
+    /// restart between commits; see the `recovery` module docs). So the caller decides by the
+    /// tree's root whether to roll it back, never by the log running out.
+    ///
+    /// # Errors
+    /// If nothing is logged to roll back, or on I/O errors.
+    pub(crate) fn rollback_one(&self, namespace: ProvableNamespace) -> anyhow::Result<()> {
+        let (name, tree) = match namespace {
+            ProvableNamespace::User => (USER, &self.user),
+            ProvableNamespace::Kernel => (KERNEL, &self.kernel),
+        };
+        tree.rollback(1)
+            .with_context(|| format!("rolling back the last commit of the {name} NOMT tree"))
     }
 
     /// The committed roots of both trees.
@@ -233,6 +287,15 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> NomtStateDb<H> {
             user: self.user.root().into_inner(),
             kernel: self.kernel.root().into_inner(),
         }
+    }
+
+    /// The hash-table bucket counts of the user and kernel trees (tests).
+    #[cfg(test)]
+    pub(crate) fn bucket_counts(&self) -> (usize, usize) {
+        (
+            self.user.hash_table_utilization().capacity,
+            self.kernel.hash_table_utilization().capacity,
+        )
     }
 }
 
@@ -252,14 +315,19 @@ fn check_io_uring() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Opens one tree, growing its hash table first if it has fewer buckets than configured.
+/// The bucket count `config` asks for, as NOMT counts them.
+fn configured_buckets(config: &NomtNamespaceConfig) -> anyhow::Result<usize> {
+    usize::try_from(config.hashtable_buckets.get())
+        .context("hash-table bucket count does not fit in usize")
+}
+
+/// Opens one tree. Fails if it has more hash-table buckets than configured.
 fn open_tree<H: Digest<OutputSize = U32> + Send + Sync>(
     name: &'static str,
     config: &NomtNamespaceConfig,
     path: &std::path::Path,
 ) -> anyhow::Result<Nomt<BinaryHasher<H>>> {
-    let configured = usize::try_from(config.hashtable_buckets.get())
-        .context("hash-table bucket count does not fit in usize")?;
+    let configured = configured_buckets(config)?;
     let nomt = Nomt::<BinaryHasher<H>>::open(config.nomt_options(path))
         .with_context(|| format!("failed to open the {name} NOMT database"))?;
     let current = nomt.hash_table_utilization().capacity;
@@ -268,10 +336,30 @@ fn open_tree<H: Digest<OutputSize = U32> + Send + Sync>(
         "the configured NOMT hash-table bucket count of the {name} tree ({configured}) is \
          smaller than the existing one on disk ({current}); shrinking is not supported"
     );
-    if current == configured {
+    Ok(nomt)
+}
+
+/// Whether a tree has fewer hash-table buckets than configured.
+fn needs_growing<H: Digest<OutputSize = U32> + Send + Sync>(
+    nomt: &Nomt<BinaryHasher<H>>,
+    config: &NomtNamespaceConfig,
+) -> anyhow::Result<bool> {
+    Ok(nomt.hash_table_utilization().capacity < configured_buckets(config)?)
+}
+
+/// Grows one tree's hash table to the configured bucket count if it has fewer: closes the
+/// tree, grows it and reopens it.
+fn grow_tree<H: Digest<OutputSize = U32> + Send + Sync>(
+    name: &'static str,
+    nomt: Nomt<BinaryHasher<H>>,
+    config: &NomtNamespaceConfig,
+    path: &std::path::Path,
+) -> anyhow::Result<Nomt<BinaryHasher<H>>> {
+    if !needs_growing(&nomt, config)? {
         return Ok(nomt);
     }
-
+    let configured = configured_buckets(config)?;
+    let current = nomt.hash_table_utilization().capacity;
     drop(nomt);
     tracing::info!(
         tree = name,
@@ -566,7 +654,7 @@ mod tests {
         let user = finish(state_db.user.begin_session(SessionParams::default()), key);
         let kernel = finish(state_db.kernel.begin_session(SessionParams::default()), key);
         let overlay = StateFinishedSession::new(user, kernel).into_state_overlay();
-        state_db.commit(overlay).unwrap();
+        state_db.commit(overlay, &Faults::default()).unwrap();
     }
 
     fn assert_value(state_db: &NomtStateDb<H>, key: u64) {
@@ -621,10 +709,10 @@ mod tests {
         .into_state_overlay();
         assert_eq!(first.prev_roots(), NomtRoots::PRE_GENESIS);
         let roots = first.roots();
-        state_db.commit(first).unwrap();
+        state_db.commit(first, &Faults::default()).unwrap();
         assert_eq!(state_db.root_hashes(), roots);
 
-        let err = state_db.commit(second).unwrap_err();
+        let err = state_db.commit(second, &Faults::default()).unwrap_err();
         assert!(
             err.to_string().contains("other than the committed"),
             "{err}"
@@ -681,7 +769,7 @@ mod tests {
                 .unwrap()
                 .remove(&committing_ref)
                 .unwrap();
-            state_db.commit(overlay).unwrap();
+            state_db.commit(overlay, &Faults::default()).unwrap();
         }
     }
 

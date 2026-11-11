@@ -73,7 +73,7 @@ pub struct AccessoryDb {
 }
 
 impl AccessoryDb {
-    const DB_PATH_SUFFIX: &'static str = "accessory";
+    pub(crate) const DB_PATH_SUFFIX: &'static str = "accessory";
     const DB_NAME: &'static str = "accessory-db";
 
     /// The options to open the accessory store with.
@@ -150,12 +150,37 @@ impl AccessoryDb {
         accessory_db.write_db_batch(db_batch)
     }
 
+    /// The root of exactly `version` (`None` if the store has none for it).
+    pub fn root_at(
+        accessory_db: &rockbound::DB,
+        version: SlotNumber,
+    ) -> anyhow::Result<Option<NomtRoots>> {
+        accessory_db.get::<StateRootHashes>(&version)
+    }
+
     /// Removes the newest version (its writes and its root) from the accessory store; does
-    /// nothing if the store is empty. For crash recovery (not wired in yet).
+    /// nothing if the store is empty. (Startup crash recovery rolls back an interrupted commit
+    /// with `rollback_version`, which checks the version first.)
     pub fn rollback(accessory_db: &Arc<rockbound::DB>) -> anyhow::Result<()> {
         let Some((version, _)) = Self::latest_version_and_root(accessory_db)? else {
             return Ok(());
         };
+        let batch = Self::rollback_batch(accessory_db, version)?;
+        accessory_db.write_schemas(&batch)
+    }
+
+    /// Removes `version`, which must be the newest one, from the accessory store (startup
+    /// crash recovery).
+    pub(crate) fn rollback_version(
+        accessory_db: &Arc<rockbound::DB>,
+        version: SlotNumber,
+    ) -> anyhow::Result<()> {
+        let latest = Self::latest_version_and_root(accessory_db)?.map(|(latest, _)| latest);
+        anyhow::ensure!(
+            latest == Some(version),
+            "cannot roll back version {version} of the accessory DB: its newest version is \
+             {latest:?}"
+        );
         let batch = Self::rollback_batch(accessory_db, version)?;
         accessory_db.write_schemas(&batch)
     }

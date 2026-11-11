@@ -25,8 +25,8 @@ use selendra_state::{
 use sha2::Sha256;
 
 use super::*;
-use crate::harness::TestDbs;
-use crate::{FlatStateDb, StateDbConfig};
+use crate::harness::{Gate, TestDbs};
+use crate::{CommitPoint, FlatStateDb, StateDbConfig};
 
 /// The chain's storage spec (SHA-256).
 type Spec = StateStorageSpec;
@@ -210,10 +210,18 @@ fn get_with_proof_retries_when_a_commit_is_reverted_during_the_read() {
         let v = match step {
             FetchStep::RootRead => 11,
             FetchStep::ValueRead => 10,
+            FetchStep::BeforeSession => return,
         };
         roots.push(set(&mut dbs, v));
     });
-    assert_eq!(steps, [FetchStep::RootRead, FetchStep::ValueRead]);
+    assert_eq!(
+        steps,
+        [
+            FetchStep::RootRead,
+            FetchStep::ValueRead,
+            FetchStep::BeforeSession
+        ]
+    );
     // The scenario: the user root is back to the first one, at a newer version.
     assert_ne!(roots[0].user_root(), first_root.user_root());
     assert_eq!(roots[1].user_root(), first_root.user_root());
@@ -227,6 +235,99 @@ fn get_with_proof_retries_when_a_commit_is_reverted_during_the_read() {
     assert_eq!(
         Prover::open_proof(root, proof).unwrap(),
         (k, Some(u32_value(10)))
+    );
+}
+
+/// A commit that lands after both flat-store root reads but before the NOMT session opens
+/// (`FetchStep::BeforeSession`) moves NOMT's root away from the one read: the attempt retries
+/// instead of proving against a root the value was not read at.
+#[test]
+fn get_with_proof_retries_when_a_commit_lands_before_the_session() {
+    let mut dbs = Dbs::new();
+    let k = map().slot_key(&1);
+    let set = |dbs: &mut Dbs, v: u32| {
+        dbs.commit_with(OFF, |state| {
+            let Ok(()) = map().set(&1, &v, state);
+        })
+    };
+    set(&mut dbs, 10);
+    let storage = dbs.storage(OFF);
+    let mut steps = Vec::new();
+    let attempt = storage.get_with_proof_once_with::<User>(k.clone(), |step| {
+        steps.push(step);
+        if step == FetchStep::BeforeSession {
+            set(&mut dbs, 11);
+        }
+    });
+    assert_eq!(
+        steps,
+        [
+            FetchStep::RootRead,
+            FetchStep::ValueRead,
+            FetchStep::BeforeSession
+        ]
+    );
+    assert!(matches!(attempt, Err(GetWithProofError::StateRootMismatch)));
+    let (proof, version, _) = storage.get_with_proof_once::<User>(k).unwrap();
+    assert_eq!(
+        (proof.value, version),
+        (Some(u32_value(11)), SlotNumber::new(1))
+    );
+}
+
+/// A commit paused before the flat live DB ([`CommitPoint::BeforeLive`], with the flat store's
+/// caches locked for writing and NOMT already a version ahead) on another thread: a
+/// `get_with_proof` does not wait for it. Its flat-store reads go on (point reads skip the
+/// locked caches, root reads take no lock) and still see the previous version, it passes every
+/// fetch step, and the NOMT session's root then differs: it retries. Once the commit is
+/// released, it proves the new version.
+#[test]
+fn get_with_proof_does_not_wait_for_a_commit_paused_before_live() {
+    let mut dbs = Dbs::new();
+    let k = map().slot_key(&1);
+    dbs.commit_with(OFF, |state| {
+        let Ok(()) = map().set(&1, &10, state);
+    });
+    let storage = dbs.storage(OFF);
+    let (change_set, root) = dbs.change_set_with(OFF, |state| {
+        let Ok(()) = map().set(&1, &11, state);
+    });
+    let gate = Gate::new();
+    dbs.set_commit_hook(Some(gate.hook_at(CommitPoint::BeforeLive)));
+    std::thread::scope(|scope| {
+        let commit = scope.spawn(|| dbs.commit(change_set));
+        assert!(gate.wait_reached(Gate::TIMEOUT), "the commit did not pause");
+        let mut steps = Vec::new();
+        let start = std::time::Instant::now();
+        let attempt = storage.get_with_proof_once_with::<User>(k.clone(), |step| steps.push(step));
+        // Had the attempt waited for the commit's lock, only the gate's timeout would have
+        // ended it, and the commit would have failed.
+        assert!(
+            start.elapsed() < Gate::TIMEOUT / 2 && !commit.is_finished(),
+            "the attempt waited for the commit"
+        );
+        assert_eq!(
+            steps,
+            [
+                FetchStep::RootRead,
+                FetchStep::ValueRead,
+                FetchStep::BeforeSession
+            ]
+        );
+        assert!(matches!(attempt, Err(GetWithProofError::StateRootMismatch)));
+        assert_eq!(
+            storage.get_unbound::<User>(k.clone()),
+            Some(u32_value(10)),
+            "the flat store's newest value while paused"
+        );
+        gate.release();
+        commit.join().unwrap();
+    });
+    assert_eq!(dbs.root(), root);
+    let (proof, version, proven_root) = storage.get_with_proof_once::<User>(k).unwrap();
+    assert_eq!(
+        (proof.value, version, proven_root),
+        (Some(u32_value(11)), SlotNumber::new(1), root)
     );
 }
 
@@ -537,7 +638,10 @@ fn every_hint_of_the_prover_storage_is_verified(
 
 /// Databases with user `1 → 10, 2 → 20` and kernel `1 → 100` (at version 0).
 fn populated() -> Dbs {
-    let mut dbs = Dbs::new();
+    populate(Dbs::new())
+}
+
+fn populate(mut dbs: Dbs) -> Dbs {
     dbs.commit_with(OFF, |state| {
         let Ok(()) = map().set(&1, &10, state);
         let Ok(()) = map().set(&2, &20, state);
@@ -1133,10 +1237,12 @@ fn deletes_of_absent_keys_commit_and_replay() {
 /// With the witness off, NOMT does not check reads, so it goes through.
 #[test]
 fn reads_that_disagree_with_nomt_fail_the_self_check() {
-    let dbs = populated();
+    // Both directories at once (taking one, then waiting for another, can wait forever).
+    let mut dirs = crate::test_utils::tempdirs(2);
+    let other = dirs.pop().unwrap();
+    let dbs = populate(Dbs::new_in(dirs.pop().unwrap(), None));
     let roots = dbs.group().roots();
     // A flat store at the same version and root, with another value for map key 1.
-    let other = crate::test_utils::tempdir();
     let config = StateDbConfig::for_tests(other.path());
     let mut flat = FlatStateDb::new(
         &config.path,
@@ -1196,9 +1302,10 @@ fn nomt_still_panics_on_deleting_an_absent_key_from_an_empty_database() {
             .finish(vec![([7; 32], KeyReadWrite::Write(None))])
             .unwrap();
         let kernel = sessions.kernel.finish(Vec::new()).unwrap();
-        dbs.group()
-            .nomt()
-            .commit(StateFinishedSession::new(user, kernel).into_state_overlay())
+        dbs.group().nomt().commit(
+            StateFinishedSession::new(user, kernel).into_state_overlay(),
+            &Default::default(),
+        )
     });
     assert!(outcome.is_err(), "NOMT no longer panics: {outcome:?}");
 }

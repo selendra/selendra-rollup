@@ -35,7 +35,7 @@ type NomtSession<H> = Session<BinaryHasher<H>>;
 
 /// Why one attempt of [`NativeStorage::get_with_proof`] failed.
 #[derive(Debug)]
-enum GetWithProofError {
+pub(crate) enum GetWithProofError {
     /// The flat store and NOMT were read at different versions (a commit was in progress):
     /// retry.
     StateRootMismatch,
@@ -44,11 +44,14 @@ enum GetWithProofError {
 
 /// The points of [`NomtProverStorage::get_with_proof_once_with`] where its hook runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FetchStep {
+pub(crate) enum FetchStep {
     /// After the first read of the newest root (step 1).
     RootRead,
     /// After the value read (step 2).
     ValueRead,
+    /// After the second read of the newest root, before the NOMT session is opened (between
+    /// steps 3 and 4): the last point before the attempt may block behind a commit.
+    BeforeSession,
 }
 
 impl fmt::Display for GetWithProofError {
@@ -430,16 +433,17 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
     /// root read with a flat-store commit. Comparing the versions too (they only increase)
     /// rules out several commits during the value read: two commits whose second restores the
     /// namespace leave its root unchanged, but the value read in between is the first one's.
-    fn get_with_proof_once<N: ProvableCompileTimeNamespace>(
+    pub(crate) fn get_with_proof_once<N: ProvableCompileTimeNamespace>(
         &self,
         key: SlotKey,
     ) -> Result<ProofOutput<Self>, GetWithProofError> {
         self.get_with_proof_once_with::<N>(key, |_| {})
     }
 
-    /// [`get_with_proof_once`](Self::get_with_proof_once), calling `between` after steps 1 and
-    /// 2 (tests commit there).
-    fn get_with_proof_once_with<N: ProvableCompileTimeNamespace>(
+    /// [`get_with_proof_once`](Self::get_with_proof_once), calling `between` at each
+    /// [`FetchStep`]: after steps 1 and 2 (tests commit there) and after step 3 (tests
+    /// synchronize with a paused commit there).
+    pub(crate) fn get_with_proof_once_with<N: ProvableCompileTimeNamespace>(
         &self,
         key: SlotKey,
         mut between: impl FnMut(FetchStep),
@@ -455,6 +459,7 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
         let (version, post_fetch_root) = self
             .latest_root_and_version_unbound()?
             .ok_or_else(|| anyhow::anyhow!("the committed state roots disappeared"))?;
+        between(FetchStep::BeforeSession);
 
         let session = self.begin_session_without_witness(namespace)?;
         let post_fetch_namespace_root = post_fetch_root.namespace_root(namespace);

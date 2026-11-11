@@ -1,4 +1,5 @@
-//! All state databases together ([`DbGroup`]) and the order they are committed in.
+//! All state databases together ([`DbGroup`]), the order they are committed in, and how they
+//! are opened (hasher guard, startup crash recovery).
 
 use std::sync::Arc;
 
@@ -11,9 +12,13 @@ use selendra_interface::reexports::digest::typenum::U32;
 
 use crate::accessory::AccessoryDb;
 use crate::config::StateDbConfig;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::faults::CommitHook;
+use crate::faults::{CommitPoint, Faults};
 use crate::flat::FlatStateDb;
 use crate::historical::{HistoricalStateReader, StateChanges, next_version_after};
 use crate::nomt_state::{NomtRoots, NomtSessionBuilder, NomtStateDb, StateFinishedSession};
+use crate::recovery::{Head, RecoveryReport, root_of};
 use crate::schema::{DbMetadata, MetadataKey};
 
 /// What the hasher guard hashes: the databases record `H(STATE_HASHER_PROBE)` when they are
@@ -47,6 +52,17 @@ impl NomtChangeSet {
     pub fn version(&self) -> SlotNumber {
         self.historical_state.version()
     }
+
+    /// The roots after these changes.
+    pub fn roots(&self) -> NomtRoots {
+        self.state.roots()
+    }
+
+    /// The NOMT part alone (tests that write the trees past the other databases).
+    #[cfg(test)]
+    pub(crate) fn into_nomt_overlay(self) -> crate::StateOverlay {
+        self.state.into_state_overlay()
+    }
 }
 
 /// The readers a storage needs, all at the same committed version (no uncommitted snapshots).
@@ -59,134 +75,151 @@ pub struct StorageReaders<H, K> {
     pub accessory: AccessoryDb,
 }
 
+impl<H, K> core::fmt::Debug for StorageReaders<H, K> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StorageReaders")
+            .field("session_builder", &self.session_builder)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The state databases: the NOMT trees, the flat value store and the accessory store.
 ///
 /// Commits are linear (one version after the other, `&mut self`). A storage manager with forks,
 /// uncommitted snapshots, the ledger DB and pruning builds on this (later).
+///
+/// **Poisoning.** A commit that fails after it started writing (an I/O error, or an injected
+/// fault) leaves the databases at different versions, and the NOMT trees' in-memory roots may
+/// already have moved. The group is then poisoned: [`commit`](Self::commit) and
+/// [`readers`](Self::readers) fail until the databases are closed and reopened, which repairs
+/// them ([`open`](Self::open)). Upstream went on with the databases out of step.
 pub struct DbGroup<H> {
     nomt: Arc<NomtStateDb<H>>,
     flat: FlatStateDb,
     accessory: Arc<rockbound::DB>,
+    faults: Faults,
+    poisoned: bool,
+    last_recovery: RecoveryReport,
 }
 
 impl<H> core::fmt::Debug for DbGroup<H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("DbGroup")
+        f.debug_struct("DbGroup")
+            .field("poisoned", &self.poisoned)
+            .field("last_recovery", &self.last_recovery)
+            .finish_non_exhaustive()
     }
 }
 
-/// The version and root a database holds (`None`: empty, at the pre-genesis root).
-type Head = Option<(SlotNumber, NomtRoots)>;
-
-fn root_of(head: Head) -> NomtRoots {
-    head.map_or(NomtRoots::PRE_GENESIS, |(_, root)| root)
-}
-
 impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
-    /// Opens (or creates) all state databases under [`StateDbConfig::path`].
+    /// Opens (or creates) all state databases under [`StateDbConfig::path`], repairing an
+    /// interrupted commit.
     ///
-    /// **Hasher guard.** The first open of empty databases records which hasher `H` they are
-    /// written with (the tag `H(b"SELENDRA/state-hasher/v1")`, [`MetadataKey::StateHasher`] in
-    /// the accessory DB); every later open must use the same one. Otherwise a node built with
-    /// another `H` would extend the trees with nodes hashed differently from the ones already
-    /// stored. The guard runs right after the databases are opened, before anything writes
-    /// data hashed with `H` (crash recovery's NOMT rollback must come after it: a rollback
-    /// rewrites the trees with the configured hasher).
+    /// In this order:
+    /// 1. Open the databases, without growing the NOMT hash tables.
+    /// 2. **Hasher guard.** The first open of empty databases records which hasher `H` they are
+    ///    written with (the tag `H(b"SELENDRA/state-hasher/v1")`, [`MetadataKey::StateHasher`]
+    ///    in the accessory DB); every later open must use the same one. Otherwise a node built
+    ///    with another `H` would extend the trees with nodes hashed differently from the ones
+    ///    already stored. It runs before anything writes data hashed with `H` (crash recovery's
+    ///    NOMT rollback rewrites the trees with `H`).
+    /// 3. **Startup crash recovery**: the databases written before the flat live DB by an
+    ///    interrupted commit are rolled back by one version, so that all are at the live DB's
+    ///    version and roots again ([`last_recovery`](Self::last_recovery) says what was rolled
+    ///    back; it is also logged). Versioned databases are rolled back only if they are exactly
+    ///    one version ahead of the live DB (never decided by root alone: a block can leave the
+    ///    roots unchanged), and a NOMT tree only if its root is that next version's (or, when no
+    ///    database recorded it, unchecked), and it must then be at the live DB's root.
+    /// 4. The consistency check: every database at the live DB's version and roots.
+    /// 5. Grow the NOMT hash tables to the configured bucket count. A refused open grows
+    ///    nothing.
     ///
-    /// Opening the databases already writes to disk, but nothing hashed with `H`: NOMT creates
-    /// a new tree's files, finishes its own write-ahead-log replay or an interrupted rehash, and
-    /// grows a tree's hash table when more buckets are configured than it has (none of which
-    /// uses `H`; NOMT hashes with `H` only to recompute the root in memory), and RocksDB creates
-    /// missing column families. So a refused open can leave a tree's hash table grown to the
-    /// configured bucket count. (Growing moves after the guard and the consistency check
-    /// together with startup crash recovery.)
+    /// Opening the databases (step 1) already writes to disk, but nothing hashed with `H`: NOMT
+    /// creates a new tree's files and finishes its own write-ahead-log replay or an interrupted
+    /// rehash (none of which uses `H`; NOMT hashes with `H` only to recompute the root in
+    /// memory), and RocksDB creates missing column families.
     ///
     /// # Errors
     /// - If a database fails to open.
     /// - If the databases were written with another hasher, or hold data but no hasher tag
     ///   (written before the guard existed, or the tag was removed): no state and no tag is
     ///   written then, beyond what opening the databases writes (above).
-    /// - If the databases are not all at the same version and root, i.e. the last commit was
-    ///   interrupted. Repairing that (rolling the newer databases back) is not implemented
-    ///   yet: upstream's startup recovery comes with the storage manager.
+    /// - If the databases are in a state an interrupted commit cannot leave (e.g. a database
+    ///   two versions ahead of the live DB, or behind it, or a NOMT tree at a root that is
+    ///   neither the live DB's nor the one a database recorded for the next version): nothing is
+    ///   rolled back then, with one exception. When no database records the next version, a
+    ///   NOMT tree not at the live DB's root is rolled back unchecked (nothing to check its root
+    ///   against) and checked afterwards, so each failed open rolls a tree that is several
+    ///   commits ahead, behind the live DB or diverged back by one more logged commit (see the
+    ///   `recovery` module docs). Upstream panicked.
+    /// - If a rollback fails, or does not restore the live DB's roots.
     pub fn open(config: &StateDbConfig) -> anyhow::Result<Self> {
-        let nomt = Arc::new(NomtStateDb::new(config)?);
-        let flat = FlatStateDb::new(
+        Self::open_with_faults(config, Faults::default())
+    }
+
+    /// [`open`](Self::open), with a commit hook (fault injection) for this instance's crash
+    /// recovery and commits.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn open_with_hook(
+        config: &StateDbConfig,
+        hook: Option<CommitHook>,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_faults(config, Faults::new(hook))
+    }
+
+    fn open_with_faults(config: &StateDbConfig, faults: Faults) -> anyhow::Result<Self> {
+        let nomt = NomtStateDb::open_no_grow(config)?;
+        let mut flat = FlatStateDb::new(
             &config.path,
             config.user_state_cache_size,
             config.kernel_state_cache_size,
         )?;
         let accessory = Arc::new(AccessoryDb::options().open_in(&config.path)?);
-        let group = Self {
+        // First: nothing may write data hashed with `H` before it.
+        check_state_hasher(&nomt, &flat, &accessory)?;
+        let last_recovery = crate::recovery::recover(&nomt, &mut flat, &accessory, &faults)?;
+        check_consistency(&nomt, &flat, &accessory)?;
+        let nomt = Arc::new(nomt.grow_to_config(config, &faults)?);
+        if !last_recovery.rolled_back.is_empty() {
+            tracing::warn!(
+                rolled_back = ?last_recovery.rolled_back,
+                live_version = ?last_recovery.live,
+                "The last commit of the state databases was interrupted: rolled back the \
+                 databases it had written"
+            );
+        }
+        Ok(Self {
             nomt,
             flat,
             accessory,
-        };
-        // First: nothing may write data hashed with `H` before it.
-        group.check_state_hasher()?;
-        group.check_consistency()?;
-        Ok(group)
+            faults,
+            poisoned: false,
+            last_recovery,
+        })
     }
 
-    /// The hasher guard (see [`open`](Self::open)): checks the recorded hasher tag, or records
-    /// it if every database is empty.
-    fn check_state_hasher(&self) -> anyhow::Result<()> {
-        let tag: [u8; 32] = H::digest(STATE_HASHER_PROBE).into();
-        match self
-            .accessory
-            .get::<DbMetadata>(&MetadataKey::StateHasher)?
-        {
-            Some(stored) => anyhow::ensure!(
-                stored == tag,
-                "the state databases were written with another state hasher (stored tag {}, \
-                 this node's {}): opening them would mix two hashers in one tree",
-                HexString(&stored),
-                HexString(tag)
-            ),
-            None => {
-                anyhow::ensure!(
-                    self.is_empty()?,
-                    "the state databases hold data but no state hasher tag (written before the \
-                     hasher guard existed, or the tag was removed): cannot check which hasher \
-                     wrote them"
-                );
-                self.accessory
-                    .put::<DbMetadata>(&MetadataKey::StateHasher, &tag.to_vec())
-                    .context("recording the state hasher tag")?;
-            }
-        }
-        Ok(())
+    /// Replaces this instance's commit hook (fault injection).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_commit_hook(&mut self, hook: Option<CommitHook>) {
+        self.faults = Faults::new(hook);
     }
 
-    /// Whether no database holds any state: the NOMT trees are empty and no version is
-    /// committed to the flat store (live or archival) or the accessory DB.
-    fn is_empty(&self) -> anyhow::Result<bool> {
-        Ok(self.nomt.root_hashes() == NomtRoots::PRE_GENESIS
-            && self.flat.latest_version_and_root_live()?.is_none()
-            && self.flat.latest_version_and_root_archival()?.is_none()
-            && AccessoryDb::latest_version_and_root(&self.accessory)?.is_none())
+    /// What startup crash recovery did when these databases were opened.
+    pub fn last_recovery(&self) -> &RecoveryReport {
+        &self.last_recovery
     }
 
-    /// Fails unless the NOMT trees, the live and archival flat DBs and the accessory DB are at
-    /// the same version and root.
-    fn check_consistency(&self) -> anyhow::Result<()> {
-        let live = self.flat.latest_version_and_root_live()?;
-        let archival = self.flat.latest_version_and_root_archival()?;
-        let accessory = AccessoryDb::latest_version_and_root(&self.accessory)?;
-        let nomt = self.nomt.root_hashes();
-        let version = |head: Head| head.map(|(version, _)| version);
+    /// Whether a failed commit poisoned the databases: then nothing can be committed or read
+    /// through [`readers`](Self::readers) until they are reopened.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    fn ensure_not_poisoned(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            nomt == root_of(live) && archival == live && accessory == live,
-            "the state databases are inconsistent (the last commit was interrupted; repairing \
-             it is not implemented yet): NOMT roots {nomt}; flat live DB at version {:?}, roots \
-             {}; flat archival DB at version {:?}, roots {}; accessory DB at version {:?}, roots \
-             {}",
-            version(live),
-            root_of(live),
-            version(archival),
-            root_of(archival),
-            version(accessory),
-            root_of(accessory),
+            !self.poisoned,
+            "the state databases are poisoned by a failed commit: reopen them (startup crash \
+             recovery repairs them)"
         );
         Ok(())
     }
@@ -199,7 +232,8 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             .map(|(version, _)| version))
     }
 
-    /// The committed roots of the NOMT trees.
+    /// The roots of the NOMT trees (the committed ones, unless a failed commit poisoned the
+    /// databases: then possibly ahead of them).
     pub fn roots(&self) -> NomtRoots {
         self.nomt.root_hashes()
     }
@@ -211,9 +245,25 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         &self.nomt
     }
 
+    /// The flat store (tests only).
+    #[cfg(test)]
+    pub(crate) fn flat(&self) -> &FlatStateDb {
+        &self.flat
+    }
+
+    /// The accessory DB (tests only).
+    #[cfg(test)]
+    pub(crate) fn accessory_db(&self) -> &Arc<rockbound::DB> {
+        &self.accessory
+    }
+
     /// Readers of the committed state, all at the newest committed version. They see later
     /// commits only through their unbound reads.
+    ///
+    /// # Errors
+    /// If the databases are poisoned ([`is_poisoned`](Self::is_poisoned)), or on read errors.
     pub fn readers<K>(&self) -> anyhow::Result<StorageReaders<H, K>> {
+        self.ensure_not_poisoned()?;
         Ok(StorageReaders {
             session_builder: NomtSessionBuilder::from_committed(self.nomt.clone()),
             historical_state: self.flat.reader()?,
@@ -230,17 +280,20 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
     /// Order (upstream's; proofs of the newest committed state rely on it): the NOMT kernel
     /// tree, the NOMT user tree, the accessory DB (values and root in one write), the flat
     /// archival DB, the flat live DB last. The live DB says which version is committed; after a
-    /// crash, the databases written before it are at most one version ahead.
+    /// crash, the databases written before it are at most one version ahead, and reopening
+    /// rolls them back ([`open`](Self::open)). Each write is synced to disk before the next.
     ///
     /// Drop every NOMT session and flat-store iterator of this thread first: a commit waits
     /// for them.
     ///
     /// # Errors
-    /// If the change set is for another version, does not build on the committed roots, or
-    /// carries a root other than its NOMT sessions' (all checked before anything is written);
-    /// or if a write fails. After a failed write the databases may be inconsistent: stop, and
-    /// reopen (which detects it).
+    /// - If the databases are poisoned, if the change set is for another version, does not
+    ///   build on the committed roots, or carries a root other than its NOMT sessions' (all
+    ///   checked before anything is written; the databases stay usable).
+    /// - If a write fails (or a fault is injected) once writing started: the databases may be
+    ///   out of step, and they are poisoned until reopened.
     pub fn commit(&mut self, change_set: NomtChangeSet) -> anyhow::Result<()> {
+        self.ensure_not_poisoned()?;
         let NomtChangeSet {
             state,
             historical_state,
@@ -274,93 +327,136 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             state.roots()
         );
 
+        let written = self.write(state, historical_state, &accessory);
+        if let Err(error) = &written {
+            self.poisoned = true;
+            tracing::error!(
+                version = %expected,
+                error = format!("{error:#}"),
+                "A commit of the state databases failed after it started writing: they are \
+                 poisoned until reopened"
+            );
+        }
+        written
+    }
+
+    /// The writes of [`commit`](Self::commit), in order, with the fault points in between.
+    fn write(
+        &mut self,
+        state: StateFinishedSession,
+        historical_state: StateChanges,
+        accessory: &SchemaBatch,
+    ) -> anyhow::Result<()> {
         // ======================= DANGER ZONE ======================
-        // The commit order is relied on by the prover's proofs of the newest committed state:
-        // change it only together with them.
+        // The commit order is relied on by the prover's proofs of the newest committed state
+        // and by startup crash recovery: change it only together with them. An error from here
+        // on poisons the databases.
+        self.faults.hit(CommitPoint::BeforeKernelNomt)?;
         self.nomt
-            .commit(state.into_state_overlay())
+            .commit(state.into_state_overlay(), &self.faults)
             .context("NOMT commit")?;
+        self.faults.hit(CommitPoint::BeforeAccessory)?;
         AccessoryDb::commit(
             &self.accessory,
-            &accessory,
+            accessory,
             &historical_state.root_hash_batch,
         )
         .context("accessory DB commit")?;
+        self.faults.hit(CommitPoint::BeforeArchival)?;
         self.flat
-            .commit(historical_state)
+            .commit_with_faults(historical_state, &self.faults)
             .context("flat state commit")?;
+        self.faults.hit(CommitPoint::AfterLive)
         // ===================== END DANGER ZONE ====================
-        Ok(())
     }
+}
+
+/// The hasher guard (see [`DbGroup::open`]): checks the recorded hasher tag, or records it if
+/// every database is empty.
+fn check_state_hasher<H: Digest<OutputSize = U32> + Send + Sync>(
+    nomt: &NomtStateDb<H>,
+    flat: &FlatStateDb,
+    accessory: &Arc<rockbound::DB>,
+) -> anyhow::Result<()> {
+    let tag: [u8; 32] = H::digest(STATE_HASHER_PROBE).into();
+    match accessory.get::<DbMetadata>(&MetadataKey::StateHasher)? {
+        Some(stored) => anyhow::ensure!(
+            stored == tag,
+            "the state databases were written with another state hasher (stored tag {}, this \
+             node's {}): opening them would mix two hashers in one tree",
+            HexString(&stored),
+            HexString(tag)
+        ),
+        None => {
+            anyhow::ensure!(
+                is_empty(nomt, flat, accessory)?,
+                "the state databases hold data but no state hasher tag (written before the \
+                 hasher guard existed, or the tag was removed): cannot check which hasher wrote \
+                 them"
+            );
+            accessory
+                .put::<DbMetadata>(&MetadataKey::StateHasher, &tag.to_vec())
+                .context("recording the state hasher tag")?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether no database holds any state: the NOMT trees are empty and no version is committed to
+/// the flat store (live or archival) or the accessory DB.
+fn is_empty<H: Digest<OutputSize = U32> + Send + Sync>(
+    nomt: &NomtStateDb<H>,
+    flat: &FlatStateDb,
+    accessory: &Arc<rockbound::DB>,
+) -> anyhow::Result<bool> {
+    Ok(nomt.root_hashes() == NomtRoots::PRE_GENESIS
+        && flat.latest_version_and_root_live()?.is_none()
+        && flat.latest_version_and_root_archival()?.is_none()
+        && AccessoryDb::latest_version_and_root(accessory)?.is_none())
+}
+
+/// Fails unless the NOMT trees, the live and archival flat DBs and the accessory DB are at the
+/// same version and root (after crash recovery, which repairs an interrupted commit).
+fn check_consistency<H: Digest<OutputSize = U32> + Send + Sync>(
+    nomt: &NomtStateDb<H>,
+    flat: &FlatStateDb,
+    accessory: &Arc<rockbound::DB>,
+) -> anyhow::Result<()> {
+    let live = flat.latest_version_and_root_live()?;
+    let archival = flat.latest_version_and_root_archival()?;
+    let accessory = AccessoryDb::latest_version_and_root(accessory)?;
+    let nomt = nomt.root_hashes();
+    let version = |head: Head| head.map(|(version, _)| version);
+    anyhow::ensure!(
+        nomt == root_of(live) && archival == live && accessory == live,
+        "the state databases are inconsistent after crash recovery: NOMT roots {nomt}; flat \
+         live DB at version {:?}, roots {}; flat archival DB at version {:?}, roots {}; \
+         accessory DB at version {:?}, roots {}",
+        version(live),
+        root_of(live),
+        version(archival),
+        root_of(archival),
+        version(accessory),
+        root_of(accessory),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use nomt::KeyReadWrite;
     use nomt::trie::KeyPath;
     use selendra_interface::reexports::digest;
     use selendra_state::namespaces::ProvableNamespace;
-    use selendra_state::{SlotKey, SlotValue};
     use sha2::Sha256;
 
     use super::*;
-    use crate::WitnessMode;
+    use crate::test_utils::blocks::{block, key, value};
+    use crate::{RecoveryStep, fail_at};
 
     type H = Sha256;
-    type Writes = Vec<(SlotKey, Option<SlotValue>)>;
-
-    fn key(bytes: &[u8]) -> SlotKey {
-        SlotKey::try_from_bytes(bytes).unwrap()
-    }
-
-    fn value(bytes: &[u8]) -> Option<SlotValue> {
-        Some(SlotValue::from(bytes.to_vec()))
-    }
 
     fn open(dir: &crate::test_utils::TestDir) -> DbGroup<H> {
         DbGroup::open(&StateDbConfig::for_tests(dir.path())).unwrap()
-    }
-
-    fn nomt_writes(writes: &Writes) -> Vec<(KeyPath, KeyReadWrite)> {
-        let sorted: BTreeMap<KeyPath, KeyReadWrite> = writes
-            .iter()
-            .map(|(key, value)| {
-                let key_path: KeyPath = H::digest(key.as_ref()).into();
-                let value = value
-                    .as_ref()
-                    .map(|v| v.combine_val_hash_and_size::<H>().to_vec());
-                (key_path, KeyReadWrite::Write(value))
-            })
-            .collect();
-        sorted.into_iter().collect()
-    }
-
-    /// A block's change set on top of the committed state of `group`.
-    fn block(
-        group: &DbGroup<H>,
-        version: u64,
-        user: Writes,
-        kernel: Writes,
-        accessory: Writes,
-    ) -> NomtChangeSet {
-        let sessions = group
-            .readers::<u64>()
-            .unwrap()
-            .session_builder
-            .begin_both_sessions(WitnessMode::Off)
-            .unwrap();
-        let state = StateFinishedSession::new(
-            sessions.user.finish(nomt_writes(&user)).unwrap(),
-            sessions.kernel.finish(nomt_writes(&kernel)).unwrap(),
-        );
-        let version = SlotNumber::new(version);
-        let historical_state =
-            HistoricalStateReader::materialize_values(user, kernel, state.roots(), version)
-                .unwrap();
-        let accessory = AccessoryDb::materialize_values(accessory, version).unwrap();
-        NomtChangeSet::new(state, historical_state, accessory)
     }
 
     #[test]
@@ -447,12 +543,21 @@ mod tests {
 
         // Wrong version.
         let change_set = block(&group, 1, writes(), writes(), vec![]);
-        assert!(group.commit(change_set).is_err());
+        let err = group.commit(change_set).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("is for version 1 but the next version is 0"),
+            "{err}"
+        );
 
         // A root other than the sessions'.
         let mut change_set = block(&group, 0, writes(), writes(), vec![]);
         change_set.historical_state.root = NomtRoots::PRE_GENESIS;
-        assert!(group.commit(change_set).is_err());
+        let err = group.commit(change_set).unwrap_err();
+        assert!(
+            err.to_string().contains("is not its NOMT sessions'"),
+            "{err}"
+        );
 
         // Two blocks on the same state: the second does not build on the committed roots.
         let first = block(&group, 0, writes(), writes(), vec![]);
@@ -467,35 +572,144 @@ mod tests {
             "{err}"
         );
 
-        // Nothing was written by the rejected change sets.
+        // Nothing was written by the rejected change sets, and the databases stay usable (not
+        // poisoned: the checks run before the first write).
         assert_eq!(group.roots(), roots);
         assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::GENESIS));
+        assert!(!group.is_poisoned());
+        let change_set = block(&group, 1, writes(), vec![], vec![]);
+        group.commit(change_set).unwrap();
         drop(group);
-        open(&tempdir);
+        let group = open(&tempdir);
+        assert_eq!(group.last_recovery().rolled_back, []);
+        assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::new(1)));
     }
 
-    /// A commit interrupted after the NOMT trees (here: only the flat store is behind) is
-    /// detected when reopening.
+    /// A commit interrupted before the flat live DB (everything else written) is rolled back
+    /// when the databases are reopened (upstream's `validate_commit_flag_and_rollback_if_
+    /// necessary`; our first port only refused to open them). Every crash point and kind of
+    /// block: `recovery::tests`.
     #[test]
-    fn open_detects_an_interrupted_commit() {
+    fn open_repairs_an_interrupted_commit() {
         let tempdir = crate::test_utils::tempdir();
-        {
+        let config = StateDbConfig::for_tests(tempdir.path());
+        let (genesis_roots, block_roots) = {
             let mut group = open(&tempdir);
-            let change_set = block(&group, 0, vec![(key(b"k1"), value(b"v"))], vec![], vec![]);
-            let NomtChangeSet { state, .. } = change_set;
-            group.nomt.commit(state.into_state_overlay()).unwrap();
-            // A flat-only commit makes it worse, not better.
-            let changes = HistoricalStateReader::materialize_values(
+            let genesis_roots = commit_genesis(&mut group);
+            let change_set = block(
+                &group,
+                1,
+                vec![(key(b"u1"), value(b"user1"))],
+                vec![(key(b"k1"), value(b"kernel1"))],
+                vec![(key(b"a1"), value(b"acc1"))],
+            );
+            let block_roots = change_set.roots();
+            group.set_commit_hook(Some(fail_at(CommitPoint::BeforeLive)));
+            let err = group.commit(change_set).unwrap_err();
+            assert!(format!("{err:#}").contains("injected fault"), "{err:#}");
+            (genesis_roots, block_roots)
+        };
+
+        let mut group = DbGroup::<H>::open(&config).unwrap();
+        assert_eq!(
+            group.last_recovery(),
+            &RecoveryReport {
+                rolled_back: vec![
+                    RecoveryStep::KernelNomt,
+                    RecoveryStep::UserNomt,
+                    RecoveryStep::Accessory,
+                    RecoveryStep::Archival,
+                ],
+                live: Some(SlotNumber::GENESIS),
+            }
+        );
+        assert_eq!(group.roots(), genesis_roots);
+        assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::GENESIS));
+        let readers = group.readers::<u64>().unwrap();
+        assert_eq!(
+            readers
+                .historical_state
+                .get_value(ProvableNamespace::User, &key(b"u1"))
+                .unwrap(),
+            value(b"user0")
+        );
+        assert_eq!(
+            readers
+                .accessory
+                .get_value_option(&key(b"a1"), SlotNumber::new(1))
+                .unwrap(),
+            value(b"acc0")
+        );
+        drop(readers);
+
+        // The same block commits again, to the same roots; the next open has nothing to do.
+        let change_set = block(
+            &group,
+            1,
+            vec![(key(b"u1"), value(b"user1"))],
+            vec![(key(b"k1"), value(b"kernel1"))],
+            vec![(key(b"a1"), value(b"acc1"))],
+        );
+        group.commit(change_set).unwrap();
+        assert_eq!(group.roots(), block_roots);
+        drop(group);
+        assert_eq!(open(&tempdir).last_recovery().rolled_back, []);
+    }
+
+    /// A commit that fails once it started writing poisons the databases: no commit and no new
+    /// readers until they are reopened (the NOMT trees may be ahead of the flat store). Upstream
+    /// went on writing on top of the half-written commit.
+    #[test]
+    fn poisoned_group_refuses_commit_and_readers() {
+        for point in CommitPoint::COMMIT {
+            let tempdir = crate::test_utils::tempdir();
+            let mut group = open(&tempdir);
+            commit_genesis(&mut group);
+            let writes = || {
+                (
+                    vec![(key(b"u1"), value(b"user1"))],
+                    vec![(key(b"k1"), value(b"kernel1"))],
+                    vec![(key(b"a1"), value(b"acc1"))],
+                )
+            };
+            let (user, kernel, accessory) = writes();
+            let first = block(&group, 1, user, kernel, accessory);
+            let (user, kernel, accessory) = writes();
+            let retry = block(&group, 1, user, kernel, accessory);
+
+            group.set_commit_hook(Some(fail_at(point)));
+            let err = group.commit(first).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("injected fault"),
+                "{point:?}: {err:#}"
+            );
+            assert!(group.is_poisoned(), "{point:?}");
+            // Even with the fault gone, and even where nothing was written yet.
+            group.set_commit_hook(None);
+            let err = group.commit(retry).unwrap_err();
+            assert!(err.to_string().contains("poisoned"), "{point:?}: {err}");
+            let err = group.readers::<u64>().unwrap_err();
+            assert!(err.to_string().contains("poisoned"), "{point:?}: {err}");
+            drop(group);
+
+            let mut group = open(&tempdir);
+            assert!(!group.is_poisoned());
+            let expected = if point == CommitPoint::AfterLive {
+                SlotNumber::new(1)
+            } else {
+                SlotNumber::GENESIS
+            };
+            assert_eq!(group.latest_version().unwrap(), Some(expected), "{point:?}");
+            let next = expected.get().checked_add(1).unwrap();
+            let change_set = block(
+                &group,
+                next,
+                vec![(key(b"u2"), value(b"v"))],
                 vec![],
                 vec![],
-                NomtRoots::PRE_GENESIS,
-                SlotNumber::GENESIS,
-            )
-            .unwrap();
-            group.flat.commit(changes).unwrap();
+            );
+            group.commit(change_set).unwrap();
         }
-        let err = DbGroup::<H>::open(&StateDbConfig::for_tests(tempdir.path())).unwrap_err();
-        assert!(err.to_string().contains("inconsistent"), "{err}");
     }
 
     // ---------------------------------------------------------------------------------------
@@ -567,8 +781,8 @@ mod tests {
     fn open_rejects_db_written_with_another_hasher() {
         let tempdir = crate::test_utils::tempdir();
         let roots = commit_genesis(&mut open(&tempdir));
-        // Without the guard, the trees' roots (recomputed with the other hasher) would be the
-        // first mismatch found, reported as an interrupted commit.
+        // Without the guard, the trees' roots (recomputed with the other hasher) would differ
+        // from the live DB's, taken for an interrupted commit that recovery cannot repair.
         let err = DbGroup::<OtherHasher>::open(&config(&tempdir)).unwrap_err();
         assert_hasher_error(&err, "written with another state hasher");
 
@@ -648,13 +862,74 @@ mod tests {
                 vec![],
             );
             let NomtChangeSet { state, .. } = change_set;
-            group.nomt.commit(state.into_state_overlay()).unwrap();
+            group
+                .nomt
+                .commit(state.into_state_overlay(), &Faults::default())
+                .unwrap();
             group.roots()
         };
         let err = DbGroup::<OtherHasher>::open(&config(&tempdir)).unwrap_err();
         assert_hasher_error(&err, "written with another state hasher");
 
-        let nomt = NomtStateDb::<H>::new(&config(&tempdir)).unwrap();
+        let nomt = NomtStateDb::<H>::open_no_grow(&config(&tempdir)).unwrap();
         assert_eq!(nomt.root_hashes(), nomt_roots);
+        drop(nomt);
+        // With the state hasher, recovery rolls the trees back.
+        let group = open(&tempdir);
+        assert_eq!(group.last_recovery().rolled_back, [RecoveryStep::UserNomt]);
+        assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::GENESIS));
+    }
+
+    /// A refused open grows no NOMT hash table: growing comes after the hasher guard, crash
+    /// recovery and the consistency check (it used to run first, when the trees were opened).
+    #[test]
+    fn refused_open_does_not_grow_hashtable() {
+        let small_count =
+            usize::try_from(StateDbConfig::for_tests("").user.hashtable_buckets.get()).unwrap();
+        let large_count = small_count.checked_mul(2).unwrap();
+        let large = |dir: &crate::test_utils::TestDir| {
+            let mut config = config(dir);
+            let buckets =
+                core::num::NonZeroU32::try_from(u32::try_from(large_count).unwrap()).unwrap();
+            config.user.hashtable_buckets = buckets;
+            config.kernel.hashtable_buckets = buckets;
+            config
+        };
+        {
+            let tempdir = crate::test_utils::tempdir();
+            let bucket_counts = || {
+                NomtStateDb::<H>::open_no_grow(&large(&tempdir))
+                    .unwrap()
+                    .bucket_counts()
+            };
+            {
+                let mut group = open(&tempdir);
+                commit_genesis(&mut group);
+                let change_set = block(&group, 1, vec![(key(b"u1"), value(b"v1"))], vec![], vec![]);
+                group.commit(change_set).unwrap();
+            }
+
+            // Refused by the hasher guard.
+            let err = DbGroup::<OtherHasher>::open(&large(&tempdir)).unwrap_err();
+            assert_hasher_error(&err, "written with another state hasher");
+            assert_eq!(bucket_counts(), (small_count, small_count));
+
+            // Refused by crash recovery: the accessory DB is behind the live DB.
+            let accessory = Arc::new(AccessoryDb::options().open_in(tempdir.path()).unwrap());
+            AccessoryDb::rollback(&accessory).unwrap();
+            drop(accessory);
+            let err = DbGroup::<H>::open(&large(&tempdir)).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("cannot be recovered"),
+                "{err:#}"
+            );
+            assert_eq!(bucket_counts(), (small_count, small_count));
+        }
+
+        // An open that succeeds grows them.
+        let tempdir = crate::test_utils::tempdir();
+        drop(open(&tempdir));
+        let group = DbGroup::<H>::open(&large(&tempdir)).unwrap();
+        assert_eq!(group.nomt().bucket_counts(), (large_count, large_count));
     }
 }

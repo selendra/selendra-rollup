@@ -17,6 +17,7 @@ use rockbound::{CacheForSchema, DB, Schema, SchemaBatch};
 use selendra_interface::common::SlotNumber;
 
 use crate::accessory::DbOptions;
+use crate::faults::{CommitPoint, Faults};
 use crate::historical::{
     HistoricalStateReader, KernelValues, StateChanges, UserValues, next_version_after,
 };
@@ -31,8 +32,9 @@ use crate::schema::StateRootHashes;
 ///   (for pruning and rollback) and the roots.
 ///
 /// A commit writes the archival DB first and the live DB last, so after a crash the live DB is
-/// never ahead: the archival DB is at most one version ahead, and
-/// [`validate_and_rollback_archival`](Self::validate_and_rollback_archival) removes that version.
+/// never ahead: the archival DB is at most one version ahead, and startup crash recovery
+/// ([`DbGroup::open`](crate::DbGroup::open)) removes that version (as
+/// [`validate_and_rollback_archival`](Self::validate_and_rollback_archival) does).
 pub struct FlatStateDb {
     user: Arc<VersionedDB<UserValues, DbCache>>,
     kernel: Arc<VersionedDB<KernelValues, DbCache>>,
@@ -52,18 +54,15 @@ impl core::fmt::Debug for FlatStateDb {
 enum CommitMode {
     /// A version: archival, then live.
     Commit,
-    /// A version's archival rows only, as if the process died before writing the live DB.
-    #[cfg(test)]
-    CrashBeforeLive,
     /// Removes a version's archival rows (the live DB is not touched).
     RollbackArchival,
 }
 
 impl FlatStateDb {
     const LIVE_DB_NAME: &'static str = "state-live";
-    const LIVE_DB_PATH_SUFFIX: &'static str = "state-db";
+    pub(crate) const LIVE_DB_PATH_SUFFIX: &'static str = "state-db";
     const ARCHIVAL_DB_NAME: &'static str = "state-archival";
-    const ARCHIVAL_DB_PATH_SUFFIX: &'static str = "archival-state-db";
+    pub(crate) const ARCHIVAL_DB_PATH_SUFFIX: &'static str = "archival-state-db";
 
     /// Opens (or creates) the store under `path`, with value caches of `user_cache_size` and
     /// `kernel_cache_size` bytes.
@@ -199,6 +198,16 @@ impl FlatStateDb {
     /// was materialized for. Also on write errors; the value caches are then cleared, since
     /// they may hold values that were not written.
     pub fn commit(&mut self, changes: StateChanges) -> anyhow::Result<()> {
+        self.commit_with_faults(changes, &Faults::default())
+    }
+
+    /// [`commit`](Self::commit), calling `faults` between the archival and the live write
+    /// ([`CommitPoint::BeforeLive`]).
+    pub(crate) fn commit_with_faults(
+        &mut self,
+        changes: StateChanges,
+        faults: &Faults,
+    ) -> anyhow::Result<()> {
         let latest = self.latest_version_and_root_live()?.map(|(v, _)| v);
         let expected = next_version_after(latest)?;
         anyhow::ensure!(
@@ -206,14 +215,21 @@ impl FlatStateDb {
             "the state changes are for version {} but the flat store expects version {expected}",
             changes.version
         );
-        self.commit_internal(&changes, CommitMode::Commit)
+        self.commit_internal(&changes, CommitMode::Commit, faults)
     }
 
     /// Writes `changes` at `changes.version` as `mode` says.
-    fn commit_internal(&self, changes: &StateChanges, mode: CommitMode) -> anyhow::Result<()> {
-        // Readers wait while the caches and the DBs are updated.
+    fn commit_internal(
+        &self,
+        changes: &StateChanges,
+        mode: CommitMode,
+        faults: &Faults,
+    ) -> anyhow::Result<()> {
+        // Held while the caches and the DBs are updated. Only prefix iterators wait for it: a
+        // point read that finds it taken reads the DBs themselves (the live DB is written last,
+        // so it holds the previous version until then), and root reads take no lock.
         let inner = self.db_cache.inner.write();
-        let written = self.write_under_lock(&inner, changes, mode);
+        let written = self.write_under_lock(&inner, changes, mode, faults);
         if written.is_err() && mode != CommitMode::RollbackArchival {
             // The caches were updated with values that may not have been written.
             inner.user_cache.clear();
@@ -228,6 +244,7 @@ impl FlatStateDb {
         inner: &Inner,
         changes: &StateChanges,
         mode: CommitMode,
+        faults: &Faults,
     ) -> anyhow::Result<()> {
         let version = changes.version.get();
         let is_commit = mode != CommitMode::RollbackArchival;
@@ -273,60 +290,43 @@ impl FlatStateDb {
         // to the archival rows needlessly.)
         self.kernel.store_committed_archival_version(version);
         self.user.store_committed_archival_version(version);
-        if mode == CommitMode::Commit {
-            self.live_db.write_db_batch(live_batch)?;
-        }
-        Ok(())
+        faults.hit(CommitPoint::BeforeLive)?;
+        self.live_db.write_db_batch(live_batch)
     }
 
     /// Checks that the live and archival DBs are at the same version; if the archival DB is one
     /// version ahead (a crash between the two writes of a commit), removes that version from
-    /// it. For crash recovery at startup (not wired in yet).
+    /// it. Startup crash recovery does the same for all the state databases
+    /// ([`DbGroup::open`](crate::DbGroup::open)).
     ///
     /// # Errors
     /// If the two DBs are in any other state (they cannot be repaired automatically), or on
     /// read or write errors. Upstream panicked.
     pub fn validate_and_rollback_archival(&mut self) -> anyhow::Result<()> {
-        let live = self.latest_version_and_root_live()?;
-        let Some((archival_version, archival_root)) = self.latest_version_and_root_archival()?
-        else {
-            anyhow::ensure!(
-                live.is_none(),
-                "the archival state DB is empty but the live one is not"
-            );
-            return Ok(());
-        };
-        let Some((live_version, live_root)) = live else {
-            anyhow::bail!(
-                "the live state DB is empty but the archival one is at version {archival_version}: \
-                 remove the archival DB manually"
-            );
-        };
-
-        if archival_version == live_version {
-            anyhow::ensure!(
-                archival_root == live_root,
-                "the live and archival state DBs have different roots at version {live_version}"
-            );
-            return Ok(());
+        if let Some((version, _)) = self.archival_ahead()? {
+            self.rollback_archival(version)?;
         }
-        anyhow::ensure!(
-            live_version.checked_add(1) == Some(archival_version),
-            "the live ({live_version}) and archival ({archival_version}) state DBs cannot be \
-             reconciled"
-        );
-        let previous_root = self.root_archival_at(live_version)?.ok_or_else(|| {
-            anyhow::anyhow!("the archival state DB has no root for version {live_version}")
-        })?;
-        anyhow::ensure!(
-            previous_root == live_root,
-            "the live and archival state DBs have different roots at version {live_version}"
-        );
-        self.rollback_archival(archival_version)
+        Ok(())
+    }
+
+    /// The archival DB's newest version and roots if it is one version ahead of the live DB
+    /// (and at the live DB's roots at its version); `None` if both are at the same version and
+    /// roots. With an empty live DB, an archival DB at genesis is one ahead (a crash during the
+    /// genesis commit; upstream refused it).
+    ///
+    /// # Errors
+    /// If the two DBs are in any other state, or on read errors.
+    pub(crate) fn archival_ahead(&self) -> anyhow::Result<Option<(SlotNumber, NomtRoots)>> {
+        crate::recovery::one_ahead(
+            "flat archival DB",
+            self.latest_version_and_root_archival()?,
+            self.latest_version_and_root_live()?,
+            |version| self.root_archival_at(version),
+        )
     }
 
     /// Removes `version` (every key written at it, and its root) from the archival DB.
-    fn rollback_archival(&mut self, version: SlotNumber) -> anyhow::Result<()> {
+    pub(crate) fn rollback_archival(&mut self, version: SlotNumber) -> anyhow::Result<()> {
         let user = keys_written_at(&self.user, version)?;
         let kernel = keys_written_at(&self.kernel, version)?;
         let mut root_hash_batch = SchemaBatch::default();
@@ -339,7 +339,7 @@ impl FlatStateDb {
             // Unused by a rollback.
             root: NomtRoots::PRE_GENESIS,
         };
-        self.commit_internal(&changes, CommitMode::RollbackArchival)
+        self.commit_internal(&changes, CommitMode::RollbackArchival, &Faults::default())
     }
 }
 
@@ -465,8 +465,8 @@ mod tests {
     }
 
     /// Commits version 0, then "crashes" during the commit of version 1 (before the archival
-    /// write, or between the archival and live writes), reopens, and rolls the archival DB
-    /// back. Upstream injected a panic through an environment variable.
+    /// write, or between the archival and live writes: a fault hook), reopens, and rolls the
+    /// archival DB back. Upstream injected a panic through an environment variable.
     fn test_rollback(archival_written: bool) {
         let tempdir = crate::test_utils::tempdir();
         let data = data_to_insert_per_version();
@@ -484,10 +484,15 @@ mod tests {
         }
 
         {
-            let flat = open(&tempdir);
+            let mut flat = open(&tempdir);
+            // The crash: a fault injected before the archival write (nothing written) or
+            // between the archival and the live write.
             if archival_written {
-                flat.commit_internal(&data.change_set(1), CommitMode::CrashBeforeLive)
-                    .unwrap();
+                let faults = Faults::new(Some(crate::faults::fail_at(CommitPoint::BeforeLive)));
+                let err = flat
+                    .commit_with_faults(data.change_set(1), &faults)
+                    .unwrap_err();
+                assert!(err.to_string().contains("injected fault"), "{err}");
             }
             assert_flat_state(0, u64::from(archival_written), &flat);
         }
@@ -508,6 +513,38 @@ mod tests {
             flat.commit(data.change_set(1)).unwrap();
             assert_flat_state(1, 1, &flat);
         }
+    }
+
+    /// A crash between the archival and the live write of the genesis commit leaves the
+    /// archival DB at version 0 and the live DB empty: that is one version ahead, rolled back
+    /// to empty (upstream refused: "remove the archival DB manually").
+    #[test]
+    fn rollback_of_an_interrupted_genesis_commit() {
+        let tempdir = crate::test_utils::tempdir();
+        let data = data_to_insert_per_version();
+        let mut flat = open(&tempdir);
+        let faults = Faults::new(Some(crate::faults::fail_at(CommitPoint::BeforeLive)));
+        flat.commit_with_faults(data.change_set(0), &faults)
+            .unwrap_err();
+        assert_eq!(flat.latest_version_and_root_live().unwrap(), None);
+        assert_eq!(
+            flat.latest_version_and_root_archival().unwrap(),
+            Some((SlotNumber::GENESIS, root(0)))
+        );
+        drop(flat);
+
+        let mut flat = open(&tempdir);
+        flat.validate_and_rollback_archival().unwrap();
+        assert_eq!(flat.latest_version_and_root_archival().unwrap(), None);
+        for (k, _) in data.user(0) {
+            assert_eq!(flat.user.get_historical_value(&k, 99).unwrap(), None);
+        }
+        assert_eq!(
+            flat.user.iter_pruning_keys_at_version(0).unwrap().count(),
+            0
+        );
+        flat.commit(data.change_set(0)).unwrap();
+        assert_flat_state(0, 0, &flat);
     }
 
     /// Rolls back the archival DB regardless of the live DB's version.
@@ -539,7 +576,8 @@ mod tests {
                 assert_eq!(flat.kernel.get_historical_value(&k, 99).unwrap(), v);
             }
             // The live DB is 2 versions ahead: not repairable.
-            assert!(flat.validate_and_rollback_archival().is_err());
+            let err = flat.validate_and_rollback_archival().unwrap_err();
+            assert!(err.to_string().contains("cannot be recovered"), "{err}");
         }
     }
 
