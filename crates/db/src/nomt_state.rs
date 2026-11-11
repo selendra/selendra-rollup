@@ -122,6 +122,56 @@ impl WitnessMode {
 }
 
 /// The two NOMT state trees: one database per provable namespace.
+///
+/// Only [`DbGroup`](crate::DbGroup) opens and commits them: opening runs the hasher guard
+/// first ([`DbGroup::open`](crate::DbGroup::open)), and a commit writes the flat store and the
+/// accessory DB in step with the trees ([`DbGroup::commit`](crate::DbGroup::commit)), from
+/// sessions this crate opened on these trees. Outside code cannot open the trees, commit to
+/// them alone, or bring in sessions of another NOMT database (whose nodes may be hashed with
+/// another hasher: NOMT only checks an overlay's previous root, never its hasher). Each of
+/// these fails to compile only because the item is private (the last example compiles with
+/// the same names; the error codes are checked only on nightly):
+///
+/// ```compile_fail,E0624
+/// # fn f(config: &selendra_db::StateDbConfig) {
+/// let _ = selendra_db::NomtStateDb::<selendra_state::StateHasher>::new(config);
+/// # }
+/// ```
+///
+/// ```compile_fail,E0624
+/// # use selendra_db::{NomtStateDb, StateOverlay};
+/// # fn f(trees: &NomtStateDb<selendra_state::StateHasher>, overlay: StateOverlay) {
+/// let _ = trees.commit(overlay);
+/// # }
+/// ```
+///
+/// ```compile_fail,E0624
+/// # fn f(user: nomt::FinishedSession, kernel: nomt::FinishedSession) {
+/// let _ = selendra_db::StateFinishedSession::new(user, kernel);
+/// # }
+/// ```
+///
+/// ```compile_fail,E0599
+/// # fn f(group: &selendra_db::DbGroup<selendra_state::StateHasher>) {
+/// let _ = group.nomt();
+/// # }
+/// ```
+///
+/// What stays public opens through the guard, or only reads:
+///
+/// ```
+/// # use selendra_db::{DbGroup, NomtRoots, NomtStateDb, StateDbConfig, StateFinishedSession};
+/// # use selendra_db::StateOverlay;
+/// # use selendra_state::StateHasher as H;
+/// # fn f(config: &StateDbConfig, group: &DbGroup<H>, trees: &NomtStateDb<H>,
+/// #     finished: StateFinishedSession, _: nomt::FinishedSession) {
+/// let _ = DbGroup::<H>::open(config);
+/// let _: NomtRoots = group.roots();
+/// let _: NomtRoots = trees.root_hashes();
+/// let overlay: StateOverlay = finished.into_state_overlay();
+/// let _: NomtRoots = overlay.prev_roots();
+/// # }
+/// ```
 pub struct NomtStateDb<H> {
     user: Nomt<BinaryHasher<H>>,
     kernel: Nomt<BinaryHasher<H>>,
@@ -144,7 +194,7 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> NomtStateDb<H> {
     ///   Linux 6.0 or later.
     /// - If a tree has more buckets than configured (shrinking is not supported), or on I/O
     ///   errors.
-    pub fn new(config: &StateDbConfig) -> anyhow::Result<Self> {
+    pub(crate) fn new(config: &StateDbConfig) -> anyhow::Result<Self> {
         check_io_uring()?;
         let kernel = open_tree(KERNEL, &config.kernel, &config.kernel_nomt_path())?;
         let user = open_tree(USER, &config.user, &config.user_nomt_path())?;
@@ -157,7 +207,7 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> NomtStateDb<H> {
     /// If `overlay` does not build on the committed roots (checked before anything is written),
     /// or if NOMT fails. If the user commit fails after the kernel commit succeeded, the trees
     /// are out of step: the caller must stop (crash recovery rolls the kernel tree back).
-    pub fn commit(&self, overlay: StateOverlay) -> anyhow::Result<()> {
+    pub(crate) fn commit(&self, overlay: StateOverlay) -> anyhow::Result<()> {
         let StateOverlay {
             user,
             kernel,
@@ -263,7 +313,8 @@ fn warn_if_nearly_full<H: Digest<OutputSize = U32> + Send + Sync>(
 }
 
 /// The uncommitted changes of one block to both trees, in memory. They can be committed
-/// ([`NomtStateDb::commit`]) or used as the base of later sessions ([`NomtSessionBuilder`]).
+/// (inside this crate: [`DbGroup::commit`](crate::DbGroup::commit)) or used as the base of
+/// later sessions ([`NomtSessionBuilder`]).
 pub struct StateOverlay {
     user: Overlay,
     kernel: Overlay,
@@ -286,6 +337,8 @@ impl StateOverlay {
 }
 
 /// The finished sessions of both trees for one block.
+///
+/// Built only inside this crate, from sessions on our trees (see [`NomtStateDb`]).
 pub struct StateFinishedSession {
     user: FinishedSession,
     kernel: FinishedSession,
@@ -293,7 +346,7 @@ pub struct StateFinishedSession {
 
 impl StateFinishedSession {
     /// Combines the finished sessions of the two trees.
-    pub fn new(user: FinishedSession, kernel: FinishedSession) -> Self {
+    pub(crate) fn new(user: FinishedSession, kernel: FinishedSession) -> Self {
         Self { user, kernel }
     }
 
@@ -331,6 +384,11 @@ pub type SharedOverlays<K> = Arc<RwLock<HashMap<K, StateOverlay>>>;
 ///
 /// A session holds NOMT's read lock: committing to the same tree blocks until every session on
 /// it is dropped. Drop sessions before committing on the same thread, or it deadlocks.
+///
+/// Sessions are opened only inside this crate (by the storages): a raw session reads and
+/// writes the trees without the flat store, and a thread holding one while opening another can
+/// deadlock behind a commit, so `begin_both_sessions` (both trees under one lock) is the only
+/// way to hold two.
 pub struct NomtSessionBuilder<H, K> {
     state_db: Arc<NomtStateDb<H>>,
     /// Newest first (as [`SessionParams::overlay`] expects).
@@ -357,11 +415,11 @@ impl<H, K> fmt::Debug for NomtSessionBuilder<H, K> {
 }
 
 /// The sessions of both trees, opened together ([`NomtSessionBuilder::begin_both_sessions`]).
-pub struct SessionsContainer<H> {
+pub(crate) struct SessionsContainer<H> {
     /// The user tree's session.
-    pub user: Session<BinaryHasher<H>>,
+    pub(crate) user: Session<BinaryHasher<H>>,
     /// The kernel tree's session.
-    pub kernel: Session<BinaryHasher<H>>,
+    pub(crate) kernel: Session<BinaryHasher<H>>,
 }
 
 impl<H, K> NomtSessionBuilder<H, K> {
@@ -415,7 +473,9 @@ where
     }
 
     /// Opens a session on the user tree, without a witness.
-    pub fn begin_user_session_without_witness(&self) -> anyhow::Result<Session<BinaryHasher<H>>> {
+    pub(crate) fn begin_user_session_without_witness(
+        &self,
+    ) -> anyhow::Result<Session<BinaryHasher<H>>> {
         self.with_overlays(|overlays| {
             let params = session_params(USER, overlays.iter().map(|o| &o.user), WitnessMode::Off)?;
             Ok(self.state_db.user.begin_session(params))
@@ -423,7 +483,9 @@ where
     }
 
     /// Opens a session on the kernel tree, without a witness.
-    pub fn begin_kernel_session_without_witness(&self) -> anyhow::Result<Session<BinaryHasher<H>>> {
+    pub(crate) fn begin_kernel_session_without_witness(
+        &self,
+    ) -> anyhow::Result<Session<BinaryHasher<H>>> {
         self.with_overlays(|overlays| {
             let params =
                 session_params(KERNEL, overlays.iter().map(|o| &o.kernel), WitnessMode::Off)?;
@@ -433,7 +495,7 @@ where
 
     /// Opens sessions on both trees under one read lock, so a thread never holds one session
     /// while waiting to open the other.
-    pub fn begin_both_sessions(
+    pub(crate) fn begin_both_sessions(
         &self,
         witness_mode: WitnessMode,
     ) -> anyhow::Result<SessionsContainer<H>> {

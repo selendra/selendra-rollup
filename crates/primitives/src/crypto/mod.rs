@@ -19,7 +19,8 @@ pub use self::secp256k1::{EthereumPublicKey, EthereumSignature};
 ///
 /// `sha2` and `ed25519-consensus` are pinned to the exact versions SP1's guest patches
 /// accelerate; the patches are applied when building the guest, so this one type works
-/// natively and inside the zkVM.
+/// natively and inside the zkVM. The hasher is the state hasher (`selendra_state::StateHasher`,
+/// checked by a test: one hash function for the whole chain).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ed25519CryptoSpec;
 
@@ -44,4 +45,27 @@ impl CryptoSpec for EvmCryptoSpec {
     type PublicKey = EthereumPublicKey;
     type Hasher = sha2::Sha256;
     type Signature = EthereumSignature;
+}
+
+#[cfg(test)]
+mod tests {
+    use core::marker::PhantomData;
+
+    use selendra_state::StateHasher;
+
+    use super::*;
+
+    /// Both crypto specs hash with the state hasher (SHA-256): checked at compile time.
+    #[test]
+    fn crypto_spec_hashers_are_the_state_hasher() {
+        fn same<T>(_: PhantomData<T>, _: PhantomData<T>) {}
+        same(
+            PhantomData::<<Ed25519CryptoSpec as CryptoSpec>::Hasher>,
+            PhantomData::<StateHasher>,
+        );
+        same(
+            PhantomData::<<EvmCryptoSpec as CryptoSpec>::Hasher>,
+            PhantomData::<StateHasher>,
+        );
+    }
 }

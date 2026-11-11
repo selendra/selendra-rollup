@@ -16,6 +16,8 @@ proptest = { workspace = true, optional = true }
 rockbound = { workspace = true, optional = true }
 selendra-interface = { workspace = true }
 serde = { workspace = true }
+# The state hasher (`StateHasher`): SHA-256, the exact version SP1's guest patches.
+sha2 = { workspace = true }
 test-strategy = { workspace = true, optional = true }
 thiserror = { workspace = true }
 
@@ -23,7 +25,6 @@ thiserror = { workspace = true }
 postcard = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 test-strategy = { workspace = true }
 
 # A real NOMT database for the verifier's tests (a test prover driving NOMT sessions). NOMT is
@@ -43,8 +44,8 @@ native = ["selendra-interface/native"]
 rockbound = ["native", "dep:rockbound"]
 # `NamespacedStateMap::arbitrary_state_map`.
 arbitrary = ["dep:arbitrary"]
-# `test_utils`: helpers for the node's storage tests (`selendra-db` dev-dependency). Never in a node
-# or guest build.
+# `test_utils` and `test_vectors`: helpers and known-answer vectors for the node's storage tests
+# (`selendra-db` dev-dependency). Never in a node or guest build.
 test-utils = ["dep:proptest", "dep:test-strategy"]
 
 [lints]

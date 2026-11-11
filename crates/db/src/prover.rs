@@ -13,15 +13,14 @@ use nomt::hasher::BinaryHasher;
 use nomt::trie::KeyPath;
 use nomt::{FinishedSession, KeyReadWrite, Session};
 use selendra_interface::common::SlotNumber;
-use selendra_interface::reexports::digest::Digest;
 use selendra_state::namespaces::{
     Accessory, CompileTimeNamespace, Namespace, ProvableCompileTimeNamespace, ProvableNamespace,
 };
 use selendra_state::{
     MerkleProofSpec, NativeStorage, NodeLeaf, NodeLeafAndMaybeValue, NomtProof,
     OrderedReadsAndWrites, ProofOutput, SlotKey, SlotValue, StateAccesses, StateRoot, StateUpdate,
-    Storage, StorageProof, StorageRoot, Witness, namespace_needs_proof, verify_namespace,
-    verify_storage_proof,
+    Storage, StorageProof, StorageRoot, Witness, key_path, leaf_value_bytes, namespace_needs_proof,
+    verify_namespace, verify_storage_proof,
 };
 
 use crate::{
@@ -67,12 +66,6 @@ impl From<anyhow::Error> for GetWithProofError {
     fn from(err: anyhow::Error) -> Self {
         Self::Other(err)
     }
-}
-
-/// The key path of `key` in a state tree: `H(key)`, the hash of the whole key (prefix
-/// included), as the verifier computes it.
-fn key_path<S: MerkleProofSpec>(key: &SlotKey) -> KeyPath {
-    S::Hasher::digest(key.as_ref()).into()
 }
 
 /// A [`Storage`] for native execution (the node and the prover), on the NOMT state trees and the
@@ -169,7 +162,8 @@ impl<S> StateUpdate for NomtStateUpdate<S> {
 
 /// The NOMT accesses of one namespace, sorted by key path (upstream `to_nomt_accesses`). A read
 /// carries the `val_hash_and_size` read, a write the new one (`None`: delete); a key both read
-/// and written is `ReadThenWrite`.
+/// and written is `ReadThenWrite`. Key paths and leaf bytes come from `selendra-state`
+/// ([`key_path`], [`leaf_value_bytes`]), the verifier's own definitions.
 ///
 /// A delete of a key that is absent from the tree (`is_absent`, asked for every delete) becomes
 /// a read of its absence. It is the same for the tree and its proof, but NOMT 1.0.5 panics
@@ -188,7 +182,7 @@ fn to_nomt_accesses<S: MerkleProofSpec>(
     // A `BTreeMap`, so the accesses are sorted: NOMT checks the order only in debug builds.
     let mut merged: BTreeMap<KeyPath, KeyReadWrite> = BTreeMap::new();
     for (key, leaf) in &accesses.ordered_reads {
-        let read = leaf.map(|leaf| leaf.combine_val_hash_and_size().to_vec());
+        let read = leaf.map(|leaf| leaf_value_bytes(&leaf).to_vec());
         if merged
             .insert(key_path::<S>(key), KeyReadWrite::Read(read))
             .is_some()
@@ -200,7 +194,7 @@ fn to_nomt_accesses<S: MerkleProofSpec>(
         let key_path = key_path::<S>(key);
         let write = value
             .as_ref()
-            .map(|value| value.combine_val_hash_and_size::<S::Hasher>().to_vec());
+            .map(|value| leaf_value_bytes(&NodeLeaf::make_leaf::<S::Hasher>(value)).to_vec());
         let absent_delete = write.is_none() && is_absent(&key_path)?;
         match merged.entry(key_path) {
             Entry::Vacant(entry) => {

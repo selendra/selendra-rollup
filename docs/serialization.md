@@ -155,21 +155,32 @@ opens it against the root; `Storage::open_proof` alone does not check the contai
 ## NOMT state trees, roots and proofs
 
 Each provable namespace (user, kernel) is one NOMT binary trie hashed with
-`BinaryHasher<Storage::Hasher>` (SHA-256): internal node `H(left ‖ right)` with the MSB cleared,
-leaf `H(key_path ‖ value_hash)` with the MSB set, `[0; 32]` the empty sub-trie. A slot is the
-leaf with:
+`BinaryHasher<Storage::Hasher>`, where the hasher is always `selendra_state::StateHasher`
+(SHA-256, `sha2 =0.10.9`, the version the SP1 guest patches): internal node `H(left ‖ right)`
+with the MSB cleared, leaf `H(key_path ‖ value_hash)` with the MSB set, `[0; 32]` the empty
+sub-trie. A slot is the leaf with:
 
 | Item | Value |
 |---|---|
-| `key_path` | `H(SlotKey bytes)`, the whole key including its prefix (nobody chooses a key's tree position) |
-| `value_hash` | `H(val_hash_and_size)` (NOMT stores the 36 bytes `val_hash_and_size` as the leaf's value) |
+| `key_path` | `H(SlotKey bytes)`, the whole key including its prefix (nobody chooses a key's tree position); `selendra_state::key_path` |
+| `value_hash` | `H(val_hash_and_size)` (NOMT stores the 36 bytes `val_hash_and_size` as the leaf's value; `selendra_state::leaf_value_bytes`) |
+
+The verifier and the node's prover call the same two functions. The leaf hint's borsh order
+(`size ‖ val_hash`) is not what the tree commits to (`val_hash ‖ size`): only the hint's fields
+are used. The MSB tag is what keeps a leaf's 64-byte preimage from being opened as an internal
+node's children and the reverse (`crates/state/src/nomt/vectors.rs` shows both attacks on an
+untagged hasher); it leaves 255 bits of each node hash (collisions about 2^127.5).
 
 Known answer (`crates/state/src/nomt/vectors.rs`, checked against real NOMT and recomputed with
 Python's `hashlib`): the slot keys `0x010101` → `0x0a000000` and `0x010102` → `0x14000000`
 (`StateMap<u8, u32>` at prefix `[1, 1]`, entries `1 → 10`, `2 → 20`) give the key path
 `0x75c8fd04ad916aec3e3d5cb76a452b116b3d4d0912a0a485e9fb8e3d240e210c` and value hash
 `0x8779dca21abd1566b0e17b01af2b08520fdd985127b1b8862e193a47d9adc843` for the first, and the
-tree root `0x41fb4b75571d866034946fd190e7baaa0e6e8add2e241bd666804ee9e8a50c92`.
+tree root `0x41fb4b75571d866034946fd190e7baaa0e6e8add2e241bd666804ee9e8a50c92`. With that user
+tree and an empty kernel tree, the global root (below) is
+`0xb92091904e678ae0016fee3132b4468fbe773646fee760e546518bebb0c05c9b`. These are
+`selendra_state::test_vectors` (feature `test-utils`), and the node's prover storage is checked
+against them (`crates/db/src/prover/tests.rs`).
 
 `StorageRoot` (the state root, `Storage::Root` of the NOMT storages):
 
@@ -235,6 +246,7 @@ bytes), so byte order is version order.
 | `state_root_hashes` | both, and `accessory/` | version | the 64 bytes `user_root ‖ kernel_root` (= `StorageRoot` borsh) |
 | `module_accessory_state` | `accessory/` | borsh `Vec<u8>` key ‖ version | borsh `Option<Vec<u8>>` (`None`: deleted) |
 | `accessory_keys_by_version` | `accessory/` | version ‖ borsh `Vec<u8>` key | empty |
+| `db_metadata` | `accessory/` | ASCII name: `state_hasher` | `state_hasher`: the 32 bytes `H("SELENDRA/state-hasher/v1")` |
 
 - The archival value is tagged so an empty value (e.g. a `StateValue<()>`, borsh of `()` is
   empty) is not read back as a delete; upstream rockbound archived deletes as the empty string,
@@ -247,6 +259,13 @@ bytes), so byte order is version order.
   stored data that does not decode is an error, never a panic.
 - Every committed version stores its root in all three RocksDB instances, and the NOMT trees
   hold the newest one, so the databases are checked against each other when opened.
+- Hasher guard: the first open of empty databases writes `db_metadata/state_hasher` with the
+  configured hasher `H` (`SHA-256("SELENDRA/state-hasher/v1")` =
+  `0x83500e863799fb8a52f07a55b6360bc1e83f638c765875a926ea0fd7ac582aaf`); every later open
+  must compute the same tag, before anything writes data hashed with `H`. (Opening the
+  databases writes nothing hashed with `H` but can already change files: NOMT's own log replay
+  and hash-table growth, RocksDB creating missing column families.) Databases that hold data
+  but no tag are refused (databases from before the guard: resync).
 - Upstream's legacy `*_jmt_values` column-family names are not used (fresh chain).
 
 ## Signatures

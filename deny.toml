@@ -58,8 +58,13 @@ ignore = true
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
-# Prefer rustls; keep OpenSSL out of the tree.
-deny = [{ name = "native-tls" }, { name = "openssl" }]
+# Prefer rustls; keep OpenSSL out of the tree. State is hashed with SHA-256 only (`StateHasher`):
+# keep BLAKE3 (nomt-core's optional built-in hasher) out, so it can never be mixed in.
+deny = [
+  { name = "native-tls" },
+  { name = "openssl" },
+  { name = "blake3", reason = "state hashes are SHA-256 only (selendra_state::StateHasher); nomt-core's blake3-hasher must stay off" },
+]
 
 [sources]
 unknown-registry = "deny"

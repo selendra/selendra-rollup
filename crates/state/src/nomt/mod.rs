@@ -6,25 +6,54 @@
 //!
 //! # What the trees commit to
 //! Each provable namespace (user, kernel) is one NOMT binary trie, hashed with
-//! `BinaryHasher<S::Hasher>` (SHA-256 in practice). A slot `key → value` is the trie leaf
-//! - key path: `H(key)`, the hash of the whole [`SlotKey`] (prefix included), so that nobody
-//!   chooses where a key sits in the tree;
-//! - value hash: `H(val_hash_and_size)`, i.e. `H(H(value) ‖ size as u32 LE)`
-//!   ([`SlotValue::combine_val_hash_and_size`]): NOMT stores the 36 bytes
-//!   `val_hash_and_size` as the leaf's value and hashes them as a value (`ValueHasher`).
+//! `BinaryHasher<S::Hasher>` (the chain's [`StateHasher`](crate::StateHasher), SHA-256). A slot
+//! `key → value` is the trie leaf
+//! - key path: [`key_path`], `H(key)`, the hash of the whole [`SlotKey`] (prefix included), so
+//!   that nobody chooses where a key sits in the tree;
+//! - value hash: `H(val_hash_and_size)`, i.e. `H(H(value) ‖ size as u32 LE)`: NOMT stores the
+//!   36 bytes [`leaf_value_bytes`] as the leaf's value and hashes them as a value
+//!   (`ValueHasher`).
+//!
+//! The verifier here and the node's prover (`selendra-db`) both call [`key_path`] and
+//! [`leaf_value_bytes`], so they cannot drift apart; the known-answer vectors
+//! (`nomt/vectors.rs`, `test_vectors`) pin what they compute.
 //!
 //! Internal and leaf nodes are domain-separated by the MSB of the node hash (`BinaryHasher`:
 //! cleared for internal nodes, set for leaves; all zeros is the empty sub-trie).
+//!
+//! # Security notes
+//! - **Node kinds are tagged in the MSB.** A node hash is SHA-256 of 64 bytes (`left ‖ right`
+//!   or `key_path ‖ value_hash`) with its first bit replaced by the node kind, so 255 bits are
+//!   left: second preimages cost about 2^255, and a collision of the truncated hash about
+//!   2^127.5. The tag is what stops a leaf's preimage from being opened as an internal node's
+//!   children and the reverse (both are 64 bytes); `vectors.rs` shows both attacks succeeding
+//!   on an untagged hasher and failing on ours.
+//! - **Other hashes are never compared with a node or a root.** A key path is `H(key)` for a
+//!   key of any length (64 bytes included), and a value hash is `H` of 36 bytes, so either may
+//!   equal some node hash or a global root as a 32-byte string. That is harmless: a key path
+//!   only chooses a position and a value hash is only hashed into its leaf; neither is ever
+//!   checked against a node or a root. The global root is `H(GLOBAL_ROOT_TAG ‖ user ‖ kernel)`
+//!   (86 bytes, never a node preimage: see [`GLOBAL_ROOT_TAG`](crate::GLOBAL_ROOT_TAG)).
+//! - **Two byte orders of a leaf.** A leaf *hint* in a witness is the borsh [`NodeLeaf`]:
+//!   `size ‖ val_hash`. What the tree *commits to* is [`leaf_value_bytes`]: `val_hash ‖ size`.
+//!   The hint's bytes are never hashed; only its fields are, through [`leaf_value_bytes`].
+//!   Hashing the borsh bytes instead would silently give other roots than NOMT's.
+//! - **Grinding.** Key paths are hashes, so nobody places a key, but anyone can grind keys
+//!   whose paths share a long prefix with another key's (about 2^k hashes for k shared bits),
+//!   making its proofs deeper (one 32-byte sibling per bit, at most 256). Bounding that cost is
+//!   a gas question (gas per key byte and per proof depth, Phase 14 in `TODO.md`).
 
 mod proof;
 mod verifier;
 
 #[cfg(all(test, unix, target_pointer_width = "64"))]
 mod test_prover;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_vectors;
 #[cfg(all(test, unix, target_pointer_width = "64"))]
 mod tests;
 #[cfg(test)]
-pub(crate) mod vectors;
+mod vectors;
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,16 +68,33 @@ pub use verifier::NomtVerifierStorage;
 use crate::storage::MerkleProofSpec;
 use crate::{
     NodeLeaf, OrderedReadsAndWrites, SlotKey, SlotValue, StateRoot, StorageProof, StorageRoot,
+    VAL_HASH_AND_SIZE_LEN,
 };
 
-/// The key path of `key` in a state tree: `H(key)`.
-fn key_path<S: MerkleProofSpec>(key: &SlotKey) -> KeyPath {
+/// The key path of `key` in a state tree: `H(key)`, the hash of the whole key (prefix
+/// included).
+///
+/// The one definition of where a key sits in the trees: the verifier and the node's prover
+/// storage both use it, for every read, write and proof. Changing it changes every state root.
+pub fn key_path<S: MerkleProofSpec>(key: &SlotKey) -> KeyPath {
     S::Hasher::digest(key.as_ref()).into()
 }
 
-/// The value hash of a leaf in a state tree: `H(val_hash_and_size)`.
+/// The bytes a state tree stores as the value of `leaf`'s key: `val_hash ‖ size` (u32 LE), 36
+/// bytes ([`NodeLeaf::combine_val_hash_and_size`]). NOMT hashes them into the leaf's value
+/// hash, `H(leaf_value_bytes)`.
+///
+/// The one definition of what a leaf commits to: the verifier hashes it, and the node's prover
+/// storage gives it to NOMT for every read and write (of a value `v`: the leaf
+/// [`NodeLeaf::make_leaf`]`(v)`). Not the borsh encoding of a [`NodeLeaf`] (`size ‖ val_hash`,
+/// the witness hint's order). Changing it changes every state root.
+pub fn leaf_value_bytes(leaf: &NodeLeaf) -> [u8; VAL_HASH_AND_SIZE_LEN] {
+    leaf.combine_val_hash_and_size()
+}
+
+/// The value hash of a leaf in a state tree: `H(`[`leaf_value_bytes`]`)`.
 fn value_hash<S: MerkleProofSpec>(leaf: &NodeLeaf) -> ValueHash {
-    S::Hasher::digest(leaf.combine_val_hash_and_size()).into()
+    S::Hasher::digest(leaf_value_bytes(leaf)).into()
 }
 
 /// Verifies a storage proof against a state root and returns the proven key and value.

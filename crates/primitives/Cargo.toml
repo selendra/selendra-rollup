@@ -27,6 +27,9 @@ thiserror = { workspace = true }
 [dev-dependencies]
 postcard = { workspace = true }
 selendra-primitives = { path = ".", features = ["native"] }
+# Only to check at compile time that the crypto specs hash with the state hasher (`StateHasher`).
+# `native`: this crate's own dev-dependency above turns on `selendra-interface/native`.
+selendra-state = { workspace = true, features = ["native"] }
 serde_json = { workspace = true }
 
 [features]

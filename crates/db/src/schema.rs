@@ -6,6 +6,7 @@
 //! | [`StateRootHashes`] | flat live, flat archival, accessory | slot number, `u64` big-endian | the 64 root bytes `user ‖ kernel` ([`NomtRoots`]) |
 //! | [`ModuleAccessoryState`] | accessory | borsh `Vec<u8>` key ‖ slot number `u64` big-endian | borsh `Option<Vec<u8>>` (`None`: deleted) |
 //! | [`AccessoryKeysByVersion`] | accessory | slot number `u64` big-endian ‖ borsh `Vec<u8>` key | empty |
+//! | [`DbMetadata`] | accessory | a [`MetadataKey`]'s name (ASCII) | its bytes (per key) |
 //!
 //! Every decoder rejects bytes that are not exactly an encoding (wrong length, trailing bytes):
 //! stored data that does not decode is an error, never a panic.
@@ -337,11 +338,70 @@ impl ValueCodec<AccessoryKeysByVersion> for () {
     }
 }
 
+define_table!(
+    /// Facts about the state databases as a whole, one row per [`MetadataKey`] (not versioned:
+    /// written outside the commits, never rolled back).
+    DbMetadata, "db_metadata", MetadataKey => Vec<u8>
+);
+
+/// A row of [`DbMetadata`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataKey {
+    /// The tag of the hasher `H` the state databases were created with:
+    /// `H(b"SELENDRA/state-hasher/v1")` (32 bytes), written by the first
+    /// [`DbGroup::open`](crate::DbGroup::open) of empty databases and checked by every later
+    /// one.
+    StateHasher,
+}
+
+impl MetadataKey {
+    /// Every key (decoding looks the stored name up here).
+    const ALL: [Self; 1] = [Self::StateHasher];
+
+    /// The stored key bytes.
+    fn name(self) -> &'static [u8] {
+        match self {
+            Self::StateHasher => b"state_hasher",
+        }
+    }
+}
+
+impl KeyEncoder<DbMetadata> for MetadataKey {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.name().to_vec())
+    }
+}
+
+impl KeyDecoder<DbMetadata> for MetadataKey {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        Self::ALL
+            .into_iter()
+            .find(|key| key.name() == data)
+            .ok_or_else(|| {
+                CodecError::Wrapped(anyhow::anyhow!(
+                    "DB corruption: unknown metadata key {:?}",
+                    String::from_utf8_lossy(data)
+                ))
+            })
+    }
+}
+
+impl ValueCodec<DbMetadata> for Vec<u8> {
+    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.clone())
+    }
+
+    fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+        Ok(data.to_vec())
+    }
+}
+
 /// The tables of the accessory DB.
-pub(crate) const ACCESSORY_TABLES: [ColumnFamilyName; 3] = [
+pub(crate) const ACCESSORY_TABLES: [ColumnFamilyName; 4] = [
     ModuleAccessoryState::COLUMN_FAMILY_NAME,
     AccessoryKeysByVersion::COLUMN_FAMILY_NAME,
     StateRootHashes::COLUMN_FAMILY_NAME,
+    DbMetadata::COLUMN_FAMILY_NAME,
 ];
 
 #[cfg(test)]
@@ -456,6 +516,31 @@ mod tests {
             );
         }
         assert!(<() as ValueCodec<AccessoryKeysByVersion>>::decode_value(&[0]).is_err());
+    }
+
+    #[test]
+    fn metadata_key_encoding_is_pinned() {
+        let encoded = <_ as KeyEncoder<DbMetadata>>::encode_key(&MetadataKey::StateHasher).unwrap();
+        assert_eq!(encoded, b"state_hasher");
+        for key in MetadataKey::ALL {
+            let encoded = <_ as KeyEncoder<DbMetadata>>::encode_key(&key).unwrap();
+            assert_eq!(
+                <MetadataKey as KeyDecoder<DbMetadata>>::decode_key(&encoded).unwrap(),
+                key
+            );
+        }
+        for bad in [&b"state_hashe"[..], b"state_hasher\0", b""] {
+            assert!(<MetadataKey as KeyDecoder<DbMetadata>>::decode_key(bad).is_err());
+        }
+        let value = vec![1, 2, 3];
+        assert_eq!(
+            <Vec<u8> as ValueCodec<DbMetadata>>::encode_value(&value).unwrap(),
+            value
+        );
+        assert_eq!(
+            <Vec<u8> as ValueCodec<DbMetadata>>::decode_value(&value).unwrap(),
+            value
+        );
     }
 
     #[test]

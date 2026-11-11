@@ -6,7 +6,9 @@
 //! - [`FlatStateDb`]: the values, versioned (RocksDB through rockbound), read as of a version
 //!   through [`HistoricalStateReader`].
 //! - [`AccessoryDb`]: accessory state (not provable), versioned.
-//! - [`DbGroup`]: all of them, committed in a fixed order ([`DbGroup::commit`]).
+//! - [`DbGroup`]: all of them, committed in a fixed order ([`DbGroup::commit`]). Opening them
+//!   checks that they were written with the same hasher (the hasher guard, [`DbGroup::open`]):
+//!   the chain's is `selendra_state::StateHasher`.
 //!
 //! Every version's root ([`NomtRoots`], `user ‖ kernel` as in
 //! [`StorageRoot`](selendra_state::StorageRoot)) is stored in each database that records
@@ -49,9 +51,10 @@ pub use config::{NomtNamespaceConfig, StateDbConfig};
 pub use flat::{DbCache, FlatStateDb};
 pub use group::{DbGroup, NomtChangeSet, StorageReaders};
 pub use historical::{HistoricalStateReader, KvPair, StateChanges};
+pub(crate) use nomt_state::SessionsContainer;
 pub use nomt_state::{
-    NomtRoots, NomtSessionBuilder, NomtStateDb, SessionsContainer, SharedOverlays,
-    StateFinishedSession, StateOverlay, WitnessMode,
+    NomtRoots, NomtSessionBuilder, NomtStateDb, SharedOverlays, StateFinishedSession, StateOverlay,
+    WitnessMode,
 };
 pub use prover::{NomtProverStorage, NomtStateUpdate};
 pub use rockbound::versioned_db::HistoricalValueError;

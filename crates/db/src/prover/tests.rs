@@ -8,14 +8,19 @@ use std::collections::BTreeMap;
 use proptest::collection::vec as prop_vec;
 use proptest::prelude::{Strategy, any};
 use proptest::{prop_assert, prop_assert_eq};
+use selendra_interface::common::HexString;
+use selendra_interface::reexports::digest::Digest;
 use selendra_state::namespaces::{Kernel, User};
 use selendra_state::test_utils::{
     Harness, InMemoryState, KERNEL_MAP, MAP, Model, Op, VALUE, VEC, accessory_map, borsh_roundtrip,
     catch_quietly, hints, kernel_map, map, run, vec as state_vec,
 };
+use selendra_state::test_vectors::{
+    NOMT_PROOF_OF_ENTRY_1, TWO_ENTRY_GLOBAL_ROOT, TWO_ENTRY_ROOT, two_entry_root, vector_entries,
+};
 use selendra_state::{
-    ArrayWitness, BorshCodec, DefaultStorageSpec, KernelStateMap, NomtVerifierStorage,
-    OrderedReadsAndWrites, Prefix, StateCheckpoint, StateMap, StateValue, StateWriter,
+    ArrayWitness, BorshCodec, KernelStateMap, NomtVerifierStorage, OrderedReadsAndWrites, Prefix,
+    StateCheckpoint, StateMap, StateStorageSpec, StateValue, StateWriter,
 };
 use sha2::Sha256;
 
@@ -23,7 +28,8 @@ use super::*;
 use crate::harness::TestDbs;
 use crate::{FlatStateDb, StateDbConfig};
 
-type Spec = DefaultStorageSpec<Sha256>;
+/// The chain's storage spec (SHA-256).
+type Spec = StateStorageSpec;
 type Prover = NomtProverStorage<Spec, u64>;
 type Verifier = NomtVerifierStorage<Spec>;
 type Root = StorageRoot<Spec>;
@@ -1197,13 +1203,20 @@ fn nomt_still_panics_on_deleting_an_absent_key_from_an_empty_database() {
     assert!(outcome.is_err(), "NOMT no longer panics: {outcome:?}");
 }
 
-/// `to_nomt_accesses`: sorted by key path, reads then writes merged, absent deletes become
-/// reads, duplicates are errors.
+/// `to_nomt_accesses`: keyed by `selendra-state`'s shared [`key_path`] (`H(whole key)`) with
+/// its [`leaf_value_bytes`], sorted by key path, reads then writes merged, absent deletes
+/// become reads, duplicates are errors.
 #[test]
-fn nomt_accesses() {
+fn nomt_accesses_use_shared_key_path() {
     let (a, b, c) = (key(b"aa"), key(b"bb"), key(b"cc"));
-    let path = |k: &SlotKey| -> KeyPath { Sha256::digest(k.as_ref()).into() };
+    let path = |k: &SlotKey| key_path::<Spec>(k);
+    // The shared definitions are the convention: `H(key)` and `val_hash ‖ size`.
+    assert_eq!(path(&a), <KeyPath>::from(Sha256::digest(b"aa")));
     let leaf = NodeLeaf::make_leaf::<Sha256>(&slot_value(b"x"));
+    assert_eq!(
+        leaf_value_bytes(&leaf),
+        slot_value(b"x").combine_val_hash_and_size::<Sha256>()
+    );
     let accesses = OrderedReadsAndWrites {
         ordered_reads: vec![(a.clone(), Some(leaf)), (b.clone(), None)],
         ordered_writes: vec![
@@ -1218,15 +1231,13 @@ fn nomt_accesses() {
     let mut expected = vec![
         (
             path(&a),
-            KeyReadWrite::ReadThenWrite(Some(leaf.combine_val_hash_and_size().to_vec()), None),
+            KeyReadWrite::ReadThenWrite(Some(leaf_value_bytes(&leaf).to_vec()), None),
         ),
         (path(&b), KeyReadWrite::Read(None)),
         (
             path(&c),
             KeyReadWrite::Write(Some(
-                slot_value(b"y")
-                    .combine_val_hash_and_size::<Sha256>()
-                    .to_vec(),
+                leaf_value_bytes(&NodeLeaf::make_leaf::<Sha256>(&slot_value(b"y"))).to_vec(),
             )),
         ),
     ];
@@ -1248,6 +1259,47 @@ fn nomt_accesses() {
         ordered_writes: vec![(b, None)],
     };
     assert!(to_nomt_accesses::<Spec>(&failing, |_| anyhow::bail!("I/O")).is_err());
+}
+
+/// The real prover storage, under the chain's spec, computes `selendra-state`'s known-answer
+/// vectors: committing the two vector entries gives the pinned user root (kernel tree empty)
+/// and global root, and NOMT's proof of the first entry is the pinned one. The prover and the
+/// verifier share `key_path`/`leaf_value_bytes`, so the replay tests can no longer catch a
+/// change of the hashing convention: this test does (as do `selendra-state`'s vectors).
+#[test]
+fn prover_storage_matches_known_answer_vectors() {
+    let mut dbs = TestDbs::<StateStorageSpec>::new();
+    let root = dbs.commit_with(ON, |state| {
+        for (key, value) in vector_entries() {
+            let Ok(()) = StateWriter::<User>::set(state, &key, value);
+        }
+    });
+    assert_eq!(HexString(root.user_root()).to_string(), TWO_ENTRY_ROOT);
+    assert_eq!(
+        root.kernel_root(),
+        StorageRoot::<Spec>::PRE_GENESIS.kernel_root()
+    );
+    assert_eq!(root, two_entry_root());
+    assert_eq!(
+        HexString(root.global_root()).to_string(),
+        TWO_ENTRY_GLOBAL_ROOT
+    );
+
+    let [(key_1, value_1), (key_2, value_2)] = vector_entries();
+    let storage = dbs.storage(OFF);
+    let (proof, version, proof_root) = storage.get_with_proof::<User>(key_1.clone()).unwrap();
+    assert_eq!((version, proof_root), (SlotNumber::GENESIS, root));
+    assert_eq!(proof.value, Some(value_1.clone()));
+    assert_eq!(
+        HexString(borsh::to_vec(&proof.proof).unwrap()).to_string(),
+        NOMT_PROOF_OF_ENTRY_1
+    );
+    assert_eq!(
+        Prover::open_proof(root, proof).unwrap(),
+        (key_1.clone(), Some(value_1))
+    );
+    // The bound reads see the entries too (through the flat store).
+    assert_eq!(storage.get::<User>(&key_2, &witness()), Some(value_2));
 }
 
 /// Accessory items added to the state update are committed at the block's version and read

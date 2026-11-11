@@ -15,6 +15,11 @@
 //! an accessor ([`StateReader`] / [`StateWriter`]) for their namespace. The storage key layout
 //! is specified in `docs/serialization.md` ("State keys").
 //!
+//! State is hashed with one hash function, [`StateHasher`] (SHA-256): the trees' key paths,
+//! value hashes and nodes, and the global root. [`StateStorageSpec`] is the storage spec with
+//! it; the hashing convention of the trees is [`key_path`] and [`leaf_value_bytes`], shared by
+//! the verifier and the node's prover.
+//!
 //! # Features
 //! - `native`: node-only code, never compiled into the zk guest: `NativeStorage`, accessory
 //!   reads, storage proofs (`get_with_proof`), raw container APIs and historical reads.
@@ -22,7 +27,8 @@
 //!   [`SlotKey`], so the node's flat store (RocksDB) can key values by it.
 //! - `arbitrary`: `NamespacedStateMap::arbitrary_state_map`.
 //! - `test-utils`: [`test_utils`], helpers for the node's storage tests (random container
-//!   operations, a model of a checkpoint, witness helpers). Never in a node or guest build.
+//!   operations, a model of a checkpoint, witness helpers), and `test_vectors`, the
+//!   known-answer vectors of the state trees. Never in a node or guest build.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -84,9 +90,11 @@ pub use namespaces::{
     ProvableNamespace, User,
 };
 // `self::`: in test builds the `nomt` crate (a dev-dependency) has the same name.
+#[cfg(any(test, feature = "test-utils"))]
+pub use self::nomt::test_vectors;
 pub use self::nomt::{
-    InvalidNomtProof, NomtProof, NomtVerifierStorage, namespace_needs_proof, verify_namespace,
-    verify_storage_proof,
+    InvalidNomtProof, NomtProof, NomtVerifierStorage, key_path, leaf_value_bytes,
+    namespace_needs_proof, verify_namespace, verify_storage_proof,
 };
 pub use slot::{Prefix, SlotKey, SlotKeyTooShort, SlotValue};
 pub use storage::{
@@ -97,3 +105,19 @@ pub use storage::{
 pub use storage::{NativeStorage, ProofOutput};
 pub use storage_root::{GLOBAL_ROOT_TAG, StorageRoot};
 pub use witness::{ArrayWitness, InvalidWitness, Witness};
+
+/// The state hasher: SHA-256, the only hash function of state. The NOMT trees (key paths,
+/// value hashes, nodes), the values' leaves ([`NodeLeaf`]) and the global root
+/// ([`StateRoot::global_root`]) all use it, natively and in the zk guest; never mix in another
+/// one.
+///
+/// It is `sha2`'s `Sha256`, pinned to the exact version (`=0.10.9`) that the SP1 guest patches
+/// with its SHA-256 precompile: the guest build replaces this same crate, so native and guest
+/// execution hash with the same function. The node's databases record which hasher wrote them
+/// and refuse to open with another one (`selendra-db`'s `DbGroup::open`).
+pub type StateHasher = sha2::Sha256;
+
+/// The storage spec of the chain's state: an [`ArrayWitness`] and [`StateHasher`]. Use it for
+/// the NOMT storages (`NomtVerifierStorage<StateStorageSpec>`, the node's prover storage)
+/// rather than spelling the hasher out.
+pub type StateStorageSpec = DefaultStorageSpec<StateHasher>;

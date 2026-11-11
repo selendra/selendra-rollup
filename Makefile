@@ -9,15 +9,24 @@ fmt:
 clippy:
 	cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+# `$(call tree_lacks,<cargo tree arguments>,<extended regex>)`: fails if `cargo tree` fails or its
+# output matches the regex (a bare `! cargo tree ... | grep ...` passes when `cargo tree` fails).
+tree_lacks = tree="$$(cargo tree $(1))" && ! printf '%s\n' "$$tree" | grep -E '$(2)'
+
 # The zk guest configuration (no `native`): lint it, and fail if OS randomness reaches it.
 # `selendra-state` has no self dev-dependency turning `native` on, so its tests (witness replay,
-# checkpoint, cache) also build and run in the guest configuration.
+# checkpoint, cache, the known-answer vectors of the state hasher) also build and run in the
+# guest configuration. State is hashed with SHA-256 only (`StateHasher`): fail if another hash
+# crate reaches the state crate (on any target), or if nomt-core's built-in hashers get enabled
+# anywhere (under any workspace feature, on any target).
 guest:
 	cargo clippy -p selendra-interface --no-default-features --locked -- -D warnings
 	cargo clippy -p selendra-primitives --no-default-features --locked -- -D warnings
 	cargo clippy -p selendra-state --no-default-features --all-targets --locked -- -D warnings
 	cargo test -p selendra-state --no-default-features --locked
-	! cargo tree -p selendra-interface -p selendra-primitives -p selendra-state --no-default-features -e normal --locked | grep getrandom
+	$(call tree_lacks,-p selendra-interface -p selendra-primitives -p selendra-state --no-default-features -e normal --locked,getrandom)
+	$(call tree_lacks,-p selendra-state --no-default-features -e normal --target all --locked,(blake3|sha3) v)
+	$(call tree_lacks,-e features -i nomt-core --all-features --target all --locked,sha2-hasher|blake3-hasher)
 
 test:
 	cargo test --workspace --all-features --locked

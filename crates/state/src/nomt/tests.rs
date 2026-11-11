@@ -399,7 +399,7 @@ fn open_proof_on_nomt_proofs() {
 /// entries, and its proof of the first one, byte for byte.
 #[test]
 fn real_nomt_matches_the_known_answer_vectors() {
-    use super::vectors::{NOMT_PROOF_OF_ENTRY_1, TWO_ENTRY_ROOT, vector_entries};
+    use super::test_vectors::{NOMT_PROOF_OF_ENTRY_1, TWO_ENTRY_ROOT, vector_entries};
     let [(key_1, value_1), (key_2, value_2)] = vector_entries();
     assert_eq!(map().slot_key(&1), key_1);
     assert_eq!(map().slot_key(&2), key_2);
