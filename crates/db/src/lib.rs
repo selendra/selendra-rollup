@@ -6,6 +6,9 @@
 //! - [`FlatStateDb`]: the values, versioned (RocksDB through rockbound), read as of a version
 //!   through [`HistoricalStateReader`].
 //! - [`AccessoryDb`]: accessory state (not provable), versioned.
+//! - The [`ledger`] DB: the chain's history (slots, batches, transactions, events, proofs, STF
+//!   info), one slot per committed version; [`LedgerReader`] reads it and builds a slot's
+//!   writes ([`LedgerChangeSet`]).
 //! - [`DbGroup`]: all of them, committed in a fixed order ([`DbGroup::commit`]). Opening them
 //!   checks that they were written with the same hasher (the hasher guard, [`DbGroup::open`]):
 //!   the chain's is `selendra_state::StateHasher`; then startup crash recovery rolls back what
@@ -23,8 +26,7 @@
 //!   natively and records the witness the zk guest's
 //!   [`NomtVerifierStorage`](selendra_state::NomtVerifierStorage) verifies.
 //!
-//! Not here yet: the storage manager (forks, uncommitted snapshots, finalization, pruning); the
-//! ledger DB.
+//! Not here yet: the storage manager (forks, uncommitted snapshots, finalization, pruning).
 //!
 //! # Features
 //! - `test-utils`: `harness` (the databases in a temporary directory, for tests) and fault
@@ -45,6 +47,7 @@ mod group;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod harness;
 mod historical;
+pub mod ledger;
 mod nomt_state;
 mod prover;
 mod recovery;
@@ -60,6 +63,7 @@ pub use faults::{CommitHook, fail_at};
 pub use flat::{DbCache, FlatStateDb};
 pub use group::{DbGroup, NomtChangeSet, StorageReaders};
 pub use historical::{HistoricalStateReader, KvPair, StateChanges};
+pub use ledger::{LedgerChangeSet, LedgerReader};
 pub(crate) use nomt_state::SessionsContainer;
 pub use nomt_state::{
     NomtRoots, NomtSessionBuilder, NomtStateDb, SharedOverlays, StateFinishedSession, StateOverlay,

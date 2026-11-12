@@ -1,13 +1,15 @@
 //! Startup crash recovery of the state databases ([`recover`], run by
 //! [`DbGroup::open`](crate::DbGroup::open)).
 //!
-//! A commit writes the NOMT kernel tree, the NOMT user tree, the accessory DB, the flat archival
-//! DB and the flat live DB, in this order, each write synced to disk. The live DB is written last
-//! and says which version is committed (`L`, with roots `R_L`; nothing committed: the
-//! pre-genesis roots). After a crash in the middle of a commit, the databases written before the
-//! live DB hold version `L + 1` (genesis if nothing is committed) and recovery rolls them back:
+//! A commit writes the NOMT kernel tree, the NOMT user tree, the ledger DB, the accessory DB, the
+//! flat archival DB and the flat live DB, in this order, each write synced to disk. The live DB is
+//! written last and says which version is committed (`L`, with roots `R_L`; nothing committed:
+//! the pre-genesis roots). After a crash in the middle of a commit, the databases written before
+//! the live DB hold version `L + 1` (genesis if nothing is committed) and recovery rolls them
+//! back:
 //!
-//! - **Versioned databases** (accessory, archival): decided by version, never by root. One at
+//! - **Versioned databases** (ledger, accessory, archival; the ledger's version is its newest
+//!   slot, which records the roots): decided by version, never by root. One at
 //!   `L` with root `R_L` is left alone. One at exactly `L + 1` whose root at `L` is `R_L` is
 //!   rolled back by one version (at genesis there is no root at `L` to compare). Anything else
 //!   cannot be the result of an interrupted commit and is an `Err`, with nothing written.
@@ -18,9 +20,10 @@
 //!   and its root must then be `R_L`. If a versioned database holds `L + 1`, the tree's root
 //!   must first be that version's (the trees are committed first): a root that is neither is an
 //!   `Err` before anything is rolled back, so no rollback log is spent on a state recovery
-//!   cannot repair. If no versioned database holds `L + 1` (the crash came before the accessory
-//!   DB was written), nothing records the roots the trees were committed to: the tree is rolled
-//!   back unchecked, whatever its root, and checked only afterwards.
+//!   cannot repair. If no versioned database holds `L + 1` (the crash came before the ledger DB
+//!   was written), nothing records the roots the trees were committed to: the tree is rolled
+//!   back unchecked, whatever its root, and checked only afterwards. Versioned databases that
+//!   hold `L + 1` must agree on its roots.
 //!
 //! Everything that can be checked before a rollback is checked before the first one; then the
 //! databases are rolled back in commit order. Each rollback is synced, and recovery is
@@ -71,6 +74,8 @@ pub enum RecoveryStep {
     KernelNomt,
     /// Rolls the NOMT user tree back.
     UserNomt,
+    /// Rolls the ledger DB back (its newest slot).
+    Ledger,
     /// Rolls the accessory DB back.
     Accessory,
     /// Rolls the flat archival DB back.
@@ -159,10 +164,11 @@ pub(crate) fn one_ahead(
 pub(crate) fn recover<H: Digest<OutputSize = U32> + Send + Sync>(
     nomt: &NomtStateDb<H>,
     flat: &mut FlatStateDb,
+    ledger: &Arc<rockbound::DB>,
     accessory: &Arc<rockbound::DB>,
     faults: &Faults,
 ) -> anyhow::Result<RecoveryReport> {
-    recover_inner(nomt, flat, accessory, faults).inspect_err(|error| {
+    recover_inner(nomt, flat, ledger, accessory, faults).inspect_err(|error| {
         tracing::error!(
             error = format!("{error:#}"),
             "Startup crash recovery of the state databases failed"
@@ -173,6 +179,7 @@ pub(crate) fn recover<H: Digest<OutputSize = U32> + Send + Sync>(
 fn recover_inner<H: Digest<OutputSize = U32> + Send + Sync>(
     nomt: &NomtStateDb<H>,
     flat: &mut FlatStateDb,
+    ledger: &Arc<rockbound::DB>,
     accessory: &Arc<rockbound::DB>,
     faults: &Faults,
 ) -> anyhow::Result<RecoveryReport> {
@@ -180,6 +187,12 @@ fn recover_inner<H: Digest<OutputSize = U32> + Send + Sync>(
     let live_roots = root_of(live);
 
     // 1. Decide, writing nothing.
+    let ledger_ahead = one_ahead(
+        "ledger DB",
+        crate::ledger::latest_version_and_root(ledger)?,
+        live,
+        |version| crate::ledger::root_at(ledger, version),
+    )?;
     let accessory_ahead = one_ahead(
         "accessory DB",
         AccessoryDb::latest_version_and_root(accessory)?,
@@ -187,20 +200,28 @@ fn recover_inner<H: Digest<OutputSize = U32> + Send + Sync>(
         |version| AccessoryDb::root_at(accessory, version),
     )?;
     let archival_ahead = flat.archival_ahead()?;
-    // The roots of the interrupted commit, if a versioned database recorded them.
-    let next_roots = match (accessory_ahead, archival_ahead) {
-        (Some((_, accessory_roots)), Some((_, archival_roots))) => {
-            anyhow::ensure!(
-                accessory_roots == archival_roots,
-                "the accessory DB and the flat archival DB are both one version ahead of the \
-                 flat live DB, with different roots ({accessory_roots} and {archival_roots}). \
-                 The state databases cannot be recovered"
-            );
-            Some(accessory_roots)
+    // The roots of the interrupted commit, if a versioned database recorded them (all that did
+    // must agree).
+    let mut next_roots: Option<(&str, NomtRoots)> = None;
+    for (name, ahead) in [
+        ("ledger DB", ledger_ahead),
+        ("accessory DB", accessory_ahead),
+        ("flat archival DB", archival_ahead),
+    ] {
+        let Some((_, roots)) = ahead else {
+            continue;
+        };
+        match next_roots {
+            Some((first, first_roots)) => anyhow::ensure!(
+                first_roots == roots,
+                "the {first} and the {name} are both one version ahead of the flat live DB, \
+                 with different roots ({first_roots} and {roots}). The state databases cannot \
+                 be recovered"
+            ),
+            None => next_roots = Some((name, roots)),
         }
-        (Some((_, roots)), None) | (None, Some((_, roots))) => Some(roots),
-        (None, None) => None,
-    };
+    }
+    let next_roots = next_roots.map(|(_, roots)| roots);
     let mut nomt_rollbacks = Vec::new();
     for (namespace, step) in [
         (ProvableNamespace::Kernel, RecoveryStep::KernelNomt),
@@ -244,6 +265,11 @@ fn recover_inner<H: Digest<OutputSize = U32> + Send + Sync>(
             live.map(|(version, _)| version),
         );
         rolled_back.push(step);
+    }
+    if let Some((version, _)) = ledger_ahead {
+        faults.hit(CommitPoint::Recovery(RecoveryStep::Ledger))?;
+        crate::ledger::rollback_version(ledger, version).context("rolling back the ledger DB")?;
+        rolled_back.push(RecoveryStep::Ledger);
     }
     if let Some((version, _)) = accessory_ahead {
         faults.hit(CommitPoint::Recovery(RecoveryStep::Accessory))?;

@@ -40,9 +40,15 @@ pub(crate) enum ScanDirection {
 
 /// DB Iterator parameterized on [`Schema`] that seeks with [`Schema::Key`] and yields
 /// [`Schema::Key`] and [`Schema::Value`] pairs.
+///
+/// Yields `Err` (once, then ends) if RocksDB reports an error or a row does not decode. A seek
+/// repositions the iterator and resumes it. (Upstream rockbound did not advance past a row that
+/// failed to decode, so `next` returned the same `Err` forever and `.count()` never ended.)
 pub struct SchemaIterator<'a, S> {
     db_iter: rocksdb::DBRawIterator<'a>,
     direction: ScanDirection,
+    /// Set after the iterator returned an error; cleared by a seek.
+    done: bool,
     phantom: PhantomData<S>,
 }
 
@@ -54,6 +60,7 @@ where
         let mut iter = SchemaIterator {
             db_iter,
             direction,
+            done: false,
             phantom: PhantomData,
         };
 
@@ -69,11 +76,13 @@ where
 
     /// Seeks to the first key.
     pub fn seek_to_first(&mut self) {
+        self.done = false;
         self.db_iter.seek_to_first();
     }
 
     /// Seeks to the last key.
     pub fn seek_to_last(&mut self) {
+        self.done = false;
         self.db_iter.seek_to_last();
     }
 
@@ -81,6 +90,7 @@ where
     /// `seek_key`.
     pub fn seek(&mut self, seek_key: &impl SeekKeyEncoder<S>) -> Result<()> {
         let key = seek_key.encode_seek_key()?;
+        self.done = false;
         self.db_iter.seek(&key);
         Ok(())
     }
@@ -91,6 +101,7 @@ where
     /// See example in [`RocksDB doc`](https://github.com/facebook/rocksdb/wiki/SeekForPrev).
     pub fn seek_for_prev(&mut self, seek_key: &impl SeekKeyEncoder<S>) -> Result<()> {
         let key = seek_key.encode_seek_key()?;
+        self.done = false;
         self.db_iter.seek_for_prev(&key);
         Ok(())
     }
@@ -105,6 +116,17 @@ where
     }
 
     fn next_impl(&mut self) -> Result<Option<IteratorOutput<S::Key, S::Value>>> {
+        if self.done {
+            return Ok(None);
+        }
+        let result = self.read_and_advance();
+        if result.is_err() {
+            self.done = true;
+        }
+        result
+    }
+
+    fn read_and_advance(&mut self) -> Result<Option<IteratorOutput<S::Key, S::Value>>> {
         // SAFETY: Calling `next` or `prev` requires to check `valid` first.
         // Not doing so may result in UB because of a nasty `rust-rocksdb` bug:
         // <https://github.com/rust-rocksdb/rust-rocksdb/issues/824>.

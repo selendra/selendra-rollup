@@ -21,8 +21,10 @@ Fixes (regression tests in `tests/versioned_db_inner/fixes.rs`):
 - **Read errors.** Upstream ended an iteration when RocksDB reported an error (I/O, corruption),
   so failed reads looked like absent data: historical reads returned `Ok(None)`, pruning saw no
   keys, and prefix iteration stopped early. These iterators now yield the error, once, and then
-  end. The iterators are `RawDbIter`, the `DeltaReader` iterators, `VersionedDbIterator` and
-  the pruning-key iterators.
+  end. The iterators are `RawDbIter`, the `DeltaReader` iterators, `VersionedDbIterator`,
+  the pruning-key iterators and `SchemaIterator`. `SchemaIterator` also ends after a row that
+  does not decode (a seek resumes it): upstream did not advance past the row, so `next` returned
+  the same `Err` forever.
 - **Corrupt data is an error, not a panic.** An undecodable key or value in `VersionedDbIterator`,
   an undecodable pruning key, and an undecodable entry in `DeltaReader::get_n_from_first_match`
   / `collect_in_range` now produce an `Err`. Upstream panicked, or silently skipped the entry.
@@ -41,6 +43,10 @@ API and scope:
   `update_metrics`); the `arbitrary` feature (proptest impls are now test-only);
   `DB::write_versioned_schemas`; and the `bindgen-runtime` feature (the workspace sets it on
   `rocksdb`).
+- New: `DeltaReader::collect_keys_in_range(range, limit)`, the keys of the first `limit` rows
+  of a range without their values (none is decoded or copied, from the DB or the snapshots),
+  for scans of tables with large values. An inverted range is an `Err` (the snapshots'
+  `BTreeMap::range` would panic).
 - Removed the panic on a zero-length versioned key. With tagged archival values, a zero-length
   key cannot be confused with a delete.
 - Tests: upstream's `DeltaReader` proptests discarded the result of their checks, so a failing

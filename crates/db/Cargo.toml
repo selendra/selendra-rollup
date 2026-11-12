@@ -1,6 +1,6 @@
 [package]
 name = "selendra-db"
-description = "The node's state databases: the NOMT state trees, the versioned flat value store (RocksDB) and the accessory store, and the commit order across them. Node-only, Unix-only."
+description = "The node's state databases: the NOMT state trees, the versioned flat value store (RocksDB), the ledger DB and the accessory store, and the commit order across them. Node-only, Unix-only."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

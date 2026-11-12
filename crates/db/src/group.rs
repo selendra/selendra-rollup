@@ -1,5 +1,6 @@
-//! All state databases together ([`DbGroup`]), the order they are committed in, and how they
-//! are opened (hasher guard, startup crash recovery).
+//! All state databases together ([`DbGroup`]): the NOMT trees, the flat value store, the ledger
+//! DB and the accessory DB; the order they are committed in, and how they are opened (hasher
+//! guard, startup crash recovery).
 
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use crate::faults::CommitHook;
 use crate::faults::{CommitPoint, Faults};
 use crate::flat::FlatStateDb;
 use crate::historical::{HistoricalStateReader, StateChanges, next_version_after};
+use crate::ledger::{self, LedgerChangeSet, LedgerReader};
 use crate::nomt_state::{NomtRoots, NomtSessionBuilder, NomtStateDb, StateFinishedSession};
 use crate::recovery::{Head, RecoveryReport, root_of};
 use crate::schema::{DbMetadata, MetadataKey};
@@ -26,7 +28,7 @@ use crate::schema::{DbMetadata, MetadataKey};
 const STATE_HASHER_PROBE: &[u8] = b"SELENDRA/state-hasher/v1";
 
 /// Everything one block changes in the state databases: the NOMT trees, the flat value store
-/// and the accessory store.
+/// and the accessory store. (Its ledger slot is a separate [`LedgerChangeSet`].)
 pub struct NomtChangeSet {
     state: StateFinishedSession,
     historical_state: StateChanges,
@@ -83,19 +85,22 @@ impl<H, K> core::fmt::Debug for StorageReaders<H, K> {
     }
 }
 
-/// The state databases: the NOMT trees, the flat value store and the accessory store.
+/// The state databases: the NOMT trees, the flat value store, the ledger DB and the accessory
+/// store.
 ///
-/// Commits are linear (one version after the other, `&mut self`). A storage manager with forks,
-/// uncommitted snapshots, the ledger DB and pruning builds on this (later).
+/// Commits are linear (one version after the other, `&mut self`), each with its ledger slot. A
+/// storage manager with forks, uncommitted snapshots and pruning builds on this (later).
 ///
 /// **Poisoning.** A commit that fails after it started writing (an I/O error, or an injected
 /// fault) leaves the databases at different versions, and the NOMT trees' in-memory roots may
-/// already have moved. The group is then poisoned: [`commit`](Self::commit) and
-/// [`readers`](Self::readers) fail until the databases are closed and reopened, which repairs
-/// them ([`open`](Self::open)). Upstream went on with the databases out of step.
+/// already have moved. The group is then poisoned: [`commit`](Self::commit),
+/// [`readers`](Self::readers) and [`ledger_reader`](Self::ledger_reader) fail until the
+/// databases are closed and reopened, which repairs them ([`open`](Self::open)). Upstream went
+/// on with the databases out of step.
 pub struct DbGroup<H> {
     nomt: Arc<NomtStateDb<H>>,
     flat: FlatStateDb,
+    ledger: Arc<rockbound::DB>,
     accessory: Arc<rockbound::DB>,
     faults: Faults,
     poisoned: bool,
@@ -126,7 +131,8 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
     /// 3. **Startup crash recovery**: the databases written before the flat live DB by an
     ///    interrupted commit are rolled back by one version, so that all are at the live DB's
     ///    version and roots again ([`last_recovery`](Self::last_recovery) says what was rolled
-    ///    back; it is also logged). Versioned databases are rolled back only if they are exactly
+    ///    back; it is also logged). Versioned databases (the ledger, whose version is its newest
+    ///    slot; the accessory DB; the flat archival DB) are rolled back only if they are exactly
     ///    one version ahead of the live DB (never decided by root alone: a block can leave the
     ///    roots unchanged), and a NOMT tree only if its root is that next version's (or, when no
     ///    database recorded it, unchecked), and it must then be at the live DB's root.
@@ -174,11 +180,13 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             config.user_state_cache_size,
             config.kernel_state_cache_size,
         )?;
+        let ledger = Arc::new(ledger::options().open_in(&config.path)?);
         let accessory = Arc::new(AccessoryDb::options().open_in(&config.path)?);
         // First: nothing may write data hashed with `H` before it.
-        check_state_hasher(&nomt, &flat, &accessory)?;
-        let last_recovery = crate::recovery::recover(&nomt, &mut flat, &accessory, &faults)?;
-        check_consistency(&nomt, &flat, &accessory)?;
+        check_state_hasher(&nomt, &flat, &ledger, &accessory)?;
+        let last_recovery =
+            crate::recovery::recover(&nomt, &mut flat, &ledger, &accessory, &faults)?;
+        check_consistency(&nomt, &flat, &ledger, &accessory)?;
         let nomt = Arc::new(nomt.grow_to_config(config, &faults)?);
         if !last_recovery.rolled_back.is_empty() {
             tracing::warn!(
@@ -191,6 +199,7 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         Ok(Self {
             nomt,
             flat,
+            ledger,
             accessory,
             faults,
             poisoned: false,
@@ -210,7 +219,8 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
     }
 
     /// Whether a failed commit poisoned the databases: then nothing can be committed or read
-    /// through [`readers`](Self::readers) until they are reopened.
+    /// through [`readers`](Self::readers) or [`ledger_reader`](Self::ledger_reader) until they
+    /// are reopened.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -257,6 +267,12 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         &self.accessory
     }
 
+    /// The ledger DB (tests only).
+    #[cfg(test)]
+    pub(crate) fn ledger_db(&self) -> &Arc<rockbound::DB> {
+        &self.ledger
+    }
+
     /// Readers of the committed state, all at the newest committed version. They see later
     /// commits only through their unbound reads.
     ///
@@ -274,25 +290,46 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         })
     }
 
-    /// Commits one block's changes, which must be for the version after the newest committed
-    /// one and build on the committed roots.
+    /// A reader of the committed ledger (no uncommitted snapshots): its newest slot is the
+    /// newest committed version, and it builds the next version's slot
+    /// ([`LedgerReader::materialize_slot`]).
+    ///
+    /// # Errors
+    /// If the databases are poisoned ([`is_poisoned`](Self::is_poisoned)): the ledger DB may
+    /// then hold a slot that was never committed.
+    pub fn ledger_reader(&self) -> anyhow::Result<LedgerReader> {
+        self.ensure_not_poisoned()?;
+        Ok(LedgerReader::new(self.ledger.clone(), Vec::new()))
+    }
+
+    /// Commits one block's changes and its ledger slot, which must be for the version after the
+    /// newest committed one and build on the committed roots and the committed ledger.
     ///
     /// Order (upstream's; proofs of the newest committed state rely on it): the NOMT kernel
-    /// tree, the NOMT user tree, the accessory DB (values and root in one write), the flat
-    /// archival DB, the flat live DB last. The live DB says which version is committed; after a
-    /// crash, the databases written before it are at most one version ahead, and reopening
-    /// rolls them back ([`open`](Self::open)). Each write is synced to disk before the next.
+    /// tree, the NOMT user tree, the ledger DB (the slot, one write batch), the accessory DB
+    /// (values and root in one write), the flat archival DB, the flat live DB last. The live DB
+    /// says which version is committed; after a crash, the databases written before it are at
+    /// most one version ahead, and reopening rolls them back ([`open`](Self::open)). Each write
+    /// is synced to disk before the next. (Upstream's comment that the ledger "goes after last"
+    /// was stale: it wrote the ledger right after the NOMT trees, as here.)
     ///
     /// Drop every NOMT session and flat-store iterator of this thread first: a commit waits
     /// for them.
     ///
     /// # Errors
-    /// - If the databases are poisoned, if the change set is for another version, does not
-    ///   build on the committed roots, or carries a root other than its NOMT sessions' (all
-    ///   checked before anything is written; the databases stay usable).
+    /// - If the databases are poisoned; if the change set is for another version, does not
+    ///   build on the committed roots, or carries a root other than its NOMT sessions'; if the
+    ///   ledger DB or the accessory DB is not at the committed version and roots; if the ledger
+    ///   slot is for another version or roots, numbers its items from other numbers than the
+    ///   ledger's next ones, or is for a DA block that is already a slot (all checked before
+    ///   anything is written; the databases stay usable).
     /// - If a write fails (or a fault is injected) once writing started: the databases may be
     ///   out of step, and they are poisoned until reopened.
-    pub fn commit(&mut self, change_set: NomtChangeSet) -> anyhow::Result<()> {
+    pub fn commit(
+        &mut self,
+        change_set: NomtChangeSet,
+        ledger: LedgerChangeSet,
+    ) -> anyhow::Result<()> {
         self.ensure_not_poisoned()?;
         let NomtChangeSet {
             state,
@@ -306,6 +343,15 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             historical_state.version() == expected,
             "the change set is for version {} but the next version is {expected}",
             historical_state.version()
+        );
+        let ledger_head = ledger::latest_version_and_root(&self.ledger)?;
+        anyhow::ensure!(
+            ledger_head == live,
+            "the ledger DB is at version {:?} (roots {}), the flat store at {:?} (roots {})",
+            ledger_head.map(|(version, _)| version),
+            root_of(ledger_head),
+            live.map(|(version, _)| version),
+            root_of(live)
         );
         let accessory_version =
             AccessoryDb::latest_version_and_root(&self.accessory)?.map(|(version, _)| version);
@@ -326,8 +372,17 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             historical_state.root(),
             state.roots()
         );
+        anyhow::ensure!(
+            ledger.version() == expected && ledger.roots() == historical_state.root(),
+            "the ledger slot is for version {} with roots ({}), the change set for version \
+             {expected} with roots ({})",
+            ledger.version(),
+            ledger.roots(),
+            historical_state.root()
+        );
+        ledger::check_builds_on_head(&self.ledger, &ledger)?;
 
-        let written = self.write(state, historical_state, &accessory);
+        let written = self.write(state, historical_state, &ledger, &accessory);
         if let Err(error) = &written {
             self.poisoned = true;
             tracing::error!(
@@ -345,16 +400,20 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         &mut self,
         state: StateFinishedSession,
         historical_state: StateChanges,
+        ledger: &LedgerChangeSet,
         accessory: &SchemaBatch,
     ) -> anyhow::Result<()> {
         // ======================= DANGER ZONE ======================
-        // The commit order is relied on by the prover's proofs of the newest committed state
-        // and by startup crash recovery: change it only together with them. An error from here
-        // on poisons the databases.
+        // The commit order (NOMT kernel, NOMT user, ledger, accessory, flat archival, flat
+        // live) is relied on by the prover's proofs of the newest committed state and by
+        // startup crash recovery: change it only together with them. An error from here on
+        // poisons the databases.
         self.faults.hit(CommitPoint::BeforeKernelNomt)?;
         self.nomt
             .commit(state.into_state_overlay(), &self.faults)
             .context("NOMT commit")?;
+        self.faults.hit(CommitPoint::BeforeLedger)?;
+        ledger::commit(&self.ledger, ledger).context("ledger DB commit")?;
         self.faults.hit(CommitPoint::BeforeAccessory)?;
         AccessoryDb::commit(
             &self.accessory,
@@ -376,6 +435,7 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
 fn check_state_hasher<H: Digest<OutputSize = U32> + Send + Sync>(
     nomt: &NomtStateDb<H>,
     flat: &FlatStateDb,
+    ledger: &Arc<rockbound::DB>,
     accessory: &Arc<rockbound::DB>,
 ) -> anyhow::Result<()> {
     let tag: [u8; 32] = H::digest(STATE_HASHER_PROBE).into();
@@ -389,7 +449,7 @@ fn check_state_hasher<H: Digest<OutputSize = U32> + Send + Sync>(
         ),
         None => {
             anyhow::ensure!(
-                is_empty(nomt, flat, accessory)?,
+                is_empty(nomt, flat, ledger, accessory)?,
                 "the state databases hold data but no state hasher tag (written before the \
                  hasher guard existed, or the tag was removed): cannot check which hasher wrote \
                  them"
@@ -403,39 +463,46 @@ fn check_state_hasher<H: Digest<OutputSize = U32> + Send + Sync>(
 }
 
 /// Whether no database holds any state: the NOMT trees are empty and no version is committed to
-/// the flat store (live or archival) or the accessory DB.
+/// the flat store (live or archival), the ledger DB or the accessory DB.
 fn is_empty<H: Digest<OutputSize = U32> + Send + Sync>(
     nomt: &NomtStateDb<H>,
     flat: &FlatStateDb,
+    ledger: &Arc<rockbound::DB>,
     accessory: &Arc<rockbound::DB>,
 ) -> anyhow::Result<bool> {
     Ok(nomt.root_hashes() == NomtRoots::PRE_GENESIS
         && flat.latest_version_and_root_live()?.is_none()
         && flat.latest_version_and_root_archival()?.is_none()
+        && ledger::latest_version_and_root(ledger)?.is_none()
         && AccessoryDb::latest_version_and_root(accessory)?.is_none())
 }
 
-/// Fails unless the NOMT trees, the live and archival flat DBs and the accessory DB are at the
-/// same version and root (after crash recovery, which repairs an interrupted commit).
+/// Fails unless the NOMT trees, the live and archival flat DBs, the ledger DB and the accessory
+/// DB are at the same version and root (after crash recovery, which repairs an interrupted
+/// commit).
 fn check_consistency<H: Digest<OutputSize = U32> + Send + Sync>(
     nomt: &NomtStateDb<H>,
     flat: &FlatStateDb,
+    ledger: &Arc<rockbound::DB>,
     accessory: &Arc<rockbound::DB>,
 ) -> anyhow::Result<()> {
     let live = flat.latest_version_and_root_live()?;
     let archival = flat.latest_version_and_root_archival()?;
+    let ledger = ledger::latest_version_and_root(ledger)?;
     let accessory = AccessoryDb::latest_version_and_root(accessory)?;
     let nomt = nomt.root_hashes();
     let version = |head: Head| head.map(|(version, _)| version);
     anyhow::ensure!(
-        nomt == root_of(live) && archival == live && accessory == live,
+        nomt == root_of(live) && archival == live && ledger == live && accessory == live,
         "the state databases are inconsistent after crash recovery: NOMT roots {nomt}; flat \
-         live DB at version {:?}, roots {}; flat archival DB at version {:?}, roots {}; \
-         accessory DB at version {:?}, roots {}",
+         live DB at version {:?}, roots {}; flat archival DB at version {:?}, roots {}; ledger \
+         DB at version {:?}, roots {}; accessory DB at version {:?}, roots {}",
         version(live),
         root_of(live),
         version(archival),
         root_of(archival),
+        version(ledger),
+        root_of(ledger),
         version(accessory),
         root_of(accessory),
     );
@@ -450,7 +517,9 @@ mod tests {
     use sha2::Sha256;
 
     use super::*;
-    use crate::test_utils::blocks::{block, key, value};
+    use crate::harness::test_slot_info;
+    use crate::ledger::SlotContents;
+    use crate::test_utils::blocks::{block, change_set, key, value};
     use crate::{RecoveryStep, fail_at};
 
     type H = Sha256;
@@ -475,7 +544,7 @@ mod tests {
                 vec![(k_kernel.clone(), value(b"kernel0"))],
                 vec![(k_acc.clone(), value(b"acc0"))],
             );
-            group.commit(change_set).unwrap();
+            change_set.commit(&mut group).unwrap();
             // A user-only block.
             let change_set = block(
                 &group,
@@ -484,7 +553,7 @@ mod tests {
                 vec![],
                 vec![],
             );
-            group.commit(change_set).unwrap();
+            change_set.commit(&mut group).unwrap();
             assert_ne!(group.roots().user, NomtRoots::PRE_GENESIS.user);
             group.roots()
         };
@@ -492,6 +561,10 @@ mod tests {
         let group = open(&tempdir);
         assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::new(1)));
         assert_eq!(group.roots(), roots);
+        // The ledger's newest slot is the committed version, with its roots.
+        let (head, slot) = group.ledger_reader().unwrap().head().unwrap().unwrap();
+        assert_eq!((head, slot.roots), (SlotNumber::new(1), roots));
+        assert_eq!(slot.da_hash, test_slot_info(SlotNumber::new(1)).da_hash);
         let readers = group.readers::<u64>().unwrap();
         let historical = &readers.historical_state;
         assert_eq!(historical.last_version(), Some(SlotNumber::new(1)));
@@ -541,9 +614,10 @@ mod tests {
         let mut group = open(&tempdir);
         let writes = || vec![(key(b"k1"), value(b"v"))];
 
-        // Wrong version.
-        let change_set = block(&group, 1, writes(), writes(), vec![]);
-        let err = group.commit(change_set).unwrap_err();
+        // Wrong version (with a valid ledger slot: the version is checked first).
+        let state = change_set(&group, 1, writes(), writes(), vec![]);
+        let ledger = block(&group, 0, writes(), writes(), vec![]).ledger;
+        let err = group.commit(state, ledger).unwrap_err();
         assert!(
             err.to_string()
                 .contains("is for version 1 but the next version is 0"),
@@ -552,8 +626,8 @@ mod tests {
 
         // A root other than the sessions'.
         let mut change_set = block(&group, 0, writes(), writes(), vec![]);
-        change_set.historical_state.root = NomtRoots::PRE_GENESIS;
-        let err = group.commit(change_set).unwrap_err();
+        change_set.state.historical_state.root = NomtRoots::PRE_GENESIS;
+        let err = change_set.commit(&mut group).unwrap_err();
         assert!(
             err.to_string().contains("is not its NOMT sessions'"),
             "{err}"
@@ -562,11 +636,11 @@ mod tests {
         // Two blocks on the same state: the second does not build on the committed roots.
         let first = block(&group, 0, writes(), writes(), vec![]);
         let second = block(&group, 0, vec![(key(b"k2"), value(b"w"))], writes(), vec![]);
-        group.commit(first).unwrap();
+        first.commit(&mut group).unwrap();
         let roots = group.roots();
         let mut second = second;
-        second.historical_state.version = SlotNumber::new(1);
-        let err = group.commit(second).unwrap_err();
+        second.state.historical_state.version = SlotNumber::new(1);
+        let err = second.commit(&mut group).unwrap_err();
         assert!(
             err.to_string().contains("other than the committed"),
             "{err}"
@@ -578,11 +652,86 @@ mod tests {
         assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::GENESIS));
         assert!(!group.is_poisoned());
         let change_set = block(&group, 1, writes(), vec![], vec![]);
-        group.commit(change_set).unwrap();
+        change_set.commit(&mut group).unwrap();
         drop(group);
         let group = open(&tempdir);
         assert_eq!(group.last_recovery().rolled_back, []);
         assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::new(1)));
+    }
+
+    /// A commit whose ledger slot does not fit is refused before anything is written, and the
+    /// databases stay usable: a slot for another version or roots, and a ledger DB not at the
+    /// committed version (a slot written past the commits: without the check, the commit would
+    /// write its slot over that one and leave the other's DA-hash index row behind).
+    #[test]
+    fn commit_rejects_bad_ledger_slots_before_writing() {
+        let tempdir = crate::test_utils::tempdir();
+        let mut group = open(&tempdir);
+        let writes = || vec![(key(b"k1"), value(b"v"))];
+        let genesis_slot = block(&group, 0, writes(), vec![], vec![]).ledger;
+        let genesis_roots = {
+            let genesis = block(&group, 0, writes(), vec![], vec![]);
+            let roots = genesis.roots();
+            genesis.commit(&mut group).unwrap();
+            roots
+        };
+        let state = |group: &DbGroup<H>| {
+            change_set(group, 1, vec![(key(b"k2"), value(b"w"))], vec![], vec![])
+        };
+
+        // A slot for another version.
+        let err = group.commit(state(&group), genesis_slot).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the ledger slot is for version 0"),
+            "{err:#}"
+        );
+
+        // A slot with other roots.
+        let ledger = group
+            .ledger_reader()
+            .unwrap()
+            .materialize_slot(
+                SlotNumber::new(1),
+                genesis_roots,
+                test_slot_info(SlotNumber::new(1)),
+                SlotContents::default(),
+            )
+            .unwrap();
+        let err = group.commit(state(&group), ledger).unwrap_err();
+        assert!(format!("{err:#}").contains("with roots"), "{err:#}");
+
+        // The ledger DB ahead of the committed version (critique: the accessory DB was checked
+        // against the live DB, the ledger DB was not).
+        let valid = block(&group, 1, vec![(key(b"k2"), value(b"w"))], vec![], vec![]);
+        let mut info = test_slot_info(SlotNumber::new(1));
+        info.da_hash = [0xEE; 32];
+        let stray = group
+            .ledger_reader()
+            .unwrap()
+            .materialize_slot(
+                SlotNumber::new(1),
+                valid.roots(),
+                info,
+                SlotContents::default(),
+            )
+            .unwrap();
+        ledger::commit(&group.ledger, &stray).unwrap();
+        let err = valid.commit(&mut group).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the ledger DB is at version Some(1)"),
+            "{err:#}"
+        );
+        assert!(!group.is_poisoned());
+        assert_eq!(group.roots(), genesis_roots);
+        assert_eq!(group.latest_version().unwrap(), Some(SlotNumber::GENESIS));
+        assert_eq!(
+            group
+                .ledger_reader()
+                .unwrap()
+                .slot_by_hash(&[0xEE; 32])
+                .unwrap(),
+            Some(SlotNumber::new(1))
+        );
     }
 
     /// A commit interrupted before the flat live DB (everything else written) is rolled back
@@ -605,7 +754,7 @@ mod tests {
             );
             let block_roots = change_set.roots();
             group.set_commit_hook(Some(fail_at(CommitPoint::BeforeLive)));
-            let err = group.commit(change_set).unwrap_err();
+            let err = change_set.commit(&mut group).unwrap_err();
             assert!(format!("{err:#}").contains("injected fault"), "{err:#}");
             (genesis_roots, block_roots)
         };
@@ -617,6 +766,7 @@ mod tests {
                 rolled_back: vec![
                     RecoveryStep::KernelNomt,
                     RecoveryStep::UserNomt,
+                    RecoveryStep::Ledger,
                     RecoveryStep::Accessory,
                     RecoveryStep::Archival,
                 ],
@@ -650,7 +800,7 @@ mod tests {
             vec![(key(b"k1"), value(b"kernel1"))],
             vec![(key(b"a1"), value(b"acc1"))],
         );
-        group.commit(change_set).unwrap();
+        change_set.commit(&mut group).unwrap();
         assert_eq!(group.roots(), block_roots);
         drop(group);
         assert_eq!(open(&tempdir).last_recovery().rolled_back, []);
@@ -678,7 +828,7 @@ mod tests {
             let retry = block(&group, 1, user, kernel, accessory);
 
             group.set_commit_hook(Some(fail_at(point)));
-            let err = group.commit(first).unwrap_err();
+            let err = first.commit(&mut group).unwrap_err();
             assert!(
                 format!("{err:#}").contains("injected fault"),
                 "{point:?}: {err:#}"
@@ -686,9 +836,11 @@ mod tests {
             assert!(group.is_poisoned(), "{point:?}");
             // Even with the fault gone, and even where nothing was written yet.
             group.set_commit_hook(None);
-            let err = group.commit(retry).unwrap_err();
+            let err = retry.commit(&mut group).unwrap_err();
             assert!(err.to_string().contains("poisoned"), "{point:?}: {err}");
             let err = group.readers::<u64>().unwrap_err();
+            assert!(err.to_string().contains("poisoned"), "{point:?}: {err}");
+            let err = group.ledger_reader().unwrap_err();
             assert!(err.to_string().contains("poisoned"), "{point:?}: {err}");
             drop(group);
 
@@ -708,7 +860,7 @@ mod tests {
                 vec![],
                 vec![],
             );
-            group.commit(change_set).unwrap();
+            change_set.commit(&mut group).unwrap();
         }
     }
 
@@ -771,7 +923,7 @@ mod tests {
             vec![(key(b"k1"), value(b"kernel0"))],
             vec![(key(b"a1"), value(b"acc0"))],
         );
-        group.commit(change_set).unwrap();
+        change_set.commit(group).unwrap();
         group.roots()
     }
 
@@ -861,7 +1013,7 @@ mod tests {
                 vec![],
                 vec![],
             );
-            let NomtChangeSet { state, .. } = change_set;
+            let NomtChangeSet { state, .. } = change_set.state;
             group
                 .nomt
                 .commit(state.into_state_overlay(), &Faults::default())
@@ -906,7 +1058,7 @@ mod tests {
                 let mut group = open(&tempdir);
                 commit_genesis(&mut group);
                 let change_set = block(&group, 1, vec![(key(b"u1"), value(b"v1"))], vec![], vec![]);
-                group.commit(change_set).unwrap();
+                change_set.commit(&mut group).unwrap();
             }
 
             // Refused by the hasher guard.

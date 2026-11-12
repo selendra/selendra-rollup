@@ -134,6 +134,36 @@ impl DeltaReader {
             .collect()
     }
 
+    /// The keys of the first `limit` rows in `range` (`smallest..largest`), in order, without
+    /// their values: no value is decoded or copied (for a table of large values, such as a scan
+    /// for keys to delete). The scan stops at `range.end` (RocksDB's iterate upper bound) and
+    /// after `limit` rows: no row after those is returned or decoded.
+    ///
+    /// # Errors
+    /// If `range` is inverted, on read errors, and if a key does not decode.
+    pub fn collect_keys_in_range<S: Schema, Sk: SeekKeyEncoder<S>>(
+        &self,
+        range: std::ops::Range<Sk>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<S::Key>> {
+        let lower_bound = range.start.encode_seek_key()?;
+        let upper_bound = range.end.encode_seek_key()?;
+        // Checked before the snapshots' `BTreeMap::range`, which panics on an inverted range.
+        anyhow::ensure!(
+            lower_bound <= upper_bound,
+            "[Rockbound]: collect_keys_in_range: lower_bound > upper_bound"
+        );
+        let mut keys = Vec::new();
+        for item in self
+            .iter_range_keys::<S>(lower_bound..upper_bound)?
+            .take(limit)
+        {
+            let (key, _) = item?;
+            keys.push(S::Key::decode_key(&key)?);
+        }
+        Ok(keys)
+    }
+
     #[allow(dead_code)]
     fn iter<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<'_, SnapshotIter<'_>>> {
         let snapshot_iterators = self
@@ -168,6 +198,31 @@ impl DeltaReader {
             db_iter,
             ScanDirection::Forward,
         ))
+    }
+
+    /// Like [`Self::iter_range`], but every item's value is empty: values are neither copied
+    /// from the DB nor from the snapshots.
+    fn iter_range_keys<S: Schema>(
+        &self,
+        range: std::ops::Range<SchemaKey>,
+    ) -> anyhow::Result<DeltaReaderIter<'_, SnapshotIterRange<'_>>> {
+        let snapshot_iterators = self
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.iter_range::<S>(range.clone()))
+            .collect::<Vec<_>>();
+
+        let db_iter = self
+            .db
+            .raw_iter_range_with_decode_fn::<S, (SchemaKey, SchemaValue)>(
+                range,
+                ScanDirection::Forward,
+                &|(key, _)| (key.to_vec(), SchemaValue::new()),
+            )?;
+
+        let mut iter = DeltaReaderIter::new(snapshot_iterators, db_iter, ScanDirection::Forward);
+        iter.keys_only = true;
+        Ok(iter)
     }
 
     fn iter_rev<S: Schema>(&self) -> anyhow::Result<DeltaReaderIter<'_, Rev<SnapshotIter<'_>>>> {
@@ -221,6 +276,9 @@ where
     direction: ScanDirection,
     /// Set once the DB iterator failed: the iteration ends after that error.
     failed: bool,
+    /// Items carry an empty value instead of a copy of the snapshot's (the DB iterator of a
+    /// keys-only iteration drops values itself).
+    keys_only: bool,
 }
 
 impl<'a, SnapshotIter> DeltaReaderIter<'a, SnapshotIter>
@@ -240,6 +298,7 @@ where
             db_iter: db_iter.peekable(),
             direction,
             failed: false,
+            keys_only: false,
         }
     }
 }
@@ -345,7 +404,12 @@ where
                         let (key, operation) = self.snapshot_iterators[idx].next().unwrap();
                         match operation {
                             Operation::Put { value } => {
-                                return Some(Ok((key.to_vec(), value.to_vec())));
+                                let value = if self.keys_only {
+                                    SchemaValue::new()
+                                } else {
+                                    value.to_vec()
+                                };
+                                return Some(Ok((key.to_vec(), value)));
                             }
                             Operation::Delete | Operation::DeleteRange { .. } => continue,
                         }
@@ -373,6 +437,25 @@ mod tests {
     use proptest::prelude::*;
 
     define_schema!(TestSchema, TestCompositeField, TestField, "TestCF");
+
+    /// A value that never decodes.
+    #[derive(Debug)]
+    pub(crate) struct Undecodable;
+
+    impl<Sc: Schema> ValueCodec<Sc> for Undecodable {
+        fn encode_value(&self) -> crate::schema::Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn decode_value(_: &[u8]) -> crate::schema::Result<Self> {
+            Err(crate::CodecError::Wrapped(anyhow::anyhow!(
+                "undecodable value"
+            )))
+        }
+    }
+
+    // `TestSchema`'s column family, read with values that never decode.
+    define_schema!(KeysOnlySchema, TestCompositeField, Undecodable, "TestCF");
 
     type S = TestSchema;
     type TestItem = (TestCompositeField, TestField);
@@ -746,6 +829,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn collect_keys_in_range_sample() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
+
+        let test_cases = vec![
+            FIELD_2..FIELD_3,
+            FIELD_2..FIELD_4,
+            FIELD_1..FIELD_7,
+            TestCompositeField::MIN..TestCompositeField::MAX,
+            FIELD_5..FIELD_5,
+        ];
+        for range in test_cases {
+            let keys: Vec<_> = delta_reader
+                .collect_in_range::<S, TestCompositeField>(range.clone())
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            for limit in 0..=keys.len() + 1 {
+                let expected = &keys[..limit.min(keys.len())];
+                assert_eq!(
+                    delta_reader
+                        .collect_keys_in_range::<S, TestCompositeField>(range.clone(), limit)
+                        .unwrap(),
+                    expected,
+                    "failed for range {range:?}, limit {limit}"
+                );
+            }
+        }
+
+        // An inverted range is an error (the snapshots' `BTreeMap::range` would panic).
+        let err = delta_reader
+            .collect_keys_in_range::<S, TestCompositeField>(FIELD_4..FIELD_2, 10)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("lower_bound > upper_bound"),
+            "{err}"
+        );
+    }
+
+    /// `collect_keys_in_range` never decodes a value, from the DB or from a snapshot.
+    #[test]
+    fn collect_keys_in_range_reads_no_values() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let delta_reader = build_sample_delta_reader(tmpdir.path());
+        let range = TestCompositeField::MIN..TestCompositeField::MAX;
+
+        assert!(
+            delta_reader
+                .collect_in_range::<KeysOnlySchema, TestCompositeField>(range.clone())
+                .is_err()
+        );
+        assert_eq!(
+            delta_reader
+                .collect_keys_in_range::<KeysOnlySchema, TestCompositeField>(range, 10)
+                .unwrap(),
+            [FIELD_2, FIELD_3, FIELD_4, FIELD_6]
+        );
+    }
+
     fn build_delta_reader_from(
         path: impl AsRef<Path>,
         db_entries: &[(TestCompositeField, TestField)],
@@ -970,10 +1114,23 @@ mod tests {
 
                 for range in full_ranges {
                      let range_values = delta_reader
-                        .collect_in_range::<S, TestCompositeField>(range)
+                        .collect_in_range::<S, TestCompositeField>(range.clone())
                         ;
                     prop_assert!(range_values.is_ok());
                     let range_values = range_values.unwrap();
+
+                    // The keys alone, up to a limit.
+                    for limit in [0, 1, 3, range_values.len(), range_values.len() + 1] {
+                        let keys = delta_reader
+                            .collect_keys_in_range::<S, TestCompositeField>(range.clone(), limit);
+                        prop_assert!(keys.is_ok());
+                        let expected: Vec<_> = range_values
+                            .iter()
+                            .take(limit)
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        prop_assert_eq!(expected, keys.unwrap());
+                    }
 
                     let last_key = all_values.iter().last().map(|(k, _v)| k);
                     let expected_values = if last_key == Some(&TestCompositeField::MAX) {

@@ -27,8 +27,9 @@ const USER: &str = "user";
 
 /// The roots of the two state trees: `user`, `kernel`.
 ///
-/// Stored as 64 bytes, `user ‖ kernel`: the same bytes as [`StorageRoot`]'s borsh encoding.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// Stored as 64 bytes, `user ‖ kernel`: the same bytes as [`StorageRoot`]'s borsh encoding (and
+/// as its own borsh encoding, in the ledger's slots).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, borsh::BorshSerialize, borsh::BorshDeserialize)]
 pub struct NomtRoots {
     /// The root of the user tree.
     pub user: [u8; 32],

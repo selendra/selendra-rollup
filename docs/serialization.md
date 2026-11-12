@@ -234,8 +234,8 @@ panics committing a session whose only changes are such deletes into an empty da
 What a node stores (`selendra-db`; node-only, not consensus: a format change needs a migration
 or a resync, never a fork). Under the database directory: the NOMT trees `user_nomt/` and
 `kernel_nomt/` (key path `H(SlotKey)` → the 36 bytes `val_hash_and_size`, as above; NOMT's own
-file format), and three RocksDB instances. Versions (slot numbers) are `u64` big-endian (8
-bytes), so byte order is version order.
+file format), and four RocksDB instances. Versions (slot numbers) and other numbers in keys are
+big-endian (`u64`: 8 bytes, `u32`: 4 bytes), so byte order is number order.
 
 | Column family | RocksDB | Key | Value |
 |---|---|---|---|
@@ -247,6 +247,16 @@ bytes), so byte order is version order.
 | `module_accessory_state` | `accessory/` | borsh `Vec<u8>` key ‖ version | borsh `Option<Vec<u8>>` (`None`: deleted) |
 | `accessory_keys_by_version` | `accessory/` | version ‖ borsh `Vec<u8>` key | empty |
 | `db_metadata` | `accessory/` | ASCII name: `state_hasher` | `state_hasher`: the 32 bytes `H("SELENDRA/state-hasher/v1")` |
+| `slot_by_number` | `ledger/` | slot number | borsh `StoredSlot`: DA hash (32), DA height (`u64`), roots (64: `user ‖ kernel`), timestamp (`i64` ms), then the batch, transaction, event and discarded-blob ranges (each `start ‖ end`, `u64`) |
+| `slot_by_hash` | `ledger/` | DA block hash (32) | slot number |
+| `batch_by_number`, `tx_by_number`, `event_by_number`, `discarded_blob_by_number` | `ledger/` | item number | borsh `StoredBatch` (hash, tx range, receipt bytes, slot), `StoredTransaction` (hash, event range, `Option` body bytes, receipt bytes, batch), `StoredEvent`, `StoredDiscardedBlob` (`DiscardedBlob`, slot) |
+| `batch_by_hash`, `tx_by_hash`, `discarded_blob_by_hash` | `ledger/` | hash (32) ‖ item number | empty |
+| `event_by_key` | `ledger/` | `u16` key length ‖ event key (at most 256 bytes) ‖ tx number ‖ event number | empty |
+| `event_count_by_key` | `ledger/` | the raw event key | count (`u64` big-endian; no row at 0) |
+| `aggregated_proof_by_slot` | `ledger/` | slot number ‖ `u32` index | the proof bytes |
+| `proof_receipt_by_slot` | `ledger/` | slot number ‖ `u32` index | borsh `([u8; 32], Vec<u8>)`: blob hash, receipt bytes |
+| `proof_receipt_by_hash` | `ledger/` | blob hash (32) ‖ slot number ‖ `u32` index | empty |
+| `stf_info_by_slot` | `ledger/` | slot number | the STF info bytes |
 
 - The archival value is tagged so an empty value (e.g. a `StateValue<()>`, borsh of `()` is
   empty) is not read back as a delete; upstream rockbound archived deletes as the empty string,
@@ -257,8 +267,15 @@ bytes), so byte order is version order.
   its element 0 at `P ‖ 0u64`; upstream rockbound returned "absent" there).
 - Every decoder rejects data that is not exactly an encoding (wrong length, trailing bytes):
   stored data that does not decode is an error, never a panic.
-- Every committed version stores its root in all three RocksDB instances, and the NOMT trees
-  hold the newest one, so the databases are checked against each other when opened.
+- Every committed version stores its root in all four RocksDB instances (the ledger in its slot
+  row: one slot per version), and the NOMT trees hold the newest one, so the databases are
+  checked against each other when opened.
+- Ledger receipts, transaction bodies, proofs and STF info are opaque bytes; their encoding is
+  the node's (borsh, Phase 10). Item numbers (batch, transaction, event, discarded blob) count
+  from 0 across slots, and each slot records its four ranges, so the next numbers come from the
+  newest slot alone. A slot's writes are point writes only (a snapshot reader cannot see range
+  deletes); a rollback (startup crash recovery) uses range deletes and is written straight to
+  the database.
 - Hasher guard: the first open of empty databases writes `db_metadata/state_hasher` with the
   configured hasher `H` (`SHA-256("SELENDRA/state-hasher/v1")` =
   `0x83500e863799fb8a52f07a55b6360bc1e83f638c765875a926ea0fd7ac582aaf`); every later open

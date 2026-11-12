@@ -360,3 +360,48 @@ fn test_schema_batch_iter_range() {
     );
     assert_eq!(None, iter.next());
 }
+
+// Same column family as `TestSchema`, with 4-byte keys: `TestSchema` cannot decode its rows.
+define_schema!(ShortKeySchema, TestField, TestField, "TestCF");
+
+/// A row that does not decode is one `Err`, then the iterator ends; a seek resumes it. Upstream
+/// did not advance past the row, so `next` returned the same `Err` forever and `.count()` never
+/// ended. (Bounded with `take` so the unfixed code fails instead of hanging.)
+#[test]
+fn undecodable_row_is_one_error_then_the_end() {
+    let db = TestDB::new();
+    // `00000001` is a prefix of every `TestCompositeField(1, ..)` key, so it sorts first.
+    db.put::<ShortKeySchema>(&TestField(1), &TestField(0))
+        .unwrap();
+
+    let rows: Vec<_> = db.iter().take(20).collect();
+    assert_eq!(rows.len(), 1, "one error, then the end");
+    let error = rows[0].as_ref().err().expect("the bad row is an error");
+    assert!(
+        format!("{error:#}").contains("failed to fill whole buffer"),
+        "unexpected error: {error:#}"
+    );
+    let mut iter = db.iter();
+    assert!(iter.next().unwrap().is_err());
+    assert!(iter.next().is_none());
+    assert!(iter.next().is_none());
+
+    // Backward, the bad row comes last.
+    let rows: Vec<_> = db.rev_iter().take(20).collect();
+    assert_eq!(rows.len(), 9);
+    let values: Vec<u32> = rows[..8]
+        .iter()
+        .map(|row| row.as_ref().unwrap().value.0)
+        .collect();
+    assert_eq!(values, [202, 200, 114, 112, 110, 104, 102, 100]);
+    assert!(rows[8].is_err());
+
+    // A seek past the bad row resumes the iterator.
+    let mut iter = db.iter();
+    assert!(iter.next().unwrap().is_err());
+    iter.seek(&TestCompositeField(1, 0, 0)).unwrap();
+    assert_eq!(
+        collect_values(iter),
+        [100, 102, 104, 110, 112, 114, 200, 202]
+    );
+}

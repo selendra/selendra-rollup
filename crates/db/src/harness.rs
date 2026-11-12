@@ -7,13 +7,46 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use selendra_state::{MerkleProofSpec, StateCheckpoint, StateUpdate, Storage, StorageRoot};
+use selendra_interface::common::SlotNumber;
+use selendra_interface::da::Time;
+use selendra_interface::reexports::digest::Digest;
+use selendra_state::{
+    MerkleProofSpec, StateCheckpoint, StateHasher, StateUpdate, Storage, StorageRoot,
+};
 
+use crate::ledger::{LedgerChangeSet, LedgerReader, SlotContents, SlotInfo};
 use crate::test_utils::{TestDir, tempdir};
 use crate::{
-    CommitHook, CommitPoint, DbGroup, NomtChangeSet, NomtProverStorage, StateDbConfig, WitnessMode,
-    fail_at,
+    CommitHook, CommitPoint, DbGroup, NomtChangeSet, NomtProverStorage, NomtRoots, StateDbConfig,
+    WitnessMode, fail_at,
 };
+
+/// The DA block of the test slot at `version`: hash `SHA-256(version as u64 big-endian)`,
+/// height `version`, timestamp `version` milliseconds (at most `i64::MAX`).
+pub fn test_slot_info(version: SlotNumber) -> SlotInfo {
+    SlotInfo {
+        da_hash: StateHasher::digest(version.get().to_be_bytes()).into(),
+        da_height: version.get(),
+        timestamp: Time::from_millis(i64::try_from(version.get()).unwrap_or(i64::MAX)),
+    }
+}
+
+/// An empty ledger slot (no batches, proofs or STF info) for the state change set at
+/// `version` with roots `roots`, on top of `ledger`'s newest slot; its DA block is
+/// [`test_slot_info`]`(version)`.
+///
+/// # Panics
+/// If the slot cannot be materialized (see [`LedgerReader::materialize_slot`]).
+pub fn empty_slot(ledger: &LedgerReader, version: SlotNumber, roots: NomtRoots) -> LedgerChangeSet {
+    ledger
+        .materialize_slot(
+            version,
+            roots,
+            test_slot_info(version),
+            SlotContents::default(),
+        )
+        .expect("materialize an empty ledger slot")
+}
 
 /// The storage of [`TestDbs`]: block references are `u64` (unused: no uncommitted overlays).
 pub type TestStorage<S> = NomtProverStorage<S, u64>;
@@ -21,7 +54,7 @@ pub type TestStorage<S> = NomtProverStorage<S, u64>;
 /// The state databases ([`DbGroup`], small settings: [`StateDbConfig::for_tests`]) in a
 /// temporary directory, deleted on drop. Every method panics on a database error.
 ///
-/// At most 4 exist at once in a process (the others wait): each holds several RocksDB and NOMT
+/// At most 3 exist at once in a process (the others wait): each holds several RocksDB and NOMT
 /// databases, which fill a small temporary file system quickly.
 pub struct TestDbs<S: MerkleProofSpec> {
     // Dropped (closed) before the directory.
@@ -85,14 +118,15 @@ impl<S: MerkleProofSpec> TestDbs<S> {
         self.group.set_commit_hook(hook);
     }
 
-    /// A crash during the commit of `change_set`: commits it with a fault at `point` (the
-    /// commit must fail there, and poison the databases), then reopens the databases, which
-    /// runs crash recovery ([`DbGroup::last_recovery`] says what it did).
+    /// A crash during the commit of `change_set` (with an [`empty_slot`]): commits it with a
+    /// fault at `point` (the commit must fail there, and poison the databases), then reopens the
+    /// databases, which runs crash recovery ([`DbGroup::last_recovery`] says what it did).
     pub fn crash_at(mut self, point: CommitPoint, change_set: NomtChangeSet) -> Self {
+        let ledger = self.empty_slot_for(&change_set);
         self.set_commit_hook(Some(fail_at(point)));
         let err = self
             .group
-            .commit(change_set)
+            .commit(change_set, ledger)
             .expect_err("the commit must fail at the injected fault");
         assert!(
             format!("{err:#}").contains("injected fault"),
@@ -118,9 +152,20 @@ impl<S: MerkleProofSpec> TestDbs<S> {
         NomtProverStorage::create(readers, witness_mode)
     }
 
-    /// Commits a change set.
+    /// A reader of the committed ledger.
+    pub fn ledger(&self) -> LedgerReader {
+        self.group.ledger_reader().expect("a ledger reader")
+    }
+
+    /// An [`empty_slot`] for `change_set`.
+    pub fn empty_slot_for(&self, change_set: &NomtChangeSet) -> LedgerChangeSet {
+        empty_slot(&self.ledger(), change_set.version(), change_set.roots())
+    }
+
+    /// Commits a change set, with an [`empty_slot`].
     pub fn commit(&mut self, change_set: NomtChangeSet) {
-        self.group.commit(change_set).expect("commit");
+        let ledger = self.empty_slot_for(&change_set);
+        self.group.commit(change_set, ledger).expect("commit");
     }
 
     /// Runs `f` on a checkpoint over a new storage and returns its changes (accessory writes
@@ -279,10 +324,11 @@ mod tests {
         dbs.commit_with(OFF, set(1));
         let storage = dbs.storage(OFF);
         let (change_set, root) = dbs.change_set_with(OFF, set(2));
+        let ledger = dbs.empty_slot_for(&change_set);
         let gate = Gate::new();
         dbs.set_commit_hook(Some(gate.hook_at(CommitPoint::BeforeArchival)));
         std::thread::scope(|scope| {
-            let commit = scope.spawn(|| dbs.group.commit(change_set));
+            let commit = scope.spawn(|| dbs.group.commit(change_set, ledger));
             assert!(gate.wait_reached(Gate::TIMEOUT), "the commit did not pause");
             assert_eq!(storage.latest_version_unbound(), SlotNumber::GENESIS);
             assert!(!commit.is_finished());
@@ -300,16 +346,17 @@ mod tests {
         let mut dbs = Dbs::new();
         let root = dbs.commit_with(OFF, set(1));
         let (change_set, _) = dbs.change_set_with(OFF, set(2));
+        let ledger = dbs.empty_slot_for(&change_set);
         let gate = Gate::with_timeout(Duration::from_millis(50));
         dbs.set_commit_hook(Some(gate.hook_at(CommitPoint::BeforeAccessory)));
-        let err = dbs.group.commit(change_set).unwrap_err();
+        let err = dbs.group.commit(change_set, ledger).unwrap_err();
         assert!(format!("{err:#}").contains("timed out"), "{err:#}");
         assert!(gate.wait_reached(Duration::ZERO));
         assert!(dbs.group().is_poisoned());
         let dbs = dbs.reopen();
         assert_eq!(
             dbs.group().last_recovery().rolled_back,
-            [RecoveryStep::UserNomt]
+            [RecoveryStep::UserNomt, RecoveryStep::Ledger]
         );
         assert_eq!(dbs.root(), root);
     }
@@ -326,6 +373,7 @@ mod tests {
             dbs.group().last_recovery().rolled_back,
             [
                 RecoveryStep::UserNomt,
+                RecoveryStep::Ledger,
                 RecoveryStep::Accessory,
                 RecoveryStep::Archival
             ]

@@ -7,9 +7,21 @@
 //! | [`ModuleAccessoryState`] | accessory | borsh `Vec<u8>` key ‖ slot number `u64` big-endian | borsh `Option<Vec<u8>>` (`None`: deleted) |
 //! | [`AccessoryKeysByVersion`] | accessory | slot number `u64` big-endian ‖ borsh `Vec<u8>` key | empty |
 //! | [`DbMetadata`] | accessory | a [`MetadataKey`]'s name (ASCII) | its bytes (per key) |
+//! | [`SlotByNumber`] | ledger | slot number | borsh [`StoredSlot`] |
+//! | [`SlotByHash`] | ledger | DA block hash (32 bytes) | slot number |
+//! | [`BatchByNumber`] / [`TxByNumber`] / [`EventByNumber`] / [`DiscardedBlobByNumber`] | ledger | item number | borsh [`StoredBatch`] / [`StoredTransaction`] / [`StoredEvent`] / [`StoredDiscardedBlob`] |
+//! | [`BatchByHash`] / [`TxByHash`] / [`DiscardedBlobByHash`] | ledger | hash ‖ item number | empty |
+//! | [`EventByKey`] | ledger | `u16` key length ‖ event key ‖ transaction number ‖ event number | empty |
+//! | [`EventCountByKey`] | ledger | the raw event key | `u64` |
+//! | [`AggregatedProofBySlot`] | ledger | slot number ‖ `u32` index | the proof bytes |
+//! | [`ProofReceiptBySlot`] | ledger | slot number ‖ `u32` index | borsh `([u8; 32], Vec<u8>)`: blob hash, receipt |
+//! | [`ProofReceiptByHash`] | ledger | blob hash ‖ slot number ‖ `u32` index | empty |
+//! | [`StfInfoBySlot`] | ledger | slot number | the STF info bytes |
 //!
-//! Every decoder rejects bytes that are not exactly an encoding (wrong length, trailing bytes):
-//! stored data that does not decode is an error, never a panic.
+//! Numbers in keys and values are big-endian (8 bytes for `u64`, 4 for `u32`), so byte order is
+//! number order. Every decoder rejects bytes that are not exactly an encoding (wrong length,
+//! trailing bytes, inverted ranges): stored data that does not decode is an error, never a
+//! panic.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -18,8 +30,13 @@ use rockbound::schema::{ColumnFamilyName, KeyDecoder, KeyEncoder, ValueCodec};
 use rockbound::versioned_db::SchemaWithVersion;
 use rockbound::{CodecError, Schema, SeekKeyEncoder};
 use selendra_interface::common::SlotNumber;
+use selendra_interface::stf::{EventKey, StoredEvent};
 use selendra_state::{Kernel, Prefix, ProvableCompileTimeNamespace, SlotKey, SlotValue, User};
 
+use crate::ledger::{
+    BatchNumber, DiscardedBlobNumber, EventNumber, StoredBatch, StoredDiscardedBlob, StoredSlot,
+    StoredTransaction, TxNumber,
+};
 use crate::nomt_state::NomtRoots;
 
 /// A provable namespace with its own versioned value table in the flat store: the four
@@ -404,6 +421,484 @@ pub(crate) const ACCESSORY_TABLES: [ColumnFamilyName; 4] = [
     DbMetadata::COLUMN_FAMILY_NAME,
 ];
 
+// ---------------------------------------------------------------------------------------------
+// The ledger DB.
+
+/// The longest event key the ledger stores, in bytes. Longer keys are refused (`Err`) when a
+/// slot is materialized and by the key encoders, so `event_by_key` keys stay exact-length
+/// prefixed (a `u16`).
+pub const MAX_EVENT_KEY_LEN: usize = 256;
+
+/// The length of an encoded hash.
+const HASH_LEN: usize = 32;
+
+/// An encoded `u64`, big-endian (so byte order is number order).
+fn encode_u64(n: u64) -> [u8; 8] {
+    n.to_be_bytes()
+}
+
+/// Splits a big-endian `u64` off the front of `data`.
+fn take_u64(data: &[u8]) -> Result<(u64, &[u8]), CodecError> {
+    let (bytes, rest) = data
+        .split_first_chunk::<8>()
+        .ok_or(CodecError::InvalidKeyLength {
+            expected: 8,
+            got: data.len(),
+        })?;
+    Ok((u64::from_be_bytes(*bytes), rest))
+}
+
+/// Splits a 32-byte hash off the front of `data`.
+fn take_hash(data: &[u8]) -> Result<([u8; HASH_LEN], &[u8]), CodecError> {
+    let (bytes, rest) =
+        data.split_first_chunk::<HASH_LEN>()
+            .ok_or(CodecError::InvalidKeyLength {
+                expected: HASH_LEN,
+                got: data.len(),
+            })?;
+    Ok((*bytes, rest))
+}
+
+/// Splits a big-endian `u32` off the front of `data`.
+fn take_u32(data: &[u8]) -> Result<(u32, &[u8]), CodecError> {
+    let (bytes, rest) = data
+        .split_first_chunk::<4>()
+        .ok_or(CodecError::InvalidKeyLength {
+            expected: 4,
+            got: data.len(),
+        })?;
+    Ok((u32::from_be_bytes(*bytes), rest))
+}
+
+/// Fails unless the whole key was decoded.
+fn ensure_consumed(rest: &[u8], expected: usize, got: usize) -> Result<(), CodecError> {
+    if rest.is_empty() {
+        Ok(())
+    } else {
+        Err(CodecError::InvalidKeyLength { expected, got })
+    }
+}
+
+/// Fails if an event key is longer than [`MAX_EVENT_KEY_LEN`].
+fn check_event_key_len(len: usize) -> Result<(), CodecError> {
+    if len > MAX_EVENT_KEY_LEN {
+        return Err(CodecError::Wrapped(anyhow::anyhow!(
+            "an event key is at most {MAX_EVENT_KEY_LEN} bytes, got {len}"
+        )));
+    }
+    Ok(())
+}
+
+/// Decodes borsh, rejecting trailing bytes (upstream's `deserialize_reader` ignored them).
+fn decode_borsh<T: borsh::BorshDeserialize>(data: &[u8]) -> Result<T, CodecError> {
+    borsh::from_slice(data).map_err(CodecError::from)
+}
+
+/// Implements the key codecs of a table keyed by a `u64` number type (`new`/`get`), 8 bytes
+/// big-endian.
+macro_rules! number_key {
+    ($table:ty, $number:ty) => {
+        impl KeyEncoder<$table> for $number {
+            fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+                Ok(encode_u64(self.get()).to_vec())
+            }
+        }
+
+        impl KeyDecoder<$table> for $number {
+            fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+                let (n, rest) = take_u64(data)?;
+                ensure_consumed(rest, 8, data.len())?;
+                Ok(<$number>::new(n))
+            }
+        }
+
+        impl SeekKeyEncoder<$table> for $number {
+            fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
+                <Self as KeyEncoder<$table>>::encode_key(self)
+            }
+        }
+    };
+}
+
+/// Implements the key codecs of an index keyed by `hash ‖ number` (32 + 8 bytes).
+macro_rules! hash_number_key {
+    ($table:ty, $number:ty) => {
+        impl KeyEncoder<$table> for ([u8; HASH_LEN], $number) {
+            fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+                let mut out = Vec::with_capacity(HASH_LEN + 8);
+                out.extend_from_slice(&self.0);
+                out.extend_from_slice(&encode_u64(self.1.get()));
+                Ok(out)
+            }
+        }
+
+        impl KeyDecoder<$table> for ([u8; HASH_LEN], $number) {
+            fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+                let (hash, rest) = take_hash(data)?;
+                let (n, rest) = take_u64(rest)?;
+                ensure_consumed(rest, HASH_LEN + 8, data.len())?;
+                Ok((hash, <$number>::new(n)))
+            }
+        }
+
+        impl SeekKeyEncoder<$table> for ([u8; HASH_LEN], $number) {
+            fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
+                <Self as KeyEncoder<$table>>::encode_key(self)
+            }
+        }
+    };
+}
+
+/// Implements the empty value codec of an index table.
+macro_rules! empty_value {
+    ($table:ty) => {
+        impl ValueCodec<$table> for () {
+            fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+                Ok(Vec::new())
+            }
+
+            fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+                if data.is_empty() {
+                    Ok(())
+                } else {
+                    Err(CodecError::Wrapped(anyhow::anyhow!(
+                        "DB corruption: an index row must be empty, got {} bytes",
+                        data.len()
+                    )))
+                }
+            }
+        }
+    };
+}
+
+/// Implements a borsh value codec (strict: no trailing bytes), checking the decoded value with
+/// `$check` (`fn(&T) -> anyhow::Result<()>`).
+macro_rules! borsh_value {
+    ($table:ty, $value:ty $(, $check:path)?) => {
+        impl ValueCodec<$table> for $value {
+            fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+                borsh::to_vec(self).map_err(CodecError::from)
+            }
+
+            fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+                let value: $value = decode_borsh(data)?;
+                $($check(&value).map_err(CodecError::Wrapped)?;)?
+                Ok(value)
+            }
+        }
+    };
+}
+
+/// Implements a raw-bytes value codec (the value is the bytes).
+macro_rules! bytes_value {
+    ($table:ty) => {
+        impl ValueCodec<$table> for Vec<u8> {
+            fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+                Ok(self.clone())
+            }
+
+            fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+                Ok(data.to_vec())
+            }
+        }
+    };
+}
+
+/// Implements the key codecs of a table keyed by `slot ‖ u32 index` (8 + 4 bytes).
+macro_rules! slot_index_key {
+    ($table:ty) => {
+        impl KeyEncoder<$table> for (SlotNumber, u32) {
+            fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+                let mut out = Vec::with_capacity(SLOT_NUMBER_LEN + 4);
+                out.extend_from_slice(&encode_slot_number(self.0));
+                out.extend_from_slice(&self.1.to_be_bytes());
+                Ok(out)
+            }
+        }
+
+        impl KeyDecoder<$table> for (SlotNumber, u32) {
+            fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+                let (slot, rest) = take_u64(data)?;
+                let (index, rest) = take_u32(rest)?;
+                ensure_consumed(rest, SLOT_NUMBER_LEN + 4, data.len())?;
+                Ok((SlotNumber::new(slot), index))
+            }
+        }
+
+        impl SeekKeyEncoder<$table> for (SlotNumber, u32) {
+            fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
+                <Self as KeyEncoder<$table>>::encode_key(self)
+            }
+        }
+    };
+}
+
+define_table!(
+    /// The ledger's slots by slot number. The largest is the ledger's newest slot: its version
+    /// (the state version it was committed with) and roots.
+    SlotByNumber, "slot_by_number", SlotNumber => StoredSlot
+);
+number_key!(SlotByNumber, SlotNumber);
+borsh_value!(SlotByNumber, StoredSlot, StoredSlot::check);
+
+define_table!(
+    /// The slot of each DA block hash (unique on a chain).
+    SlotByHash, "slot_by_hash", [u8; 32] => SlotNumber
+);
+
+impl KeyEncoder<SlotByHash> for [u8; HASH_LEN] {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(self.to_vec())
+    }
+}
+
+impl KeyDecoder<SlotByHash> for [u8; HASH_LEN] {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        data.try_into().map_err(|_| CodecError::InvalidKeyLength {
+            expected: HASH_LEN,
+            got: data.len(),
+        })
+    }
+}
+
+impl ValueCodec<SlotByHash> for SlotNumber {
+    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(encode_slot_number(*self).to_vec())
+    }
+
+    fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+        decode_slot_number(data)
+    }
+}
+
+define_table!(
+    /// The ledger's batches by number.
+    BatchByNumber, "batch_by_number", BatchNumber => StoredBatch
+);
+number_key!(BatchByNumber, BatchNumber);
+borsh_value!(BatchByNumber, StoredBatch, StoredBatch::check);
+
+define_table!(
+    /// Index of the batches by hash: `hash ‖ number` (several batches may have one hash;
+    /// upstream keyed by the hash alone, so a repeated hash overwrote the older row).
+    BatchByHash, "batch_by_hash", ([u8; 32], BatchNumber) => ()
+);
+hash_number_key!(BatchByHash, BatchNumber);
+empty_value!(BatchByHash);
+
+define_table!(
+    /// The ledger's transactions by number.
+    TxByNumber, "tx_by_number", TxNumber => StoredTransaction
+);
+number_key!(TxByNumber, TxNumber);
+borsh_value!(TxByNumber, StoredTransaction, StoredTransaction::check);
+
+define_table!(
+    /// Index of the transactions by hash: `hash ‖ number`.
+    TxByHash, "tx_by_hash", ([u8; 32], TxNumber) => ()
+);
+hash_number_key!(TxByHash, TxNumber);
+empty_value!(TxByHash);
+
+define_table!(
+    /// The ledger's events by number.
+    EventByNumber, "event_by_number", EventNumber => StoredEvent
+);
+number_key!(EventByNumber, EventNumber);
+borsh_value!(EventByNumber, StoredEvent);
+
+define_table!(
+    /// Index of the events by key: `u16 length ‖ key ‖ transaction number ‖ event number`, so
+    /// the events of one key are contiguous and ordered by transaction (exact-key scans; the
+    /// length prefix rules out key-prefix scans, which `event_count_by_key` serves).
+    EventByKey, "event_by_key", (EventKey, TxNumber, EventNumber) => ()
+);
+
+impl KeyEncoder<EventByKey> for (EventKey, TxNumber, EventNumber) {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        let key = self.0.inner();
+        check_event_key_len(key.len())?;
+        let len = u16::try_from(key.len()).map_err(|_| CodecError::InvalidKeyLength {
+            expected: MAX_EVENT_KEY_LEN,
+            got: key.len(),
+        })?;
+        let mut out = Vec::with_capacity(2 + key.len() + 16);
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&encode_u64(self.1.get()));
+        out.extend_from_slice(&encode_u64(self.2.get()));
+        Ok(out)
+    }
+}
+
+impl KeyDecoder<EventByKey> for (EventKey, TxNumber, EventNumber) {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        let (len, rest) = data
+            .split_first_chunk::<2>()
+            .ok_or(CodecError::InvalidKeyLength {
+                expected: 2,
+                got: data.len(),
+            })?;
+        let len = usize::from(u16::from_be_bytes(*len));
+        check_event_key_len(len)?;
+        let (key, rest) = rest
+            .split_at_checked(len)
+            .ok_or(CodecError::InvalidKeyLength {
+                expected: 2 + len,
+                got: data.len(),
+            })?;
+        let (tx, rest) = take_u64(rest)?;
+        let (event, rest) = take_u64(rest)?;
+        ensure_consumed(rest, 2 + len + 16, data.len())?;
+        Ok((
+            EventKey::new(key),
+            TxNumber::new(tx),
+            EventNumber::new(event),
+        ))
+    }
+}
+
+impl SeekKeyEncoder<EventByKey> for (EventKey, TxNumber, EventNumber) {
+    fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
+        <Self as KeyEncoder<EventByKey>>::encode_key(self)
+    }
+}
+
+empty_value!(EventByKey);
+
+define_table!(
+    /// How many events of each key the ledger holds. The key is the raw event-key bytes, so
+    /// the rows are in key order (a key-prefix scan finds every key with a prefix); the value
+    /// is a `u64` big-endian. A key whose count drops to 0 has no row.
+    EventCountByKey, "event_count_by_key", EventKey => u64
+);
+
+impl KeyEncoder<EventCountByKey> for EventKey {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        check_event_key_len(self.inner().len())?;
+        Ok(self.inner().clone())
+    }
+}
+
+impl KeyDecoder<EventCountByKey> for EventKey {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        check_event_key_len(data.len())?;
+        Ok(EventKey::new(data))
+    }
+}
+
+impl SeekKeyEncoder<EventCountByKey> for EventKey {
+    fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
+        <Self as KeyEncoder<EventCountByKey>>::encode_key(self)
+    }
+}
+
+impl ValueCodec<EventCountByKey> for u64 {
+    fn encode_value(&self) -> Result<Vec<u8>, CodecError> {
+        Ok(encode_u64(*self).to_vec())
+    }
+
+    fn decode_value(data: &[u8]) -> Result<Self, CodecError> {
+        let bytes: [u8; 8] = data.try_into().map_err(|_| {
+            CodecError::Wrapped(anyhow::anyhow!(
+                "DB corruption: an event count must be 8 bytes, got {}",
+                data.len()
+            ))
+        })?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+}
+
+define_table!(
+    /// The ledger's discarded blobs by number.
+    DiscardedBlobByNumber, "discarded_blob_by_number", DiscardedBlobNumber => StoredDiscardedBlob
+);
+number_key!(DiscardedBlobByNumber, DiscardedBlobNumber);
+borsh_value!(DiscardedBlobByNumber, StoredDiscardedBlob);
+
+define_table!(
+    /// Index of the discarded blobs by hash: `hash ‖ number` (upstream keyed the blobs
+    /// themselves by hash, so a repeated hash overwrote the older blob).
+    DiscardedBlobByHash, "discarded_blob_by_hash", ([u8; 32], DiscardedBlobNumber) => ()
+);
+hash_number_key!(DiscardedBlobByHash, DiscardedBlobNumber);
+empty_value!(DiscardedBlobByHash);
+
+define_table!(
+    /// The aggregated proofs accepted in each slot, by `slot ‖ u32 index` (opaque bytes;
+    /// upstream kept a single proof, always at id 0, which a rollback never removed).
+    AggregatedProofBySlot, "aggregated_proof_by_slot", (SlotNumber, u32) => Vec<u8>
+);
+slot_index_key!(AggregatedProofBySlot);
+bytes_value!(AggregatedProofBySlot);
+
+define_table!(
+    /// The proof receipts of each slot, by `slot ‖ u32 index`: the proof blob's hash and the
+    /// receipt (borsh `([u8; 32], Vec<u8>)`; the receipt is opaque bytes).
+    ProofReceiptBySlot, "proof_receipt_by_slot", (SlotNumber, u32) => ([u8; 32], Vec<u8>)
+);
+slot_index_key!(ProofReceiptBySlot);
+borsh_value!(ProofReceiptBySlot, ([u8; 32], Vec<u8>));
+
+define_table!(
+    /// Index of the proof receipts by proof blob hash: `hash ‖ slot ‖ u32 index`.
+    ProofReceiptByHash, "proof_receipt_by_hash", ([u8; 32], SlotNumber, u32) => ()
+);
+
+impl KeyEncoder<ProofReceiptByHash> for ([u8; HASH_LEN], SlotNumber, u32) {
+    fn encode_key(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = Vec::with_capacity(HASH_LEN + SLOT_NUMBER_LEN + 4);
+        out.extend_from_slice(&self.0);
+        out.extend_from_slice(&encode_slot_number(self.1));
+        out.extend_from_slice(&self.2.to_be_bytes());
+        Ok(out)
+    }
+}
+
+impl KeyDecoder<ProofReceiptByHash> for ([u8; HASH_LEN], SlotNumber, u32) {
+    fn decode_key(data: &[u8]) -> Result<Self, CodecError> {
+        let (hash, rest) = take_hash(data)?;
+        let (slot, rest) = take_u64(rest)?;
+        let (index, rest) = take_u32(rest)?;
+        ensure_consumed(rest, HASH_LEN + SLOT_NUMBER_LEN + 4, data.len())?;
+        Ok((hash, SlotNumber::new(slot), index))
+    }
+}
+
+impl SeekKeyEncoder<ProofReceiptByHash> for ([u8; HASH_LEN], SlotNumber, u32) {
+    fn encode_seek_key(&self) -> Result<Vec<u8>, CodecError> {
+        <Self as KeyEncoder<ProofReceiptByHash>>::encode_key(self)
+    }
+}
+
+empty_value!(ProofReceiptByHash);
+
+define_table!(
+    /// The STF info of each slot (opaque bytes).
+    StfInfoBySlot, "stf_info_by_slot", SlotNumber => Vec<u8>
+);
+number_key!(StfInfoBySlot, SlotNumber);
+bytes_value!(StfInfoBySlot);
+
+/// The tables of the ledger DB.
+pub(crate) const LEDGER_TABLES: [ColumnFamilyName; 15] = [
+    SlotByNumber::COLUMN_FAMILY_NAME,
+    SlotByHash::COLUMN_FAMILY_NAME,
+    BatchByNumber::COLUMN_FAMILY_NAME,
+    BatchByHash::COLUMN_FAMILY_NAME,
+    TxByNumber::COLUMN_FAMILY_NAME,
+    TxByHash::COLUMN_FAMILY_NAME,
+    EventByNumber::COLUMN_FAMILY_NAME,
+    EventByKey::COLUMN_FAMILY_NAME,
+    EventCountByKey::COLUMN_FAMILY_NAME,
+    DiscardedBlobByNumber::COLUMN_FAMILY_NAME,
+    DiscardedBlobByHash::COLUMN_FAMILY_NAME,
+    AggregatedProofBySlot::COLUMN_FAMILY_NAME,
+    ProofReceiptBySlot::COLUMN_FAMILY_NAME,
+    ProofReceiptByHash::COLUMN_FAMILY_NAME,
+    StfInfoBySlot::COLUMN_FAMILY_NAME,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +918,7 @@ mod tests {
             <NomtStateValues<Kernel> as SchemaWithVersion>::VERSION_METADATA_COLUMN_FAMILY_NAME,
         ];
         names.extend(ACCESSORY_TABLES);
+        names.extend(LEDGER_TABLES);
         let count = names.len();
         names.sort_unstable();
         names.dedup();
@@ -540,6 +1036,154 @@ mod tests {
         assert_eq!(
             <Vec<u8> as ValueCodec<DbMetadata>>::decode_value(&value).unwrap(),
             value
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        selendra_interface::common::HexString(bytes).to_string()
+    }
+
+    /// The ledger's key bytes (big-endian numbers: byte order is number order) and value bytes,
+    /// pinned against bytes computed with Python's `struct` (`<` borsh little-endian, `>` key
+    /// big-endian).
+    #[test]
+    fn ledger_encodings_are_pinned() {
+        let n = 0x0102;
+        let be = [0, 0, 0, 0, 0, 0, 1, 2];
+        assert_eq!(
+            <_ as KeyEncoder<SlotByNumber>>::encode_key(&SlotNumber::new(n)).unwrap(),
+            be
+        );
+        assert_eq!(
+            <_ as KeyEncoder<StfInfoBySlot>>::encode_key(&SlotNumber::new(n)).unwrap(),
+            be
+        );
+        assert_eq!(
+            <_ as KeyEncoder<BatchByNumber>>::encode_key(&BatchNumber::new(n)).unwrap(),
+            be
+        );
+        assert_eq!(
+            <_ as KeyEncoder<TxByNumber>>::encode_key(&TxNumber::new(n)).unwrap(),
+            be
+        );
+        assert_eq!(
+            <_ as KeyEncoder<EventByNumber>>::encode_key(&EventNumber::new(n)).unwrap(),
+            be
+        );
+        assert_eq!(
+            <_ as KeyEncoder<DiscardedBlobByNumber>>::encode_key(&DiscardedBlobNumber::new(n))
+                .unwrap(),
+            be
+        );
+        let hash = [0xAB; 32];
+        assert_eq!(
+            <_ as KeyEncoder<SlotByHash>>::encode_key(&hash).unwrap(),
+            hash
+        );
+        assert_eq!(
+            <SlotNumber as ValueCodec<SlotByHash>>::encode_value(&SlotNumber::new(n)).unwrap(),
+            be
+        );
+        let hash_then_be = [hash.as_slice(), &be].concat();
+        assert_eq!(
+            <_ as KeyEncoder<BatchByHash>>::encode_key(&(hash, BatchNumber::new(n))).unwrap(),
+            hash_then_be
+        );
+        assert_eq!(
+            <_ as KeyEncoder<TxByHash>>::encode_key(&(hash, TxNumber::new(n))).unwrap(),
+            hash_then_be
+        );
+        assert_eq!(
+            <_ as KeyEncoder<DiscardedBlobByHash>>::encode_key(&(
+                hash,
+                DiscardedBlobNumber::new(n)
+            ))
+            .unwrap(),
+            hash_then_be
+        );
+        assert_eq!(
+            hex(&<_ as KeyEncoder<EventByKey>>::encode_key(&(
+                EventKey::new(b"ab"),
+                TxNumber::new(1),
+                EventNumber::new(2)
+            ))
+            .unwrap()),
+            "0x0002616200000000000000010000000000000002"
+        );
+        assert_eq!(
+            <_ as KeyEncoder<EventCountByKey>>::encode_key(&EventKey::new(b"ab")).unwrap(),
+            b"ab"
+        );
+        assert_eq!(
+            <u64 as ValueCodec<EventCountByKey>>::encode_value(&n).unwrap(),
+            be
+        );
+        let slot_index = [0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 4, 5];
+        assert_eq!(
+            <_ as KeyEncoder<AggregatedProofBySlot>>::encode_key(&(SlotNumber::new(3), 0x0405))
+                .unwrap(),
+            slot_index
+        );
+        assert_eq!(
+            <_ as KeyEncoder<ProofReceiptBySlot>>::encode_key(&(SlotNumber::new(3), 0x0405))
+                .unwrap(),
+            slot_index
+        );
+        assert_eq!(
+            hex(&<_ as KeyEncoder<ProofReceiptByHash>>::encode_key(&(
+                hash,
+                SlotNumber::new(3),
+                0x0405
+            ))
+            .unwrap()),
+            "0xabababababababababababababababababababababababababababababababab000000000000000300000405"
+        );
+        assert_eq!(
+            hex(&<_ as ValueCodec<ProofReceiptBySlot>>::encode_value(&([1; 32], vec![9])).unwrap()),
+            "0x01010101010101010101010101010101010101010101010101010101010101010100000009"
+        );
+        assert_eq!(
+            <Vec<u8> as ValueCodec<AggregatedProofBySlot>>::encode_value(&vec![7, 8]).unwrap(),
+            [7, 8]
+        );
+
+        let slot = StoredSlot {
+            da_hash: [0x11; 32],
+            da_height: n,
+            roots: NomtRoots {
+                user: [0x22; 32],
+                kernel: [0x33; 32],
+            },
+            timestamp: selendra_interface::da::Time::from_millis(-2),
+            batches: BatchNumber::new(1)..BatchNumber::new(2),
+            txs: TxNumber::new(3)..TxNumber::new(4),
+            events: EventNumber::new(5)..EventNumber::new(6),
+            discarded_blobs: DiscardedBlobNumber::new(7)..DiscardedBlobNumber::new(8),
+        };
+        let bytes = <_ as ValueCodec<SlotByNumber>>::encode_value(&slot).unwrap();
+        assert_eq!(
+            hex(&bytes),
+            "0x1111111111111111111111111111111111111111111111111111111111111111020100000000000022\
+             222222222222222222222222222222222222222222222222222222222222223333333333333333333333\
+             333333333333333333333333333333333333333333feffffffffffffff01000000000000000200000000\
+             000000030000000000000004000000000000000500000000000000060000000000000007000000000000\
+             000800000000000000"
+        );
+        assert_eq!(
+            <StoredSlot as ValueCodec<SlotByNumber>>::decode_value(&bytes).unwrap(),
+            slot
+        );
+        let tx = StoredTransaction {
+            hash: [0x44; 32],
+            events: EventNumber::new(1)..EventNumber::new(3),
+            body: Some(vec![0xAA]),
+            receipt: vec![0xBB, 0xCC],
+            batch: BatchNumber::new(9),
+        };
+        assert_eq!(
+            hex(&<_ as ValueCodec<TxByNumber>>::encode_value(&tx).unwrap()),
+            "0x4444444444444444444444444444444444444444444444444444444444444444010000000000000003\
+             000000000000000101000000aa02000000bbcc0900000000000000"
         );
     }
 

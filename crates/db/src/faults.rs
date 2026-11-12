@@ -17,8 +17,8 @@ use crate::recovery::RecoveryStep;
 /// A point of [`DbGroup::commit`](crate::DbGroup::commit) or of the startup crash recovery of
 /// [`DbGroup::open`](crate::DbGroup::open) where the commit hook runs.
 ///
-/// A commit writes, in this order: the NOMT kernel tree, the NOMT user tree, the accessory DB,
-/// the flat archival DB, the flat live DB. The points sit between these writes.
+/// A commit writes, in this order: the NOMT kernel tree, the NOMT user tree, the ledger DB, the
+/// accessory DB, the flat archival DB, the flat live DB. The points sit between these writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CommitPoint {
@@ -26,9 +26,12 @@ pub enum CommitPoint {
     BeforeKernelNomt,
     /// Before the NOMT user tree: the kernel tree is written.
     BeforeUserNomt,
-    /// Before the accessory DB: both NOMT trees are written.
+    /// Before the ledger DB: both NOMT trees are written.
+    BeforeLedger,
+    /// Before the accessory DB: both NOMT trees and the ledger DB are written.
     BeforeAccessory,
-    /// Before the flat archival DB: the NOMT trees and the accessory DB are written.
+    /// Before the flat archival DB: the NOMT trees, the ledger DB and the accessory DB are
+    /// written.
     BeforeArchival,
     /// Before the flat live DB: everything else is written.
     ///
@@ -49,9 +52,10 @@ pub enum CommitPoint {
 
 impl CommitPoint {
     /// The points of a commit, in order.
-    pub const COMMIT: [Self; 6] = [
+    pub const COMMIT: [Self; 7] = [
         Self::BeforeKernelNomt,
         Self::BeforeUserNomt,
+        Self::BeforeLedger,
         Self::BeforeAccessory,
         Self::BeforeArchival,
         Self::BeforeLive,

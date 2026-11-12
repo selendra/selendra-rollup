@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 /// Layout under [`path`](Self::path):
 /// - `user_nomt/`, `kernel_nomt/`: the NOMT state trees (one per provable namespace);
 /// - `state-db/`, `archival-state-db/`: the flat value store (live and archival RocksDB);
+/// - `ledger/`: the ledger DB (RocksDB);
 /// - `accessory/`: the accessory store (RocksDB).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateDbConfig {

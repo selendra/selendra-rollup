@@ -24,10 +24,14 @@ use sha2::Sha256;
 
 use super::*;
 use crate::faults::CommitHook;
-use crate::schema::{AccessoryKeysByVersion, StateRootHashes};
-use crate::test_utils::blocks::{Writes, block, dump, key};
+use crate::harness::test_slot_info;
+use crate::ledger::{LedgerReader, SlotContents};
+use crate::schema::{AccessoryKeysByVersion, SlotByNumber, StateRootHashes};
+use crate::test_utils::blocks::{
+    Block, Writes, block_with_slot, change_set, dump, key, slot_contents,
+};
 use crate::test_utils::{tempdir, tempdirs};
-use crate::{DbGroup, NomtChangeSet, StateDbConfig, WitnessMode, fail_at};
+use crate::{DbGroup, StateDbConfig, WitnessMode, fail_at};
 
 type H = Sha256;
 
@@ -64,17 +68,19 @@ fn writes(pairs: &[(&str, Option<&str>)]) -> Writes {
         .collect()
 }
 
-/// The writes of one block.
+/// The writes of one block, with its ledger slot's contents.
 #[derive(Clone, Default)]
 struct BlockWrites {
     user: Writes,
     kernel: Writes,
     accessory: Writes,
+    ledger: SlotContents,
 }
 
 impl BlockWrites {
-    fn change_set(&self, group: &DbGroup<H>, version: u64) -> NomtChangeSet {
-        block(
+    /// The state change set alone (for writes past the other databases).
+    fn state(&self, group: &DbGroup<H>, version: u64) -> crate::NomtChangeSet {
+        change_set(
             group,
             version,
             self.user.clone(),
@@ -82,20 +88,34 @@ impl BlockWrites {
             self.accessory.clone(),
         )
     }
+
+    fn change_set(&self, group: &DbGroup<H>, version: u64) -> Block {
+        block_with_slot(
+            group,
+            version,
+            self.user.clone(),
+            self.kernel.clone(),
+            self.accessory.clone(),
+            self.ledger.clone(),
+        )
+    }
 }
 
-/// Versions 0 and 1: writes and deletes in every namespace.
+/// Versions 0 and 1: writes and deletes in every namespace, and every kind of ledger item
+/// (event keys `e1` and `e2` counted across the slots).
 fn base() -> [BlockWrites; 2] {
     [
         BlockWrites {
             user: writes(&[("u1", Some("u1@0")), ("u2", Some("u2@0"))]),
             kernel: writes(&[("k1", Some("k1@0")), ("k2", Some("k2@0"))]),
             accessory: writes(&[("a1", Some("a1@0")), ("a2", Some("a2@0"))]),
+            ledger: slot_contents(10, &["e1", "e2"]),
         },
         BlockWrites {
             user: writes(&[("u1", Some("u1@1")), ("u2", None)]),
             kernel: writes(&[("k2", Some("k2@1"))]),
             accessory: writes(&[("a1", Some("a1@1")), ("a2", None)]),
+            ledger: slot_contents(11, &["e1"]),
         },
     ]
 }
@@ -106,6 +126,7 @@ fn next_block() -> BlockWrites {
         user: writes(&[("u4", Some("u4@3"))]),
         kernel: writes(&[("k3", Some("k3@3"))]),
         accessory: writes(&[("a4", Some("a4@3"))]),
+        ledger: slot_contents(30, &["e4"]),
     }
 }
 
@@ -136,6 +157,8 @@ impl Kind {
                 user: writes(&[("u1", None), ("u3", Some("u3@2"))]),
                 kernel: writes(&[("k1", Some("k1@2"))]),
                 accessory: writes(&[("a1", Some("a1@2")), ("a3", Some("a3@2"))]),
+                // A count to decrement (e1) and one to delete (e3) on rollback.
+                ledger: slot_contents(20, &["e1", "e3", "e3"]),
             },
             Self::UserOnly => BlockWrites {
                 user: writes(&[("u1", Some("u1@2"))]),
@@ -149,6 +172,7 @@ impl Kind {
                 user: writes(&[("u1", Some("u1@1"))]),
                 kernel: writes(&[("k2", Some("k2@1"))]),
                 accessory: writes(&[("a1", Some("a1@1"))]),
+                ledger: slot_contents(21, &["e2"]),
             },
             Self::AccessoryOnly => BlockWrites {
                 accessory: writes(&[("a1", None), ("a3", Some("a3@2"))]),
@@ -182,9 +206,11 @@ fn expected_steps(
     [
         (1, changes_kernel, RecoveryStep::KernelNomt),
         (2, changes_user, RecoveryStep::UserNomt),
-        // The accessory and archival writes always include the version's root.
-        (3, true, RecoveryStep::Accessory),
-        (4, true, RecoveryStep::Archival),
+        // The ledger, accessory and archival writes always include the version (a slot, a
+        // root).
+        (3, true, RecoveryStep::Ledger),
+        (4, true, RecoveryStep::Accessory),
+        (5, true, RecoveryStep::Archival),
     ]
     .into_iter()
     .filter(|(written_before, changed, _)| reached >= *written_before && *changed)
@@ -216,17 +242,31 @@ impl Model {
     /// Commits `block` to `group` as the next version and applies it.
     fn commit(&mut self, group: &mut DbGroup<H>, block: &BlockWrites) -> NomtRoots {
         let version = self.version.map_or(0, |v| v.checked_add(1).unwrap());
-        group.commit(block.change_set(group, version)).unwrap();
+        block.change_set(group, version).commit(group).unwrap();
         self.apply(version, block);
         group.roots()
     }
 
     /// Reads every key through fresh readers: the flat store, the NOMT trees (the value hashes)
-    /// and the accessory DB.
+    /// and the accessory DB; and the ledger's newest slot.
     fn check(&self, group: &DbGroup<H>) {
         assert_eq!(
             group.latest_version().unwrap().map(|version| version.get()),
             self.version
+        );
+        let ledger_head = group.ledger_reader().unwrap().head().unwrap();
+        assert_eq!(
+            ledger_head
+                .as_ref()
+                .map(|(number, slot)| (number.get(), slot.roots, slot.da_hash)),
+            self.version.map(|version| {
+                let version = SlotNumber::new(version);
+                (
+                    version.get(),
+                    group.roots(),
+                    test_slot_info(version).da_hash,
+                )
+            })
         );
         let readers = group.readers::<u64>().unwrap();
         let sessions = readers
@@ -269,9 +309,23 @@ impl Model {
     }
 }
 
-/// No database holds a row of `version`: no root, no flat-store keys, no accessory index rows.
+/// No database holds a row of `version`: no ledger slot, no root, no flat-store keys, no
+/// accessory index rows.
 fn assert_no_rows_at(group: &DbGroup<H>, version: u64) {
     let version = SlotNumber::new(version);
+    let ledger = group.ledger_reader().unwrap();
+    assert_eq!(ledger.slot(version).unwrap(), None, "ledger slot {version}");
+    assert_eq!(
+        ledger
+            .slot_by_hash(&test_slot_info(version).da_hash)
+            .unwrap(),
+        None
+    );
+    assert_eq!(ledger.stf_info(version).unwrap(), None);
+    assert_eq!(
+        ledger.aggregated_proofs(version).unwrap(),
+        Vec::<Vec<u8>>::new()
+    );
     let end = version.checked_add(1).unwrap();
     let start: (SlotNumber, &[u8]) = (version, &[]);
     let end: (SlotNumber, &[u8]) = (end, &[]);
@@ -311,7 +365,7 @@ fn crash_after_base(dir: &Path, point: CommitPoint, crashed: &BlockWrites) -> (M
     let change_set = crashed.change_set(&group, 2);
     let roots = change_set.roots();
     group.set_commit_hook(Some(fail_at(point)));
-    let err = group.commit(change_set).unwrap_err();
+    let err = change_set.commit(&mut group).unwrap_err();
     assert_error(&err, "injected fault");
     assert!(group.is_poisoned());
     if point == CommitPoint::AfterLive {
@@ -397,6 +451,11 @@ fn crash_matrix_before_user_nomt() {
 }
 
 #[test]
+fn crash_matrix_before_ledger() {
+    crash_matrix(CommitPoint::BeforeLedger);
+}
+
+#[test]
 fn crash_matrix_before_accessory() {
     crash_matrix(CommitPoint::BeforeAccessory);
 }
@@ -431,7 +490,10 @@ fn crash_during_genesis_commit_recovers_to_empty() {
             let change_set = genesis.change_set(&group, 0);
             let roots = change_set.roots();
             group.set_commit_hook(Some(fail_at(point)));
-            assert_error(&group.commit(change_set).unwrap_err(), "injected fault");
+            assert_error(
+                &change_set.commit(&mut group).unwrap_err(),
+                "injected fault",
+            );
             roots
         };
         let mut group = open(crashed_dir);
@@ -467,9 +529,10 @@ fn crash_during_genesis_commit_recovers_to_empty() {
 // ---------------------------------------------------------------------------------------------
 // Crashes during recovery.
 
-const ROLLBACK_STEPS: [RecoveryStep; 4] = [
+const ROLLBACK_STEPS: [RecoveryStep; 5] = [
     RecoveryStep::KernelNomt,
     RecoveryStep::UserNomt,
+    RecoveryStep::Ledger,
     RecoveryStep::Accessory,
     RecoveryStep::Archival,
 ];
@@ -529,7 +592,7 @@ fn crash_then_reopen_with_more_buckets() {
 
     // Crash (both trees ahead), then reopen with twice the buckets.
     let dir = tempdir();
-    let (mut model, roots) = crash_after_base(dir.path(), CommitPoint::BeforeAccessory, &crashed);
+    let (mut model, roots) = crash_after_base(dir.path(), CommitPoint::BeforeLedger, &crashed);
     let mut group = DbGroup::<H>::open(&config_with_buckets(dir.path(), 1000)).unwrap();
     assert_eq!(
         group.last_recovery().rolled_back,
@@ -555,7 +618,10 @@ fn crash_then_reopen_with_more_buckets() {
     let change_set = crashed.change_set(&group, 2);
     let roots = change_set.roots();
     group.set_commit_hook(Some(fail_at(CommitPoint::BeforeUserNomt)));
-    assert_error(&group.commit(change_set).unwrap_err(), "injected fault");
+    assert_error(
+        &change_set.commit(&mut group).unwrap_err(),
+        "injected fault",
+    );
     drop(group);
     let mut group = DbGroup::<H>::open(&config_with_buckets(dir.path(), 2000)).unwrap();
     assert_eq!(
@@ -661,7 +727,7 @@ fn open_irreconcilable_dbs_is_error_not_panic() {
             ..BlockWrites::default()
         };
         for (version, block) in [(2, &crashed), (3, &next_block()), (4, &third)] {
-            let overlay = block.change_set(&group, version).into_nomt_overlay();
+            let overlay = block.state(&group, version).into_nomt_overlay();
             group.nomt().commit(overlay, &Faults::default()).unwrap();
         }
         drop(group);
@@ -709,36 +775,96 @@ fn open_irreconcilable_dbs_is_error_not_panic() {
         }
     }
 
-    // A NOMT tree at neither the live DB's root nor the next version's (which the accessory DB
-    // recorded): refused before its rollback log is used. With the bogus accessory version
-    // removed, the same tree rolls back (unchecked: no database records the next version).
-    {
+    // A NOMT tree at neither the live DB's root nor the next version's (which the accessory DB,
+    // or the ledger DB, recorded): refused before its rollback log is used (also when only the
+    // ledger DB, written first, records the next version: a crash before the accessory DB).
+    // With the bogus version removed, the same tree rolls back (unchecked: no database records
+    // the next version).
+    for recorder in ["accessory DB", "ledger DB"] {
         let dir = tempdir();
         let model = with_base(dir.path());
         let group = open(dir.path());
-        let overlay = crashed.change_set(&group, 2).into_nomt_overlay();
+        let overlay = crashed.state(&group, 2).into_nomt_overlay();
         group.nomt().commit(overlay, &Faults::default()).unwrap();
         let ahead = group.roots();
-        let mut roots = SchemaBatch::new();
-        roots
-            .put::<StateRootHashes>(&SlotNumber::new(2), &other_roots)
-            .unwrap();
-        AccessoryDb::commit(group.accessory_db(), &SchemaBatch::new(), &roots).unwrap();
+        if recorder == "ledger DB" {
+            let slot = group
+                .ledger_reader()
+                .unwrap()
+                .materialize_slot(
+                    SlotNumber::new(2),
+                    other_roots,
+                    test_slot_info(SlotNumber::new(2)),
+                    SlotContents::default(),
+                )
+                .unwrap();
+            crate::ledger::commit(group.ledger_db(), &slot).unwrap();
+        } else {
+            let mut roots = SchemaBatch::new();
+            roots
+                .put::<StateRootHashes>(&SlotNumber::new(2), &other_roots)
+                .unwrap();
+            AccessoryDb::commit(group.accessory_db(), &SchemaBatch::new(), &roots).unwrap();
+        }
         drop(group);
         let err = DbGroup::<H>::open(&config(dir.path())).unwrap_err();
         assert_error(&err, "NOMT Kernel tree's root");
         assert_error(&err, "is neither the flat live DB's");
-        assert_eq!(nomt_roots(dir.path()), ahead);
+        assert_eq!(nomt_roots(dir.path()), ahead, "{recorder}");
 
-        let accessory = Arc::new(AccessoryDb::options().open_in(dir.path()).unwrap());
-        AccessoryDb::rollback(&accessory).unwrap();
-        drop(accessory);
+        if recorder == "ledger DB" {
+            let ledger = Arc::new(crate::ledger::options().open_in(dir.path()).unwrap());
+            crate::ledger::rollback_version(&ledger, SlotNumber::new(2)).unwrap();
+        } else {
+            let accessory = Arc::new(AccessoryDb::options().open_in(dir.path()).unwrap());
+            AccessoryDb::rollback(&accessory).unwrap();
+        }
         let group = open(dir.path());
         assert_eq!(
             group.last_recovery().rolled_back,
-            [RecoveryStep::KernelNomt, RecoveryStep::UserNomt]
+            [RecoveryStep::KernelNomt, RecoveryStep::UserNomt],
+            "{recorder}"
         );
         model.check(&group);
+    }
+
+    // The ledger DB two versions ahead of the live DB (a stray slot after an interrupted
+    // commit): refused, nothing rolled back.
+    {
+        let dir = tempdir();
+        let (_, roots) = crash_after_base(dir.path(), CommitPoint::BeforeLive, &crashed);
+        {
+            let ledger = Arc::new(crate::ledger::options().open_in(dir.path()).unwrap());
+            let slot = LedgerReader::new(ledger.clone(), Vec::new())
+                .materialize_slot(
+                    SlotNumber::new(3),
+                    other_roots,
+                    test_slot_info(SlotNumber::new(3)),
+                    SlotContents::default(),
+                )
+                .unwrap();
+            crate::ledger::commit(&ledger, &slot).unwrap();
+        }
+        let err = DbGroup::<H>::open(&config(dir.path())).unwrap_err();
+        assert_error(&err, "the ledger DB (version Some(3)");
+        assert_error(&err, "cannot be recovered");
+        assert_eq!(nomt_roots(dir.path()), roots);
+        assert_eq!(
+            ledger_head(dir.path()),
+            Some((SlotNumber::new(3), other_roots))
+        );
+    }
+
+    // The ledger DB behind the live DB.
+    {
+        let dir = tempdir();
+        with_base(dir.path());
+        let ledger = Arc::new(crate::ledger::options().open_in(dir.path()).unwrap());
+        crate::ledger::rollback_version(&ledger, SlotNumber::new(1)).unwrap();
+        drop(ledger);
+        let err = DbGroup::<H>::open(&config(dir.path())).unwrap_err();
+        assert_error(&err, "the ledger DB (version Some(0)");
+        assert_error(&err, "cannot be recovered");
     }
 
     // The accessory DB behind the live DB.
@@ -753,25 +879,12 @@ fn open_irreconcilable_dbs_is_error_not_panic() {
         assert_error(&err, "cannot be recovered");
     }
 
-    // The accessory DB, then the archival DB, one version ahead, but with another root than the
-    // live DB's at the live version: refused before anything is rolled back.
-    for archival in [false, true] {
+    // The ledger DB, the accessory DB, then the archival DB, one version ahead, but with another
+    // root than the live DB's at the live version: refused before anything is rolled back.
+    for name in ["ledger DB", "accessory DB", "flat archival DB"] {
         let dir = tempdir();
         let (_, roots) = crash_after_base(dir.path(), CommitPoint::BeforeLive, &crashed);
-        let name = if archival {
-            let flat = FlatStateDb::new(dir.path(), 1000, 1000).unwrap();
-            flat.archival_db()
-                .put::<StateRootHashes>(&SlotNumber::new(1), &other_roots)
-                .unwrap();
-            "flat archival DB"
-        } else {
-            AccessoryDb::options()
-                .open_in(dir.path())
-                .unwrap()
-                .put::<StateRootHashes>(&SlotNumber::new(1), &other_roots)
-                .unwrap();
-            "accessory DB"
-        };
+        set_roots(dir.path(), name, SlotNumber::new(1), other_roots);
         let err = DbGroup::<H>::open(&config(dir.path())).unwrap_err();
         assert_error(&err, &format!("the {name} is at version 2, one after"));
         assert_error(
@@ -781,6 +894,11 @@ fn open_irreconcilable_dbs_is_error_not_panic() {
         assert_error(&err, "cannot be recovered");
         // Nothing rolled back.
         assert_eq!(nomt_roots(dir.path()), roots, "{name}");
+        assert_eq!(
+            ledger_head(dir.path()),
+            Some((SlotNumber::new(2), roots)),
+            "{name}"
+        );
         let accessory = Arc::new(AccessoryDb::options().open_in(dir.path()).unwrap());
         assert_eq!(
             AccessoryDb::latest_version_and_root(&accessory).unwrap(),
@@ -796,19 +914,51 @@ fn open_irreconcilable_dbs_is_error_not_panic() {
         );
     }
 
-    // The accessory and archival DBs one version ahead, with different roots.
-    {
+    // The ledger, accessory and archival DBs one version ahead, one of them with different
+    // roots.
+    for (changed, pair) in [
+        ("ledger DB", "the ledger DB and the accessory DB"),
+        ("accessory DB", "the ledger DB and the accessory DB"),
+        ("flat archival DB", "the ledger DB and the flat archival DB"),
+    ] {
         let dir = tempdir();
         let (_, roots) = crash_after_base(dir.path(), CommitPoint::BeforeLive, &crashed);
-        AccessoryDb::options()
-            .open_in(dir.path())
-            .unwrap()
-            .put::<StateRootHashes>(&SlotNumber::new(2), &other_roots)
-            .unwrap();
+        set_roots(dir.path(), changed, SlotNumber::new(2), other_roots);
         let err = DbGroup::<H>::open(&config(dir.path())).unwrap_err();
+        assert_error(&err, &format!("{pair} are both one version ahead"));
         assert_error(&err, "with different roots");
         assert_error(&err, "cannot be recovered");
-        assert_eq!(nomt_roots(dir.path()), roots);
+        assert_eq!(nomt_roots(dir.path()), roots, "{changed}");
+    }
+}
+
+/// The ledger DB's newest slot and its roots (the databases closed).
+fn ledger_head(dir: &Path) -> Option<(SlotNumber, NomtRoots)> {
+    let ledger = Arc::new(crate::ledger::options().open_in(dir).unwrap());
+    crate::ledger::latest_version_and_root(&ledger).unwrap()
+}
+
+/// Overwrites the roots `name` (a versioned database) records for `version` (the databases
+/// closed).
+fn set_roots(dir: &Path, name: &str, version: SlotNumber, roots: NomtRoots) {
+    match name {
+        "ledger DB" => {
+            let ledger = crate::ledger::options().open_in(dir).unwrap();
+            let mut slot = ledger.get::<SlotByNumber>(&version).unwrap().unwrap();
+            slot.roots = roots;
+            ledger.put::<SlotByNumber>(&version, &slot).unwrap();
+        }
+        "accessory DB" => AccessoryDb::options()
+            .open_in(dir)
+            .unwrap()
+            .put::<StateRootHashes>(&version, &roots)
+            .unwrap(),
+        "flat archival DB" => FlatStateDb::new(dir, 1000, 1000)
+            .unwrap()
+            .archival_db()
+            .put::<StateRootHashes>(&version, &roots)
+            .unwrap(),
+        _ => panic!("not a versioned database: {name}"),
     }
 }
 
@@ -914,6 +1064,7 @@ fn large_block(version: u64) -> BlockWrites {
         user: writes("u"),
         kernel: writes("k"),
         accessory: writes("a"),
+        ledger: SlotContents::default(),
     }
 }
 
@@ -948,7 +1099,7 @@ fn kill_9_child() {
             assert!(version < 1000, "not killed");
             let change_set = large_block(version).change_set(&group, version);
             committing.store(version, Ordering::SeqCst);
-            group.commit(change_set).unwrap();
+            change_set.commit(&mut group).unwrap();
         }
     }
     let point = CommitPoint::COMMIT
@@ -966,7 +1117,7 @@ fn kill_9_child() {
     });
     let mut group = DbGroup::<H>::open_with_hook(&config(&dir), Some(hook)).unwrap();
     let change_set = Kind::UserAndKernel.writes().change_set(&group, 2);
-    let err = group.commit(change_set).unwrap_err();
+    let err = change_set.commit(&mut group).unwrap_err();
     panic!("not killed: {err:#}");
 }
 
