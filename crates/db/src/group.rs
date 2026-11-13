@@ -7,6 +7,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use rockbound::SchemaBatch;
 use rockbound::cache::delta_reader::DeltaReader;
+use rockbound::versioned_db::VersionedDeltaReader;
 use selendra_interface::common::{HexString, SlotNumber};
 use selendra_interface::reexports::digest::Digest;
 use selendra_interface::reexports::digest::typenum::U32;
@@ -19,7 +20,10 @@ use crate::faults::{CommitPoint, Faults};
 use crate::flat::FlatStateDb;
 use crate::historical::{HistoricalStateReader, StateChanges, next_version_after};
 use crate::ledger::{self, LedgerChangeSet, LedgerReader};
-use crate::nomt_state::{NomtRoots, NomtSessionBuilder, NomtStateDb, StateFinishedSession};
+use crate::nomt_state::{
+    CommittedRoots, NomtRoots, NomtSessionBuilder, NomtStateDb, OverlayRef, SharedOverlays,
+    StateFinishedSession, StateOverlay,
+};
 use crate::recovery::{Head, RecoveryReport, root_of};
 use crate::schema::{DbMetadata, MetadataKey};
 
@@ -60,16 +64,94 @@ impl NomtChangeSet {
         self.state.roots()
     }
 
+    /// The roots these changes build on.
+    pub fn prev_roots(&self) -> NomtRoots {
+        self.state.prev_roots()
+    }
+
     /// The NOMT part alone (tests that write the trees past the other databases).
     #[cfg(test)]
     pub(crate) fn into_nomt_overlay(self) -> crate::StateOverlay {
         self.state.into_state_overlay()
     }
+
+    /// Splits a block's changes and its ledger slot into the NOMT overlay and the rest, which
+    /// readers see as snapshots until the block is committed.
+    ///
+    /// # Errors
+    /// If a batch has a range delete: a snapshot reader cannot see one, so the block would read
+    /// differently before and after its commit. (Range deletes are written only straight to the
+    /// databases, by crash recovery's rollbacks and by pruning, never through a change set.)
+    pub(crate) fn into_parts(
+        self,
+        ledger: LedgerChangeSet,
+    ) -> anyhow::Result<(StateOverlay, SnapshotGroup)> {
+        let Self {
+            state,
+            historical_state,
+            accessory,
+        } = self;
+        anyhow::ensure!(
+            !accessory.has_range_ops()
+                && !historical_state.root_hash_batch.has_range_ops()
+                && !ledger.batch().has_range_ops(),
+            "the changes of version {} have a range delete, which readers of uncommitted \
+             snapshots cannot see",
+            historical_state.version()
+        );
+        let overlay = state.into_state_overlay();
+        let snapshot = SnapshotGroup {
+            prev_roots: overlay.prev_roots(),
+            historical: historical_state,
+            accessory: Arc::new(accessory),
+            ledger,
+        };
+        Ok((overlay, snapshot))
+    }
 }
 
-/// The readers a storage needs, all at the same committed version (no uncommitted snapshots).
+/// One block's changes besides its NOMT overlay, as a storage manager keeps them until the
+/// block is committed: readers of later blocks see them as snapshots (the flat store, the
+/// accessory DB, the ledger DB), and [`DbGroup::commit_snapshot`] writes them.
+///
+/// Only point writes and deletes ([`NomtChangeSet::into_parts`] refuses range deletes): a
+/// snapshot reader cannot see a range delete, so crash recovery's rollbacks and pruning, which
+/// use them, write straight to the databases and are never kept here.
+#[derive(Clone)]
+pub(crate) struct SnapshotGroup {
+    historical: StateChanges,
+    accessory: Arc<SchemaBatch>,
+    ledger: LedgerChangeSet,
+    prev_roots: NomtRoots,
+}
+
+impl SnapshotGroup {
+    /// The block's version.
+    pub(crate) fn version(&self) -> SlotNumber {
+        self.historical.version()
+    }
+
+    /// The roots after the block.
+    pub(crate) fn roots(&self) -> NomtRoots {
+        self.historical.root()
+    }
+
+    /// The roots the block builds on.
+    pub(crate) fn prev_roots(&self) -> NomtRoots {
+        self.prev_roots
+    }
+
+    /// The block's ledger slot.
+    pub(crate) fn ledger(&self) -> &LedgerChangeSet {
+        &self.ledger
+    }
+}
+
+/// The readers a storage needs, all at the same version: the newest committed one, plus the
+/// same chain of uncommitted blocks (snapshots and NOMT overlays) if a storage manager built
+/// them on one.
 pub struct StorageReaders<H, K> {
-    /// Opens NOMT sessions on the committed trees.
+    /// Opens NOMT sessions on the committed trees and the blocks' overlays.
     pub session_builder: NomtSessionBuilder<H, K>,
     /// Reads the flat value store.
     pub historical_state: HistoricalStateReader,
@@ -88,8 +170,10 @@ impl<H, K> core::fmt::Debug for StorageReaders<H, K> {
 /// The state databases: the NOMT trees, the flat value store, the ledger DB and the accessory
 /// store.
 ///
-/// Commits are linear (one version after the other, `&mut self`), each with its ledger slot. A
-/// storage manager with forks, uncommitted snapshots and pruning builds on this (later).
+/// Commits are linear (one version after the other, `&mut self`), each with its ledger slot.
+/// The storage manager ([`NomtStorageManager`](crate::NomtStorageManager)) builds forks of
+/// uncommitted blocks on top (readers of the committed state plus uncommitted snapshots) and
+/// commits the finalized ones.
 ///
 /// **Poisoning.** A commit that fails after it started writing (an I/O error, or an injected
 /// fault) leaves the databases at different versions, and the NOMT trees' in-memory roots may
@@ -173,7 +257,7 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         Self::open_with_faults(config, Faults::new(hook))
     }
 
-    fn open_with_faults(config: &StateDbConfig, faults: Faults) -> anyhow::Result<Self> {
+    pub(crate) fn open_with_faults(config: &StateDbConfig, faults: Faults) -> anyhow::Result<Self> {
         let nomt = NomtStateDb::open_no_grow(config)?;
         let mut flat = FlatStateDb::new(
             &config.path,
@@ -225,6 +309,12 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         self.poisoned
     }
 
+    /// Runs this instance's commit hook at `point` (points of the storage manager's
+    /// finalization, between the commits of its blocks).
+    pub(crate) fn hit(&self, point: CommitPoint) -> anyhow::Result<()> {
+        self.faults.hit(point)
+    }
+
     fn ensure_not_poisoned(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.poisoned,
@@ -274,20 +364,103 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
     }
 
     /// Readers of the committed state, all at the newest committed version. They see later
-    /// commits only through their unbound reads.
+    /// commits only through their unbound reads. (The storage manager's readers add uncommitted
+    /// blocks.)
     ///
     /// # Errors
     /// If the databases are poisoned ([`is_poisoned`](Self::is_poisoned)), or on read errors.
-    pub fn readers<K>(&self) -> anyhow::Result<StorageReaders<H, K>> {
+    pub fn readers<K: Clone>(&self) -> anyhow::Result<StorageReaders<H, K>> {
+        let (readers, _ledger) = self.readers_at(&[], SharedOverlays::default())?;
+        Ok(readers)
+    }
+
+    /// Readers of the newest committed state plus the uncommitted blocks `chain_oldest_first`
+    /// (each block's key in `overlays`, the map of NOMT overlays shared with the storage manager,
+    /// and its snapshot), and a ledger reader with the same blocks. The blocks' versions must
+    /// follow the newest committed version one by one (from genesis if nothing is committed),
+    /// each building on the roots of the one before it, the first on the committed roots.
+    ///
+    /// # Errors
+    /// If the databases are poisoned, if the blocks are not such a chain (upstream did not
+    /// check: a gap or a wrong order made the readers see wrong versions, and their version
+    /// computation could overflow), or on read errors.
+    pub(crate) fn readers_at<K: Clone>(
+        &self,
+        chain_oldest_first: &[(K, &SnapshotGroup)],
+        overlays: SharedOverlays<K>,
+    ) -> anyhow::Result<(StorageReaders<H, K>, LedgerReader)> {
         self.ensure_not_poisoned()?;
-        Ok(StorageReaders {
-            session_builder: NomtSessionBuilder::from_committed(self.nomt.clone()),
-            historical_state: self.flat.reader()?,
-            accessory: AccessoryDb::with_reader(DeltaReader::new(
-                self.accessory.clone(),
-                Vec::new(),
-            )),
-        })
+        let live = self.flat.latest_version_and_root_live()?;
+        let base = live.map(|(version, _)| version);
+        let mut prev_roots = root_of(live);
+        for (index, (_, snapshot)) in chain_oldest_first.iter().enumerate() {
+            let index = u64::try_from(index).context("chain length overflow")?;
+            // Genesis is the first version if nothing is committed (critique: not `base + 1`).
+            let expected = match base {
+                Some(base) => index.checked_add(1).and_then(|n| base.checked_add(n)),
+                None => Some(SlotNumber::new(index)),
+            };
+            anyhow::ensure!(
+                Some(snapshot.version()) == expected,
+                "block {index} of the uncommitted chain is for version {}, but the version after \
+                 the newest committed one ({:?}) and the {index} blocks before it is {:?}",
+                snapshot.version(),
+                base.map(|v| v.get()),
+                expected.map(|v| v.get())
+            );
+            anyhow::ensure!(
+                snapshot.prev_roots() == prev_roots,
+                "block {index} of the uncommitted chain (version {}) builds on roots ({}) other \
+                 than those of the block before it ({prev_roots})",
+                snapshot.version(),
+                snapshot.prev_roots()
+            );
+            prev_roots = snapshot.roots();
+        }
+
+        // Oldest first, as the rockbound readers expect.
+        let count = chain_oldest_first.len();
+        let (mut user, mut kernel, mut roots, mut accessory, mut ledger) = (
+            Vec::with_capacity(count),
+            Vec::with_capacity(count),
+            Vec::with_capacity(count),
+            Vec::with_capacity(count),
+            Vec::with_capacity(count),
+        );
+        for (_, snapshot) in chain_oldest_first {
+            user.push(snapshot.historical.user.clone());
+            kernel.push(snapshot.historical.kernel.clone());
+            roots.push(snapshot.historical.root_hash_batch.clone());
+            accessory.push(snapshot.accessory.clone());
+            ledger.push(snapshot.ledger.batch().clone());
+        }
+        // Newest first, as NOMT expects.
+        let refs = chain_oldest_first
+            .iter()
+            .rev()
+            .map(|(key, snapshot)| OverlayRef {
+                key: key.clone(),
+                version: snapshot.version(),
+                roots: snapshot.roots(),
+            })
+            .collect();
+        let base_version = base.map(|version| version.get());
+        let historical_state = HistoricalStateReader::new(
+            VersionedDeltaReader::new(self.flat.user_db().clone(), base_version, user),
+            VersionedDeltaReader::new(self.flat.kernel_db().clone(), base_version, kernel),
+            DeltaReader::new(self.flat.live_db().clone(), roots),
+        )?;
+        let readers = StorageReaders {
+            session_builder: NomtSessionBuilder::new(
+                self.nomt.clone(),
+                refs,
+                overlays,
+                CommittedRoots::new(self.flat.live_db().clone()),
+            ),
+            historical_state,
+            accessory: AccessoryDb::with_snapshots(self.accessory.clone(), base, accessory),
+        };
+        Ok((readers, LedgerReader::new(self.ledger.clone(), ledger)))
     }
 
     /// A reader of the committed ledger (no uncommitted snapshots): its newest slot is the
@@ -331,12 +504,42 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         ledger: LedgerChangeSet,
     ) -> anyhow::Result<()> {
         self.ensure_not_poisoned()?;
-        let NomtChangeSet {
-            state,
-            historical_state,
-            accessory,
-        } = change_set;
+        let (overlay, snapshot) = change_set.into_parts(ledger)?;
+        self.commit_snapshot(overlay, &snapshot)
+    }
 
+    /// [`commit`](Self::commit) of a block kept by the storage manager: its NOMT overlay and its
+    /// snapshot. Runs [`check_snapshot`](Self::check_snapshot) first.
+    pub(crate) fn commit_snapshot(
+        &mut self,
+        overlay: StateOverlay,
+        snapshot: &SnapshotGroup,
+    ) -> anyhow::Result<()> {
+        self.check_snapshot(&overlay, snapshot)?;
+        let version = snapshot.version();
+        let written = self.write(overlay, snapshot);
+        if let Err(error) = &written {
+            self.poisoned = true;
+            tracing::error!(
+                %version,
+                error = format!("{error:#}"),
+                "A commit of the state databases failed after it started writing: they are \
+                 poisoned until reopened"
+            );
+        }
+        written
+    }
+
+    /// The checks of [`commit`](Self::commit) before anything is written (see its errors): a
+    /// block that fails them can be kept and committed later.
+    pub(crate) fn check_snapshot(
+        &self,
+        overlay: &StateOverlay,
+        snapshot: &SnapshotGroup,
+    ) -> anyhow::Result<()> {
+        self.ensure_not_poisoned()?;
+        let historical_state = &snapshot.historical;
+        let ledger = &snapshot.ledger;
         let live = self.flat.latest_version_and_root_live()?;
         let expected = next_version_after(live.map(|(version, _)| version))?;
         anyhow::ensure!(
@@ -361,16 +564,16 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             live.map(|(version, _)| version)
         );
         anyhow::ensure!(
-            state.prev_roots() == root_of(live),
+            overlay.prev_roots() == root_of(live),
             "the change set builds on roots ({}) other than the committed ones ({})",
-            state.prev_roots(),
+            overlay.prev_roots(),
             root_of(live)
         );
         anyhow::ensure!(
-            state.roots() == historical_state.root(),
+            overlay.roots() == historical_state.root(),
             "the change set's root ({}) is not its NOMT sessions' ({})",
             historical_state.root(),
-            state.roots()
+            overlay.roots()
         );
         anyhow::ensure!(
             ledger.version() == expected && ledger.roots() == historical_state.root(),
@@ -380,29 +583,11 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             ledger.roots(),
             historical_state.root()
         );
-        ledger::check_builds_on_head(&self.ledger, &ledger)?;
-
-        let written = self.write(state, historical_state, &ledger, &accessory);
-        if let Err(error) = &written {
-            self.poisoned = true;
-            tracing::error!(
-                version = %expected,
-                error = format!("{error:#}"),
-                "A commit of the state databases failed after it started writing: they are \
-                 poisoned until reopened"
-            );
-        }
-        written
+        ledger::check_builds_on_head(&self.ledger, ledger)
     }
 
     /// The writes of [`commit`](Self::commit), in order, with the fault points in between.
-    fn write(
-        &mut self,
-        state: StateFinishedSession,
-        historical_state: StateChanges,
-        ledger: &LedgerChangeSet,
-        accessory: &SchemaBatch,
-    ) -> anyhow::Result<()> {
+    fn write(&mut self, overlay: StateOverlay, snapshot: &SnapshotGroup) -> anyhow::Result<()> {
         // ======================= DANGER ZONE ======================
         // The commit order (NOMT kernel, NOMT user, ledger, accessory, flat archival, flat
         // live) is relied on by the prover's proofs of the newest committed state and by
@@ -410,20 +595,20 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         // poisons the databases.
         self.faults.hit(CommitPoint::BeforeKernelNomt)?;
         self.nomt
-            .commit(state.into_state_overlay(), &self.faults)
+            .commit(overlay, &self.faults)
             .context("NOMT commit")?;
         self.faults.hit(CommitPoint::BeforeLedger)?;
-        ledger::commit(&self.ledger, ledger).context("ledger DB commit")?;
+        ledger::commit(&self.ledger, &snapshot.ledger).context("ledger DB commit")?;
         self.faults.hit(CommitPoint::BeforeAccessory)?;
         AccessoryDb::commit(
             &self.accessory,
-            accessory,
-            &historical_state.root_hash_batch,
+            &snapshot.accessory,
+            &snapshot.historical.root_hash_batch,
         )
         .context("accessory DB commit")?;
         self.faults.hit(CommitPoint::BeforeArchival)?;
         self.flat
-            .commit_with_faults(historical_state, &self.faults)
+            .commit_with_faults(&snapshot.historical, &self.faults)
             .context("flat state commit")?;
         self.faults.hit(CommitPoint::AfterLive)
         // ===================== END DANGER ZONE ====================
@@ -517,10 +702,10 @@ mod tests {
     use sha2::Sha256;
 
     use super::*;
-    use crate::harness::test_slot_info;
+    use crate::harness::{empty_slot, test_slot_info};
     use crate::ledger::SlotContents;
-    use crate::test_utils::blocks::{block, change_set, key, value};
-    use crate::{RecoveryStep, fail_at};
+    use crate::test_utils::blocks::{block, change_set, change_set_on, key, value};
+    use crate::{RecoveryStep, WitnessMode, fail_at};
 
     type H = Sha256;
 
@@ -862,6 +1047,142 @@ mod tests {
             );
             change_set.commit(&mut group).unwrap();
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Uncommitted blocks.
+
+    /// Three uncommitted blocks on `group` (versions after the committed one), each on the one
+    /// before, writing `[version]` at `k`: their overlays (in `overlays`) and snapshots.
+    fn uncommitted_chain(
+        group: &DbGroup<H>,
+        overlays: &SharedOverlays<u64>,
+        first: u64,
+    ) -> Vec<(u64, SnapshotGroup)> {
+        let mut snapshots: Vec<(u64, SnapshotGroup)> = Vec::new();
+        for version in first..first + 3 {
+            let chain: Vec<(u64, &SnapshotGroup)> = snapshots
+                .iter()
+                .map(|(key, snapshot)| (*key, snapshot))
+                .collect();
+            let (readers, ledger) = group.readers_at(&chain, overlays.clone()).unwrap();
+            let byte = u8::try_from(version).unwrap();
+            let state = change_set_on(
+                &readers,
+                version,
+                vec![(key(b"k1"), value(&[byte]))],
+                vec![],
+                vec![(key(b"a1"), value(&[byte]))],
+            );
+            let slot = empty_slot(&ledger, SlotNumber::new(version), state.roots());
+            let (overlay, snapshot) = state.into_parts(slot).unwrap();
+            overlays.write().unwrap().insert(version, overlay);
+            snapshots.push((version, snapshot));
+        }
+        snapshots
+    }
+
+    /// B15: `readers_at` takes uncommitted blocks only as a chain whose versions follow the
+    /// committed one by one, each on the roots of the one before (upstream checked neither: a
+    /// gap or a wrong order gave readers of wrong versions, and their version computation could
+    /// overflow). On empty databases the chain starts at genesis (critique #3: not at
+    /// `base + 1`).
+    #[test]
+    fn readers_at_rejects_non_consecutive_snapshots() {
+        let tempdir = crate::test_utils::tempdir();
+        let mut group = open(&tempdir);
+        let overlays: SharedOverlays<u64> = Arc::default();
+        let chain = uncommitted_chain(&group, &overlays, 0);
+        let block = |i: usize| (chain[i].0, &chain[i].1);
+        let read = |group: &DbGroup<H>, blocks: &[(u64, &SnapshotGroup)]| {
+            let (readers, ledger) = group.readers_at(blocks, overlays.clone()).unwrap();
+            let user = readers
+                .historical_state
+                .get_value(ProvableNamespace::User, &key(b"k1"))
+                .unwrap();
+            let accessory = readers
+                .accessory
+                .get_value_bound(&key(b"a1"), SlotNumber::MAX)
+                .unwrap();
+            assert_eq!(user, accessory);
+            let session = readers
+                .session_builder
+                .begin_both_sessions(WitnessMode::Off);
+            let nomt_root = session.unwrap().user.prev_root().into_inner();
+            (
+                readers.historical_state.last_version(),
+                user,
+                ledger.head().unwrap().map(|(slot, _)| slot),
+                nomt_root,
+            )
+        };
+        assert_eq!(
+            read(&group, &[block(0), block(1), block(2)]),
+            (
+                Some(SlotNumber::new(2)),
+                value(&[2]),
+                Some(SlotNumber::new(2)),
+                chain[2].1.roots().user
+            )
+        );
+        assert_eq!(read(&group, &[block(0)]).0, Some(SlotNumber::GENESIS));
+        assert_eq!(read(&group, &[]).0, None);
+
+        // A block on other roots than the one before it, at the right version.
+        let (readers, ledger) = group.readers_at(&[], overlays.clone()).unwrap();
+        let other = change_set_on(&readers, 1, vec![(key(b"x1"), value(b"x"))], vec![], vec![]);
+        let slot = empty_slot(&ledger, SlotNumber::new(0), other.roots());
+        let (_, other) = other.into_parts(slot).unwrap();
+        let err = group
+            .readers_at(&[block(0), (9, &other)], overlays.clone())
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("other than those of the block before"),
+            "{err:#}"
+        );
+
+        for blocks in [
+            vec![block(1)],
+            vec![block(0), block(2)],
+            vec![block(1), block(0)],
+            vec![block(0), block(0)],
+            vec![block(0), block(1), block(2), block(2)],
+        ] {
+            let err = group.readers_at(&blocks, overlays.clone()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("of the uncommitted chain is for version"),
+                "{err:#}"
+            );
+        }
+
+        // Block 0 committed: the chain starts at version 1 now.
+        let overlay = overlays.write().unwrap().remove(&0).unwrap();
+        group.commit_snapshot(overlay, &chain[0].1).unwrap();
+        assert_eq!(read(&group, &[block(1), block(2)]).1, value(&[2]));
+        assert!(group.readers_at(&[block(0)], overlays.clone()).is_err());
+        assert!(group.readers_at(&[block(2)], overlays.clone()).is_err());
+    }
+
+    /// Critique #21: a change set with a range delete is refused before anything is written: a
+    /// reader of the block's snapshot would not see the range delete (range deletes are
+    /// written only straight to the databases, by rollbacks and pruning).
+    #[test]
+    fn change_set_with_range_delete_is_refused() {
+        let tempdir = crate::test_utils::tempdir();
+        let mut group = open(&tempdir);
+        let mut block = block(&group, 0, vec![(key(b"k1"), value(b"v"))], vec![], vec![]);
+        block
+            .state
+            .accessory
+            .delete_range::<crate::schema::ModuleAccessoryState>(
+                &(b"a".as_slice(), SlotNumber::GENESIS),
+                &(b"b".as_slice(), SlotNumber::GENESIS),
+            )
+            .unwrap();
+        let err = block.commit(&mut group).unwrap_err();
+        assert!(format!("{err:#}").contains("range delete"), "{err:#}");
+        assert!(!group.is_poisoned());
+        assert_eq!(group.latest_version().unwrap(), None);
     }
 
     // ---------------------------------------------------------------------------------------

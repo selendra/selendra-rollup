@@ -210,7 +210,7 @@ fn get_with_proof_retries_when_a_commit_is_reverted_during_the_read() {
         let v = match step {
             FetchStep::RootRead => 11,
             FetchStep::ValueRead => 10,
-            FetchStep::BeforeSession => return,
+            FetchStep::BeforeSession | FetchStep::AfterSessionOpen => return,
         };
         roots.push(set(&mut dbs, v));
     });
@@ -219,7 +219,8 @@ fn get_with_proof_retries_when_a_commit_is_reverted_during_the_read() {
         [
             FetchStep::RootRead,
             FetchStep::ValueRead,
-            FetchStep::BeforeSession
+            FetchStep::BeforeSession,
+            FetchStep::AfterSessionOpen
         ]
     );
     // The scenario: the user root is back to the first one, at a newer version.
@@ -264,7 +265,8 @@ fn get_with_proof_retries_when_a_commit_lands_before_the_session() {
         [
             FetchStep::RootRead,
             FetchStep::ValueRead,
-            FetchStep::BeforeSession
+            FetchStep::BeforeSession,
+            FetchStep::AfterSessionOpen
         ]
     );
     assert!(matches!(attempt, Err(GetWithProofError::StateRootMismatch)));
@@ -311,7 +313,8 @@ fn get_with_proof_does_not_wait_for_a_commit_paused_before_live() {
             [
                 FetchStep::RootRead,
                 FetchStep::ValueRead,
-                FetchStep::BeforeSession
+                FetchStep::BeforeSession,
+                FetchStep::AfterSessionOpen
             ]
         );
         assert!(matches!(attempt, Err(GetWithProofError::StateRootMismatch)));
@@ -742,7 +745,8 @@ fn read_and_write(state: &mut StateCheckpoint<Prover>) {
 }
 
 /// A previous root other than the storage's is an error in both witness modes (upstream
-/// checked it only in strict mode), and so is computing a state update on a stale storage.
+/// checked it only in strict mode), and computing a state update on a stale storage is a typed
+/// [`StaleStorage`] error (whatever root is passed), so callers can retry with a new storage.
 #[test]
 fn a_stale_previous_root_or_storage_is_rejected() {
     let mut dbs = populated();
@@ -760,7 +764,8 @@ fn a_stale_previous_root_or_storage_is_rejected() {
             let err = storage
                 .compute_state_update(accesses.clone(), &witness, stale)
                 .unwrap_err();
-            assert!(err.to_string().contains("stale storage"), "{err}");
+            assert!(err.to_string().contains("wrong previous root"), "{err}");
+            assert!(err.downcast_ref::<StaleStorage>().is_none(), "{err}");
         }
         // No proof hint was added.
         assert_eq!(witness.len(), read_hints);
@@ -782,6 +787,14 @@ fn a_stale_previous_root_or_storage_is_rejected() {
             .compute_state_update(accesses.clone(), &witness, root)
             .unwrap_err();
         assert!(err.to_string().contains("stale storage"), "{err}");
+        assert_eq!(
+            err.downcast_ref::<StaleStorage>(),
+            Some(&StaleStorage {
+                storage_version: Some(SlotNumber::GENESIS),
+                committed_version: Some(SlotNumber::new(1)),
+                discarded_fork: false,
+            })
+        );
     }
 }
 

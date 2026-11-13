@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Context;
 use rockbound::cache::delta_reader::DeltaReader;
 use rockbound::rocksdb::ColumnFamilyDescriptor;
 use rockbound::{SchemaBatch, rocksdb};
@@ -69,7 +70,20 @@ pub(crate) fn ensure_version_is_correct(
 /// are exact until pruned.
 #[derive(Clone, Debug)]
 pub struct AccessoryDb {
+    /// The database plus the snapshots, merged.
     db: DeltaReader,
+    /// For [`get_value_bound`](Self::get_value_bound): the database alone, the version it was at
+    /// when the snapshots were taken, and the snapshots (`None`: not known, as for
+    /// [`with_reader`](Self::with_reader)).
+    layers: Option<Layers>,
+}
+
+#[derive(Clone, Debug)]
+struct Layers {
+    committed: DeltaReader,
+    base: Option<SlotNumber>,
+    /// Oldest first: the versions after `base`, one each.
+    snapshots: Vec<Arc<SchemaBatch>>,
 }
 
 impl AccessoryDb {
@@ -88,13 +102,35 @@ impl AccessoryDb {
         }
     }
 
-    /// A reader over `reader` (the accessory database and its snapshots).
+    /// A reader over `reader` (the accessory database and its snapshots). Its bound reads are
+    /// its merged reads ([`get_value_option`](Self::get_value_option)).
     pub fn with_reader(reader: DeltaReader) -> Self {
-        Self { db: reader }
+        Self {
+            db: reader,
+            layers: None,
+        }
     }
 
-    /// The value of `key` at `version`: the newest write at or below it (`None` if absent or
-    /// deleted).
+    /// A reader of `db` at version `base` (`None`: empty) plus `snapshots`, the batches of the
+    /// versions after it, oldest first, one each.
+    pub(crate) fn with_snapshots(
+        db: Arc<rockbound::DB>,
+        base: Option<SlotNumber>,
+        snapshots: Vec<Arc<SchemaBatch>>,
+    ) -> Self {
+        Self {
+            db: DeltaReader::new(db.clone(), snapshots.clone()),
+            layers: Some(Layers {
+                committed: DeltaReader::new(db, Vec::new()),
+                base,
+                snapshots,
+            }),
+        }
+    }
+
+    /// The value of `key` at `version`: the newest write at or below it, in the snapshots or
+    /// the database (`None` if absent or deleted). Unbound: the database's rows after the
+    /// snapshots' base version count too, even if another fork's block wrote them.
     pub fn get_value_option(
         &self,
         key: &SlotKey,
@@ -105,6 +141,50 @@ impl AccessoryDb {
             version,
             self.db
                 .get_prev::<ModuleAccessoryState>(&(key.as_ref(), version))?,
+        )
+    }
+
+    /// The value of `key` at `version`, a version this reader sees: its newest write in the
+    /// snapshots of the versions up to `version`, else in the database at `version` or at the
+    /// snapshots' base version, whichever is older.
+    ///
+    /// The snapshots hold every write after the base version, so the database's rows after it
+    /// are not this reader's: they may be another fork's block of the same version, committed
+    /// after the snapshots' block was discarded (the merged read,
+    /// [`get_value_option`](Self::get_value_option), would read them as this reader's).
+    pub(crate) fn get_value_bound(
+        &self,
+        key: &SlotKey,
+        version: SlotNumber,
+    ) -> anyhow::Result<Option<SlotValue>> {
+        let Some(layers) = &self.layers else {
+            return self.get_value_option(key, version);
+        };
+        for (index, snapshot) in layers.snapshots.iter().enumerate().rev() {
+            let index = u64::try_from(index).context("snapshot index overflow")?;
+            let snapshot_version = match layers.base {
+                Some(base) => index.checked_add(1).and_then(|n| base.checked_add(n)),
+                None => Some(SlotNumber::new(index)),
+            }
+            .ok_or_else(|| anyhow::anyhow!("snapshot version overflow"))?;
+            if snapshot_version > version {
+                continue;
+            }
+            let row = (key.as_ref().to_vec(), snapshot_version);
+            if let Some(value) = snapshot.get_value::<ModuleAccessoryState>(&row)? {
+                return Ok(value);
+            }
+        }
+        let Some(base) = layers.base else {
+            return Ok(None);
+        };
+        let db_version = version.min(base);
+        ensure_version_is_correct(
+            key.as_ref(),
+            db_version,
+            layers
+                .committed
+                .get_prev::<ModuleAccessoryState>(&(key.as_ref(), db_version))?,
         )
     }
 

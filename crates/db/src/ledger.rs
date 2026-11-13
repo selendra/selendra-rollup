@@ -107,6 +107,11 @@ impl LedgerChangeSet {
     pub fn slot(&self) -> &StoredSlot {
         &self.slot
     }
+
+    /// The slot's writes (kept as a snapshot until committed).
+    pub(crate) fn batch(&self) -> &Arc<SchemaBatch> {
+        &self.batch
+    }
 }
 
 /// The first number of each kind of item of the slot after `head` (zeros on an empty ledger).
@@ -524,15 +529,14 @@ pub(crate) fn root_at(db: &DB, version: SlotNumber) -> anyhow::Result<Option<Nom
     Ok(db.get::<SlotByNumber>(&version)?.map(|slot| slot.roots))
 }
 
-/// Checks, before anything of a commit is written, that `change_set` is the slot after the
-/// ledger DB's newest one: its items numbered from the newest slot's ranges on, and its DA
-/// block not already a slot.
-pub(crate) fn check_builds_on_head(
-    db: &Arc<DB>,
+/// Checks that `change_set` numbers its items from the next numbers after `parent` (the slot it
+/// was built on; `None`: the empty ledger). `what` names the parent in the error.
+pub(crate) fn check_numbered_after(
+    parent: Option<&StoredSlot>,
     change_set: &LedgerChangeSet,
+    what: &str,
 ) -> anyhow::Result<()> {
-    let head = DeltaReader::new(db.clone(), Vec::new()).get_largest::<SlotByNumber>()?;
-    let expected = next_numbers(head.as_ref().map(|(_, slot)| slot));
+    let expected = next_numbers(parent);
     let slot = &change_set.slot;
     let first = (
         slot.batches.start,
@@ -543,10 +547,27 @@ pub(crate) fn check_builds_on_head(
     anyhow::ensure!(
         first == expected,
         "the ledger change set of slot {} numbers its (batches, transactions, events, discarded \
-         blobs) from {first:?}, but the ledger DB's next numbers are {expected:?}: it was not \
-         built on the committed ledger",
+         blobs) from {first:?}, but the next numbers after {what} are {expected:?}: it was not \
+         built on {what}",
         change_set.slot_number
     );
+    Ok(())
+}
+
+/// Checks, before anything of a commit is written, that `change_set` is the slot after the
+/// ledger DB's newest one: its items numbered from the newest slot's ranges on, and its DA
+/// block not already a slot.
+pub(crate) fn check_builds_on_head(
+    db: &Arc<DB>,
+    change_set: &LedgerChangeSet,
+) -> anyhow::Result<()> {
+    let head = DeltaReader::new(db.clone(), Vec::new()).get_largest::<SlotByNumber>()?;
+    check_numbered_after(
+        head.as_ref().map(|(_, slot)| slot),
+        change_set,
+        "the committed ledger DB's newest slot",
+    )?;
+    let slot = &change_set.slot;
     if let Some(existing) = db.get::<SlotByHash>(&slot.da_hash)? {
         anyhow::bail!(
             "the ledger change set of slot {} is for the DA block {}, already slot {existing}",

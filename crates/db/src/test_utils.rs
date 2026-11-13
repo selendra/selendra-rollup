@@ -93,7 +93,7 @@ pub(crate) mod blocks {
     use crate::ledger::{BatchContents, LedgerChangeSet, SlotContents, TxContents};
     use crate::{
         AccessoryDb, DbGroup, FlatStateDb, HistoricalStateReader, NomtChangeSet, NomtRoots,
-        StateFinishedSession, WitnessMode,
+        StateFinishedSession, StorageReaders, WitnessMode,
     };
 
     /// One namespace's writes (`None`: delete).
@@ -235,9 +235,24 @@ pub(crate) mod blocks {
         kernel: Writes,
         accessory: Writes,
     ) -> NomtChangeSet {
-        let sessions = group
-            .readers::<u64>()
-            .expect("readers")
+        let readers = group.readers::<u64>().expect("readers");
+        change_set_on(&readers, version, user, kernel, accessory)
+    }
+
+    /// A block's state change set on top of the state `readers` see (committed state and
+    /// uncommitted blocks).
+    pub(crate) fn change_set_on<H, K>(
+        readers: &StorageReaders<H, K>,
+        version: u64,
+        user: Writes,
+        kernel: Writes,
+        accessory: Writes,
+    ) -> NomtChangeSet
+    where
+        H: Digest<OutputSize = U32> + Send + Sync,
+        K: Eq + std::hash::Hash,
+    {
+        let sessions = readers
             .session_builder
             .begin_both_sessions(WitnessMode::Off)
             .expect("NOMT sessions");

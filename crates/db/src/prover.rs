@@ -33,6 +33,44 @@ mod tests;
 
 type NomtSession<H> = Session<BinaryHasher<H>>;
 
+/// A storage that can no longer compute a state update or open a NOMT session: a newer version
+/// was committed after it was created (it is *stale*: NOMT keeps only the newest trees), or its
+/// blocks were discarded by a finalization on another fork (`discarded_fork`).
+///
+/// [`compute_state_update`](Storage::compute_state_update) and
+/// [`get_with_proof`](NativeStorage::get_with_proof) return it inside their `anyhow::Error`
+/// (`downcast_ref::<StaleStorage>()`): the caller retries with a new storage (upstream's
+/// sequencer `expect`ed here). `get_with_proof` does not retry it itself, since waiting does not
+/// help. The storage's bound reads still see its own version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleStorage {
+    /// The storage's version (`None`: it sees an empty state).
+    pub storage_version: Option<SlotNumber>,
+    /// The newest committed version when the error was raised.
+    pub committed_version: Option<SlotNumber>,
+    /// Whether the storage's uncommitted blocks were discarded (another fork was finalized).
+    pub discarded_fork: bool,
+}
+
+impl fmt::Display for StaleStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = if self.discarded_fork {
+            "it is on a discarded fork"
+        } else {
+            "a newer version was committed"
+        };
+        write!(
+            f,
+            "stale storage (version {:?}, newest committed version {:?}): {reason}; create a \
+             new storage",
+            self.storage_version.map(|v| v.get()),
+            self.committed_version.map(|v| v.get())
+        )
+    }
+}
+
+impl std::error::Error for StaleStorage {}
+
 /// Why one attempt of [`NativeStorage::get_with_proof`] failed.
 #[derive(Debug)]
 pub(crate) enum GetWithProofError {
@@ -52,6 +90,8 @@ pub(crate) enum FetchStep {
     /// After the second read of the newest root, before the NOMT session is opened (between
     /// steps 3 and 4): the last point before the attempt may block behind a commit.
     BeforeSession,
+    /// Right after the NOMT session is opened (step 4), before the roots are compared.
+    AfterSessionOpen,
 }
 
 impl fmt::Display for GetWithProofError {
@@ -74,12 +114,18 @@ impl From<anyhow::Error> for GetWithProofError {
 /// A [`Storage`] for native execution (the node and the prover), on the NOMT state trees and the
 /// flat value store ([`DbGroup`](crate::DbGroup)).
 ///
-/// A storage is a view of the state as of one committed version (its
-/// [`latest_version`](NativeStorage::latest_version)): its reads ([`Storage::get`],
-/// [`Storage::get_leaf`], [`NativeStorage::get_accessory`]) keep returning that version's values
-/// after newer versions are committed (through the flat store's archival rows). Its state
-/// update can only be computed while it is the newest committed version: NOMT keeps no history,
-/// so [`compute_state_update`](Storage::compute_state_update) of a stale storage fails.
+/// A storage is a view of the state as of one version (its
+/// [`latest_version`](NativeStorage::latest_version)): the newest committed version, plus the
+/// uncommitted blocks a storage manager built it on (snapshots of the flat store, the accessory
+/// DB and the ledger, and NOMT overlays). Its reads ([`Storage::get`], [`Storage::get_leaf`],
+/// [`NativeStorage::get_accessory`]) keep returning that version's values after newer versions
+/// are committed (through the flat store's archival rows and its own snapshots), also after its
+/// blocks were discarded. Its state update can only be computed while its base is the newest
+/// committed version: NOMT keeps no history, so
+/// [`compute_state_update`](Storage::compute_state_update) of a stale storage fails with
+/// [`StaleStorage`].
+///
+/// Storages are `Clone + Send + Sync` and outlive the storage manager's finalizations.
 ///
 /// # Witness
 /// With [`WitnessMode::On`] it records the hints of the witness protocol (see
@@ -242,6 +288,15 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
         }
     }
 
+    /// The root of the state this storage sees (the pre-genesis root if it is empty): the root
+    /// to pass to [`compute_state_update`](Storage::compute_state_update).
+    ///
+    /// # Errors
+    /// If no root is stored for its version, or on read errors.
+    pub fn root(&self) -> anyhow::Result<StorageRoot<S>> {
+        self.own_root()
+    }
+
     /// Whether this storage sees an empty state (no version committed before it was created).
     pub fn is_empty(&self) -> bool {
         self.historical_state.get_next_version() == SlotNumber::GENESIS
@@ -250,6 +305,12 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
     /// Whether this storage records a witness.
     pub fn witness_mode(&self) -> WitnessMode {
         self.witness_mode
+    }
+
+    /// The session builder (tests that hold NOMT sessions).
+    #[cfg(test)]
+    pub(crate) fn session_builder(&self) -> &NomtSessionBuilder<S::Hasher, K> {
+        &self.session_builder
     }
 
     /// `witness` if this storage records one.
@@ -289,8 +350,9 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
     }
 
     /// The result of a read that cannot observe [`HistoricalValueError::PrunedVersion`] (unbound
-    /// reads: they read the newest committed state, never the archival rows; accessory reads;
-    /// root reads): the value, or a panic on a database error, since `None` means "absent".
+    /// reads: they read the newest state, committed or in this storage's snapshots, never the
+    /// archival rows; accessory reads; root reads): the value, or a panic on a database error,
+    /// since `None` means "absent".
     fn resolve_unbound_read<T>(
         result: anyhow::Result<Option<T>>,
         source: &'static str,
@@ -310,7 +372,8 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
         }
     }
 
-    /// The newest committed value of `key` in a provable namespace (unbound).
+    /// The newest value of `key` in a provable namespace (unbound): committed, or in this
+    /// storage's snapshots newer than the committed version.
     fn read_provable_value_unbound(
         &self,
         namespace: ProvableNamespace,
@@ -319,7 +382,8 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
         self.historical_state.get_value_unbound(namespace, key)
     }
 
-    /// The newest committed value of `key` (unbound); panics on a database error.
+    /// The newest value of `key` (unbound: committed, or in this storage's snapshots); panics on
+    /// a database error.
     fn read_value_unbound<N: CompileTimeNamespace>(&self, key: &SlotKey) -> Option<SlotValue> {
         match N::NAMESPACE {
             Namespace::User => Self::resolve_unbound_read(
@@ -357,7 +421,7 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
             Namespace::Kernel => provable(ProvableNamespace::Kernel),
             Namespace::Accessory => self
                 .accessory
-                .get_value_option(key, resolved_version.unwrap_or(self.latest_version())),
+                .get_value_bound(key, resolved_version.unwrap_or(self.latest_version())),
         }
     }
 
@@ -376,7 +440,7 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
         Ok(value.map(NodeLeafAndMaybeValue::with_fetched_value::<S::Hasher>))
     }
 
-    /// The newest committed version and its root (unbound).
+    /// The newest version and its root (unbound: committed, or of this storage's snapshots).
     fn latest_root_and_version_unbound(
         &self,
     ) -> anyhow::Result<Option<(SlotNumber, StorageRoot<S>)>> {
@@ -415,15 +479,18 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
 
     /// One attempt of [`NativeStorage::get_with_proof`].
     ///
-    /// NOMT keeps only the newest tree, so the proof is of the newest committed state, and the
-    /// value must be read from the flat store at the same version. They are committed one
-    /// after the other ([`DbGroup::commit`](crate::DbGroup::commit): NOMT first, the flat live
-    /// DB last), so:
+    /// NOMT keeps only the newest tree, so the proof is of the newest state: the newest
+    /// committed one, or the newest of this storage's uncommitted blocks if it has any (unbound
+    /// reads see both: the newest committed version or a newer one of this storage's
+    /// snapshots). The value must be read from the flat store at the same version. They are
+    /// committed one after the other ([`DbGroup::commit`](crate::DbGroup::commit): NOMT first,
+    /// the flat live DB last), so:
     /// 1. read the newest root from the flat store;
-    /// 2. read the value from the flat store (unbound: the newest committed value, not this
-    ///    storage's version);
+    /// 2. read the value from the flat store (unbound: the newest value, not this storage's
+    ///    version);
     /// 3. read the newest root from the flat store again;
-    /// 4. open a NOMT session (NOMT cannot commit while it is open);
+    /// 4. open a NOMT session (NOMT cannot commit while it is open; a storage manager's
+    ///    finalization holds the overlays lock while it commits, so the session waits for it);
     /// 5. if the two flat-store reads give different versions or roots, or NOMT's root differs
     ///    from theirs, a commit was in progress: [`GetWithProofError::StateRootMismatch`]
     ///    (retry);
@@ -441,8 +508,8 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
     }
 
     /// [`get_with_proof_once`](Self::get_with_proof_once), calling `between` at each
-    /// [`FetchStep`]: after steps 1 and 2 (tests commit there) and after step 3 (tests
-    /// synchronize with a paused commit there).
+    /// [`FetchStep`]: after steps 1 and 2 (tests commit there), after step 3 and after the
+    /// session opened (tests synchronize with a paused commit there).
     pub(crate) fn get_with_proof_once_with<N: ProvableCompileTimeNamespace>(
         &self,
         key: SlotKey,
@@ -462,6 +529,7 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
         between(FetchStep::BeforeSession);
 
         let session = self.begin_session_without_witness(namespace)?;
+        between(FetchStep::AfterSessionOpen);
         let post_fetch_namespace_root = post_fetch_root.namespace_root(namespace);
         if pre_fetch_version != version
             || pre_fetch_root.namespace_root(namespace) != post_fetch_namespace_root
@@ -576,9 +644,11 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> Storage for NomtProverStorage<S, 
     }
 
     /// # Errors
-    /// - If `prev_state_root` is not the root of this storage's version, or not the root of
-    ///   the NOMT trees (upstream checked only the latter, and only in strict mode): the
-    ///   storage is stale, or the caller passed the wrong root.
+    /// - [`StaleStorage`] (inside the `anyhow::Error`) if the storage is stale: a newer version
+    ///   was committed since it was created (the NOMT trees are no longer at its root), or its
+    ///   blocks were discarded (upstream: only a root check, and only in strict mode).
+    /// - If `prev_state_root` is not this storage's root: the caller passed the wrong root
+    ///   (upstream did not check it outside strict mode).
     /// - With the witness on, if a read does not match the NOMT tree (see the type docs).
     /// - If NOMT fails, or two accesses have the same key path.
     fn compute_state_update(
@@ -589,13 +659,9 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> Storage for NomtProverStorage<S, 
     ) -> anyhow::Result<(StorageRoot<S>, NomtStateUpdate<S>)> {
         let next_version = self.historical_state.get_next_version();
         let own_root = self.own_root()?;
-        anyhow::ensure!(
-            own_root == prev_state_root,
-            "stale storage or wrong previous root (next version {next_version}): the passed \
-             previous root {prev_state_root} is not this storage's root {own_root}"
-        );
         // Both sessions under one lock (`begin_both_sessions`); they block NOMT commits until
-        // finished.
+        // finished. Opening them fails with `StaleStorage` if this storage's blocks were
+        // discarded.
         let SessionsContainer { user, kernel } = self
             .session_builder
             .begin_both_sessions(self.witness_mode)?;
@@ -603,10 +669,19 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> Storage for NomtProverStorage<S, 
             user.prev_root().into_inner(),
             kernel.prev_root().into_inner(),
         );
+        if session_root != own_root {
+            return Err(StaleStorage {
+                storage_version: self.historical_state.last_version(),
+                committed_version: self.session_builder.committed_version()?,
+                discarded_fork: false,
+            }
+            .into());
+        }
         anyhow::ensure!(
-            session_root == prev_state_root,
-            "stale storage (next version {next_version}): the passed previous root \
-             {prev_state_root} is not the root of the NOMT trees {session_root}"
+            own_root == prev_state_root,
+            "wrong previous root (next version {next_version}): the passed previous root \
+             {prev_state_root} is not this storage's root {own_root} (not a stale storage: the \
+             NOMT trees are at its root)"
         );
 
         let StateAccesses {
@@ -674,7 +749,8 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NativeStorage for NomtProverStora
             .unwrap_or(SlotNumber::GENESIS)
     }
 
-    /// Genesis also when nothing is committed (as upstream).
+    /// The newest version this storage can see: the newest committed one, or the newest of its
+    /// own uncommitted blocks if newer. Genesis also when nothing is committed (as upstream).
     fn latest_version_unbound(&self) -> SlotNumber {
         Self::resolve_unbound_read(
             self.historical_state.last_version_unbound(),
@@ -716,9 +792,15 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NativeStorage for NomtProverStora
         self.read_value::<Accessory>(key, version)
     }
 
-    /// Proves the newest committed value (not this storage's version), retrying for up to
-    /// 375 ms while a commit is in progress. Blocks the thread while retrying: call it from a
-    /// blocking context in async code.
+    /// Proves the newest value (not this storage's version): the newest committed one, or the
+    /// newest of this storage's uncommitted blocks if it has any, retrying for up to 375 ms while a
+    /// commit is in progress. Blocks the thread while retrying, and while a storage manager
+    /// commits: call it from a blocking context in async code.
+    ///
+    /// # Errors
+    /// [`StaleStorage`] (`discarded_fork`, inside the `anyhow::Error`) at once, without
+    /// retrying, if this storage's blocks were discarded; a root mismatch once the retries ran
+    /// out; read errors.
     fn get_with_proof<N: ProvableCompileTimeNamespace>(
         &self,
         key: SlotKey,
@@ -770,10 +852,23 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NativeStorage for NomtProverStora
         .map(|(_, roots)| roots.into())
     }
 
+    /// The newest value of `key`, whatever this storage's version: the newest committed one, or
+    /// the newest of this storage's snapshots (uncommitted blocks) that are newer than the
+    /// committed version.
+    ///
+    /// On a storage whose blocks were discarded (another fork was committed), this mixes its
+    /// snapshots newer than the committed version with the committed state (TODO.md, storage
+    /// manager item); bound reads and proofs do not.
     fn get_unbound<N: CompileTimeNamespace>(&self, key: SlotKey) -> Option<SlotValue> {
         self.read_value_unbound::<N>(&key)
     }
 
+    /// The newest accessory value of `key` at or below `max_version` (`None`: any), whatever
+    /// this storage's version: in the committed accessory DB or in this storage's snapshots
+    /// (uncommitted blocks).
+    ///
+    /// On a storage whose blocks were discarded, this mixes its snapshots with the committed
+    /// state, as [`get_unbound`](NativeStorage::get_unbound) does.
     fn get_accessory_unbound(
         &self,
         key: SlotKey,
@@ -787,12 +882,20 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NativeStorage for NomtProverStora
     }
 
     /// # Errors
-    /// If `cursor` does not start with `prefix`, or if a newer version has been committed since
-    /// this storage was created (the flat store's live table no longer matches it).
+    /// If `cursor` does not start with `prefix`, if a version newer than this storage's has been
+    /// committed (the flat store's live table no longer matches it), or if this storage is on a
+    /// discarded fork ([`StaleStorage`]).
     ///
     /// # Panics
     /// The iterator panics if a read fails (it yields plain pairs: ending early would read as
     /// "no more keys").
+    ///
+    /// # Locking
+    /// The iterator holds the flat store's lock until it is dropped, and commits wait for it.
+    /// While it is alive, do not commit or finalize on this thread, and do not open NOMT
+    /// sessions on it (`get_with_proof`, `compute_state_update`) if a storage manager may
+    /// finalize on another: the finalization holds the overlays lock the session waits for while
+    /// it waits for the iterator, a deadlock. Collect the iterator or drop it first.
     fn maybe_iter_user_values_with_prefix(
         &self,
         prefix: SlotKey,
@@ -813,6 +916,12 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NativeStorage for NomtProverStora
 
 impl<S: MerkleProofSpec, K> NomtProverStorage<S, K> {
     /// Both `maybe_iter_*`: deleted keys are not yielded (rockbound skips them).
+    ///
+    /// The iterator merges this storage's snapshots newer than the committed version with the
+    /// flat store's live table, so its snapshots at or below the committed version must be the
+    /// committed blocks: checked by root, while the iterator holds the flat store's lock (no
+    /// commit completes meanwhile). A storage on a discarded fork fails with [`StaleStorage`]
+    /// (rockbound took them for committed, so it iterated the other fork's values).
     fn iter_values_with_prefix(
         &self,
         namespace: ProvableNamespace,
@@ -822,6 +931,26 @@ impl<S: MerkleProofSpec, K> NomtProverStorage<S, K> {
         let iter = self
             .historical_state
             .iter_values_with_prefix(namespace, &prefix, cursor)?;
+        if let Some(committed) = self.session_builder.committed_version()?
+            && self
+                .historical_state
+                .last_version()
+                .is_some_and(|version| version >= committed)
+        {
+            let own = self
+                .historical_state
+                .get_root_hash(committed)?
+                .filter(|(found, _)| *found == committed)
+                .map(|(_, roots)| roots);
+            if own != self.session_builder.committed_root_at(committed)? {
+                return Err(StaleStorage {
+                    storage_version: self.historical_state.last_version(),
+                    committed_version: Some(committed),
+                    discarded_fork: true,
+                }
+                .into());
+            }
+        }
         Ok(Some(iter.map(move |item| {
             item.unwrap_or_else(|error| {
                 panic!("Database error while iterating over the {namespace:?} values: {error:?}")

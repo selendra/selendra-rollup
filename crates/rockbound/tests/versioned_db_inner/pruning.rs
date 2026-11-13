@@ -106,6 +106,44 @@ fn basic_prune() {
     assert_eq!(historical(&delta_reader, b"k", 6).unwrap(), Some(6));
 }
 
+/// A reader of snapshots reads a key that none of its snapshots writes at its base version
+/// when asked for a newer version (README, "Readers of snapshots of a discarded fork"). Once
+/// that version is pruned, `PrunedVersion` reports it, the version read: the requested version
+/// with "has been pruned, the oldest available version is 6" would contradict itself.
+#[test]
+fn snapshot_reader_reports_its_pruned_base_version() {
+    let (_dir, db) = open_versioned();
+    for v in 0..=9u64 {
+        put_at(&db, &[(b"k", v as u32)], v);
+    }
+    let mut snapshot = VersionedSchemaBatch::<LiveKeys>::default();
+    snapshot.put_versioned(TestKey::from(b"s".to_vec()), TestField::new(100));
+    let reader = VersionedDeltaReader::<LiveKeys, VersionedDbCache<LiveKeys>>::new(
+        db.clone(),
+        Some(2),
+        vec![Arc::new(snapshot)],
+    );
+    assert_eq!(historical(&reader, b"k", 3).unwrap(), Some(2));
+
+    let out = db.collect_pruning_batch(3, None).unwrap();
+    assert_eq!(out.last_pruned_version, Some(5));
+    commit_pruning_batch(&db, &out.batch);
+    for version in [2, 3] {
+        let result = historical(&reader, b"k", version);
+        assert!(
+            matches!(
+                result,
+                Err(HistoricalValueError::PrunedVersion {
+                    requested_version: 2,
+                    oldest_available_version: Some(6),
+                })
+            ),
+            "version {version}: {result:?}"
+        );
+    }
+    assert_eq!(historical(&reader, b"s", 3).unwrap(), Some(100));
+}
+
 #[test]
 fn direct_historical_lookup_can_return_survivor_below_pruned_watermark() {
     let (_dir, db) = open_versioned();

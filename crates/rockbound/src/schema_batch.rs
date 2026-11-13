@@ -99,6 +99,13 @@ impl<K: Ord, V> SchemaBatch<K, V> {
         Self::default()
     }
 
+    /// Returns `true` if this batch has a range operation (a range delete). A
+    /// [`DeltaReader`](crate::cache::delta_reader::DeltaReader) does not see range operations in
+    /// its snapshots, so a batch kept as a snapshot must have none.
+    pub fn has_range_ops(&self) -> bool {
+        self.range_ops.values().any(|ops| !ops.is_empty())
+    }
+
     /// Returns `true` if this batch has no point writes and no range operations.
     pub fn is_empty(&self) -> bool {
         self.last_writes.values().all(|writes| writes.is_empty())

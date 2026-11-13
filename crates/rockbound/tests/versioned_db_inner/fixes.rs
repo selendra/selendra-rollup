@@ -5,7 +5,10 @@
 //! - B3: a RocksDB read error ended the iteration, so it read as "absent";
 //! - rolling back a version with puts in it wrote the puts again;
 //! - a reader of the empty DB iterated version 0's rows once version 0 was committed, instead
-//!   of erroring as stale.
+//!   of erroring as stale;
+//! - B15: a reader's latest version (base version plus one per snapshot) was added unchecked;
+//! - a reader read another fork's committed writes as its own once a block of the same version
+//!   as one of its snapshots was committed.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -517,6 +520,95 @@ fn stale_reader_iteration_is_an_error() {
             .iter_with_prefix(TestKey::from(vec![]))
             .is_ok()
     );
+}
+
+// ---- Snapshots of another fork ----
+
+/// A reader on a snapshot of version 1 (writing `a`) after another block of version 1 (writing
+/// `b` and `c`, from another fork) was committed: the reader keeps reading its own state, where
+/// `b` has its version-0 value and `c` is absent. Upstream read the live table (and, in
+/// historical reads, the archive at the snapshot's version), so it read the other block's
+/// writes as its own. Readers on the empty DB read only their snapshots.
+#[test]
+fn reader_on_a_discarded_snapshot_reads_its_own_state() {
+    let (_dir, f) = fixture();
+    f.commit(0, &[(b"a", Some(b"a0")), (b"b", Some(b"b0"))]);
+    let snapshot = |writes: &[(&[u8], &[u8])]| {
+        let mut batch = VersionedSchemaBatch::<BytesSchema>::default();
+        for (key, value) in writes {
+            batch.put_versioned(TestKey::from(key.to_vec()), Bytes(value.to_vec()));
+        }
+        Arc::new(batch)
+    };
+    let ours = VersionedDeltaReader::new(f.db.clone(), Some(0), vec![snapshot(&[(b"a", b"a1")])]);
+    let genesis = VersionedDeltaReader::new(f.db.clone(), None, vec![snapshot(&[(b"g", b"g0")])]);
+    f.commit(1, &[(b"b", Some(b"b1-theirs")), (b"c", Some(b"c1-theirs"))]);
+
+    let get = |reader: &VersionedDeltaReader<BytesSchema, BytesCache>, k: &[u8]| {
+        reader
+            .get_latest_borrowed(&TestKey::from(k.to_vec()))
+            .unwrap()
+            .map(|v| v.0)
+    };
+    let hist = |reader: &VersionedDeltaReader<BytesSchema, BytesCache>, k: &[u8], v| {
+        reader
+            .get_historical_borrowed(&TestKey::from(k.to_vec()), v)
+            .unwrap()
+            .map(|v| v.0)
+    };
+    assert_eq!(get(&ours, b"a"), some(b"a1"));
+    assert_eq!(get(&ours, b"b"), some(b"b0"));
+    assert_eq!(get(&ours, b"c"), None);
+    assert_eq!(hist(&ours, b"a", 1), some(b"a1"));
+    assert_eq!(hist(&ours, b"b", 1), some(b"b0"));
+    assert_eq!(hist(&ours, b"c", 1), None);
+    assert_eq!(hist(&ours, b"a", 0), some(b"a0"));
+    assert_eq!(hist(&ours, b"b", 0), some(b"b0"));
+    // Built on the empty DB: only its snapshot.
+    assert_eq!(get(&genesis, b"g"), some(b"g0"));
+    assert_eq!(get(&genesis, b"a"), None);
+    assert_eq!(hist(&genesis, b"a", 0), None);
+    // A reader of the committed version 1 reads it.
+    assert_eq!(get(&f.reader_at(1), b"b"), some(b"b1-theirs"));
+    assert_eq!(get(&f.reader_at(0), b"b"), some(b"b0"));
+}
+
+// ---- B15 ----
+
+/// A reader whose base version plus its snapshots overflows a `u64`: every read is an `Err`
+/// (upstream added unchecked, so the reads panicked on the overflow, or, without overflow
+/// checks, saw a wrapped version). Readers that fit are unchanged, the empty DB's included.
+#[test]
+fn reader_version_overflow_is_an_error() {
+    let (_dir, f) = fixture();
+    let key = TestKey::from(b"k".to_vec());
+    let snapshot = || {
+        let mut batch = VersionedSchemaBatch::<BytesSchema>::default();
+        batch.put_versioned(key.clone(), Bytes(b"v".to_vec()));
+        Arc::new(batch)
+    };
+    let reader = VersionedDeltaReader::new(f.db.clone(), Some(u64::MAX), vec![snapshot()]);
+    let err = reader.latest_version().unwrap_err();
+    assert!(err.to_string().contains("version overflow"), "{err}");
+    assert!(reader.get_latest_borrowed(&key).is_err());
+    assert!(reader.get_latest_borrowed_unbound(&key).is_err());
+    assert!(reader.get_historical_borrowed(&key, 0).is_err());
+    assert!(reader.iter_with_prefix(TestKey::from(vec![])).is_err());
+
+    let at = |base, snapshots: usize| {
+        VersionedDeltaReader::new(
+            f.db.clone(),
+            base,
+            (0..snapshots).map(|_| snapshot()).collect(),
+        )
+        .latest_version()
+        .unwrap()
+    };
+    assert_eq!(at(Some(u64::MAX - 1), 1), Some(u64::MAX));
+    assert_eq!(at(Some(u64::MAX), 0), Some(u64::MAX));
+    assert_eq!(at(Some(3), 2), Some(5));
+    assert_eq!(at(None, 0), None);
+    assert_eq!(at(None, 3), Some(2));
 }
 
 // ---- B3 ----

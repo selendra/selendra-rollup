@@ -4,3 +4,6 @@
 //! access system resources or the network, write to disk, etc.
 
 pub mod da;
+pub mod storage;
+
+pub use storage::{FinalizedBlock, HierarchicalStorageManager};

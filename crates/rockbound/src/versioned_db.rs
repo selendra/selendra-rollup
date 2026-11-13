@@ -1126,11 +1126,26 @@ where
         }
     }
 
-    /// Returns the latest version that is available in the reader.
-    pub fn latest_version(&self) -> Option<u64> {
+    /// Returns the latest version that is available in the reader: the base version plus one
+    /// per snapshot (the snapshots are the versions after the base version, in order), or, on
+    /// the empty DB (`None`), the number of snapshots minus one.
+    ///
+    /// # Errors
+    /// If that version does not fit in a `u64` (upstream added unchecked: an overflow panic, or
+    /// a wrapped version in builds without overflow checks).
+    pub fn latest_version(&self) -> anyhow::Result<Option<u64>> {
+        let snapshots = u64::try_from(self.snapshots.len())
+            .map_err(|_| anyhow::anyhow!("more than u64::MAX snapshots"))?;
         match self.base_version {
-            Some(base_version) => Some(base_version + self.snapshots.len() as u64),
-            None => self.snapshots.len().checked_sub(1).map(|len| len as u64),
+            Some(base_version) => base_version
+                .checked_add(snapshots)
+                .map(Some)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "version overflow: base version {base_version} plus {snapshots} snapshots"
+                    )
+                }),
+            None => Ok(snapshots.checked_sub(1)),
         }
     }
 
@@ -1376,7 +1391,7 @@ where
             (encoded_prefix.clone().., prefix.clone())
         };
 
-        let latest_version = self.latest_version();
+        let latest_version = self.latest_version()?;
         // Compared as options: a reader of the empty DB (`None`) is older than any committed
         // version. (Upstream compared `v > latest_version.unwrap_or(0)`, so a reader taken
         // before version 0 was committed iterated version 0's rows.)
@@ -1428,48 +1443,52 @@ where
         })
     }
 
-    /// Returns the latest value of a key in the reader.
+    /// Returns the latest value of a key in the reader: its newest write in the snapshots, else
+    /// its value at the reader's base version.
+    ///
+    /// The snapshots hold every write after the base version, so a key they do not write keeps
+    /// its base version's value: the live table's while the DB is still at the base version,
+    /// else the archive's at the base version. (Upstream read the live table until the DB moved
+    /// past the reader's newest version, on purpose: once another block of the same version as
+    /// one of the snapshots was committed, from another fork, the reader read that block's
+    /// writes as its own.) A reader built on the empty DB (no base version) reads only its
+    /// snapshots.
     pub fn get_latest_borrowed(
         &self,
         key: &<V as Schema>::Key,
     ) -> anyhow::Result<Option<V::Value>> {
+        // Checks that the reader's version fits.
+        self.latest_version()?;
         for snapshot in self.snapshots.iter() {
             if let Some(value) = snapshot.versioned_table_writes.get(key) {
                 return Ok(value.clone());
             }
         }
-        // The live value for any key is None if the DB is empty.
-        let Some(own_version) = self.latest_version() else {
+        let Some(base_version) = self.base_version else {
             return Ok(None);
         };
-        // If the DB mutated underneath us such that the live version is now newer than this snapshot's version, we need to fetch from the historical table. This is much slower than fetching from the live table, but it should be a rare case.
-        // Note that the data that was committed could come from a different fork even if it's at the same height as our snapshot. This is intentionally allowed for compatibiltiy with pre-existing
-        // behavior of the system.
-        let min_safe_db_version = self.db.fetch_latest_committed_archival_version();
-        // If the value in the archival DB is newer than the version of this snapshot, then...
-        // - It's not safe to fetch from the live table (that is probably also newer)
-        // - The value we want is guaranteed to be in the archival DB, so we can fetch it from there.
-        if min_safe_db_version.is_some_and(|v| v > own_version) {
+        // Whether the DB moved past the base version: the live table may then hold newer values
+        // (also of another fork), and the base version's are in the archive.
+        let moved = || {
+            self.db
+                .fetch_latest_committed_archival_version()
+                .is_some_and(|v| v > base_version)
+        };
+        if moved() {
             tracing::trace!(
-                ?min_safe_db_version,
-                "DB is out of date, fetching 'live' values from historical table. Using latest version {:?}",
-                own_version
+                base_version,
+                "The DB moved past the reader's base version: reading the archive"
             );
-            // The data from the base version is guaranteed to match our data - but data from the latest version could be from a different fork that was committed
-            return Ok(self.get_historical_borrowed(key, own_version)?);
+            return Ok(self.get_historical_borrowed(key, base_version)?);
         }
-
         let live_value = self.db.get_live_value(key)?;
-        // If the DB has no committed version or if its latest version is less than the latest version we know about, then it hasn't changed underneath us in a way that would invalidate the read.
-        let safe_db_version = self.db.fetch_latest_committed_archival_version();
-        // If a write happened while we were fetching from the db, the results are unknown. Now that the state we want is guaranteed to be in the archival DB, we can fetch it safely from there.
-        if safe_db_version.is_some_and(|v| v > own_version) {
+        // A commit during the live read: the read may be of the newer version.
+        if moved() {
             tracing::trace!(
-                ?safe_db_version,
-                "DB became out of date during a read. Fetching 'live' values from historical table. Using latest version {:?}",
-                own_version
+                base_version,
+                "The DB moved past the reader's base version during the read: reading the archive"
             );
-            Ok(self.get_historical_borrowed(key, own_version)?)
+            Ok(self.get_historical_borrowed(key, base_version)?)
         } else {
             Ok(live_value)
         }
@@ -1481,7 +1500,7 @@ where
         key: &<V as Schema>::Key,
     ) -> anyhow::Result<Option<V::Value>> {
         let live_table_version = self.db.get_committed_version_live_db()?;
-        let latest_version = self.latest_version();
+        let latest_version = self.latest_version()?;
         // If the "live" table is ahead of this storage, fetch directly from the live table.
         let Some(latest_version) = latest_version else {
             return self.db.get_live_value(key);
@@ -1513,7 +1532,7 @@ where
         key: &<V as Schema>::Key,
         version: u64,
     ) -> Result<Option<V::Value>, HistoricalValueError> {
-        let Some(newest_version) = self.latest_version() else {
+        let Some(newest_version) = self.latest_version()? else {
             return Err(HistoricalValueError::FutureVersion {
                 requested_version: version,
                 latest_version: None,
@@ -1548,17 +1567,25 @@ where
                 }
             };
         }
+        // Not written by the snapshots up to `version`: the value at the base version if
+        // `version` is after it (the snapshots hold every write after the base version; the DB's
+        // rows after it may be another fork's, upstream read them), else at `version`. A reader
+        // built on the empty DB reads only its snapshots.
+        let Some(base_version) = self.base_version else {
+            return Ok(None);
+        };
+        let db_version = version.min(base_version);
         let historical_value = self
             .db
-            .get_historical_value_raw(key.as_ref().to_vec(), version)?;
+            .get_historical_value_raw(key.as_ref().to_vec(), db_version)?;
         let oldest_available_version = self
             .db
             .get_pruned_version()?
             .and_then(|v| v.checked_add(1))
             .unwrap_or(0);
-        if version < oldest_available_version {
+        if db_version < oldest_available_version {
             Err(HistoricalValueError::PrunedVersion {
-                requested_version: version,
+                requested_version: db_version,
                 oldest_available_version: Some(oldest_available_version),
             })
         } else {
@@ -1581,11 +1608,13 @@ pub enum HistoricalValueError {
         latest_version: Option<u64>,
     },
     #[error(
-        "The requested version {requested_version} has been pruned. The oldest available version is {oldest_available_version:?}"
+        "Version {requested_version} has been pruned. The oldest available version is {oldest_available_version:?}"
     )]
-    /// The requested version is older than the oldest available version.
+    /// The version to read in the database is older than the oldest available version.
     PrunedVersion {
-        /// The requested version.
+        /// The version read in the database: the requested version, or, for a key that none of
+        /// a reader's snapshots writes, the reader's base version if the requested one is newer
+        /// (the key is read there, see `VersionedDeltaReader::get_historical_borrowed`).
         requested_version: u64,
         /// The oldest available version.
         oldest_available_version: Option<u64>,

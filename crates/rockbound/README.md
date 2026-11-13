@@ -35,6 +35,19 @@ Fixes (regression tests in `tests/versioned_db_inner/fixes.rs`):
   older than any committed version (`VersionedDeltaReader::iter_with_prefix_and_cursor`).
 - **Rollback.** `update_versioned_db_batch` without `is_commit` now removes the version's
   archival rows for puts too. Upstream wrote the puts again, live table and cache included.
+- **Readers of snapshots of a discarded fork.** `VersionedDeltaReader::get_latest_borrowed` and
+  `get_historical_borrowed` read a key that no snapshot writes from the DB at the reader's
+  newest (or requested) version, not at its base version. Once another block of the same
+  version as one of the reader's snapshots was committed (another fork's: upstream allowed it
+  on purpose), the reader read that block's writes as its own. The snapshots hold every write
+  after the base version, so such a key now reads at the base version (the live table while the
+  DB is still there, else the archive), and a reader built on the empty DB reads only its
+  snapshots. If the base version was pruned, `PrunedVersion::requested_version` is the base
+  version (the version read, now documented as such), not the requested one.
+- **Reader version overflow.** `VersionedDeltaReader::latest_version` (the base version plus one
+  per snapshot) was added unchecked, so a reader past `u64::MAX` panicked on every read, or saw
+  a wrapped version without overflow checks. It is now checked and returns
+  `anyhow::Result<Option<u64>>`; the reads return the `Err`.
 
 API and scope:
 - Iterator items are `anyhow::Result<..>`. `VersionedDbIterator` yields `(key, value)`; upstream
@@ -43,6 +56,8 @@ API and scope:
   `update_metrics`); the `arbitrary` feature (proptest impls are now test-only);
   `DB::write_versioned_schemas`; and the `bindgen-runtime` feature (the workspace sets it on
   `rocksdb`).
+- New: `SchemaBatch::has_range_ops`, whether a batch has a range delete (a `DeltaReader` does
+  not see range operations in its snapshots, so a batch kept as a snapshot must have none).
 - New: `DeltaReader::collect_keys_in_range(range, limit)`, the keys of the first `limit` rows
   of a range without their values (none is decoded or copied, from the DB or the snapshots),
   for scans of tables with large values. An inverted range is an `Err` (the snapshots'

@@ -198,14 +198,14 @@ impl FlatStateDb {
     /// was materialized for. Also on write errors; the value caches are then cleared, since
     /// they may hold values that were not written.
     pub fn commit(&mut self, changes: StateChanges) -> anyhow::Result<()> {
-        self.commit_with_faults(changes, &Faults::default())
+        self.commit_with_faults(&changes, &Faults::default())
     }
 
     /// [`commit`](Self::commit), calling `faults` between the archival and the live write
     /// ([`CommitPoint::BeforeLive`]).
     pub(crate) fn commit_with_faults(
         &mut self,
-        changes: StateChanges,
+        changes: &StateChanges,
         faults: &Faults,
     ) -> anyhow::Result<()> {
         let latest = self.latest_version_and_root_live()?.map(|(v, _)| v);
@@ -215,7 +215,7 @@ impl FlatStateDb {
             "the state changes are for version {} but the flat store expects version {expected}",
             changes.version
         );
-        self.commit_internal(&changes, CommitMode::Commit, faults)
+        self.commit_internal(changes, CommitMode::Commit, faults)
     }
 
     /// Writes `changes` at `changes.version` as `mode` says.
@@ -490,7 +490,7 @@ mod tests {
             if archival_written {
                 let faults = Faults::new(Some(crate::faults::fail_at(CommitPoint::BeforeLive)));
                 let err = flat
-                    .commit_with_faults(data.change_set(1), &faults)
+                    .commit_with_faults(&data.change_set(1), &faults)
                     .unwrap_err();
                 assert!(err.to_string().contains("injected fault"), "{err}");
             }
@@ -524,7 +524,7 @@ mod tests {
         let data = data_to_insert_per_version();
         let mut flat = open(&tempdir);
         let faults = Faults::new(Some(crate::faults::fail_at(CommitPoint::BeforeLive)));
-        flat.commit_with_faults(data.change_set(0), &faults)
+        flat.commit_with_faults(&data.change_set(0), &faults)
             .unwrap_err();
         assert_eq!(flat.latest_version_and_root_live().unwrap(), None);
         assert_eq!(

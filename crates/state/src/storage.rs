@@ -385,7 +385,10 @@ mod native {
     /// iterators (and any database session) before committing on the same thread, and keep one
     /// live iterator per thread (a second one can wait behind a queued commit that waits for
     /// the first). [`get_with_proof`](Self::get_with_proof) may sleep and retry while a commit
-    /// is in progress: call it from a blocking context in async code.
+    /// is in progress: call it from a blocking context in async code. Do not call it (or any
+    /// method that opens a database session) on a thread that holds a live iterator while a
+    /// storage manager may finalize on another: the finalization's commit waits for the
+    /// iterator while holding a lock the session waits for. Collect the iterator first.
     pub trait NativeStorage: Storage {
         /// Gets the latest version available in the current instance storage.
         fn latest_version(&self) -> SlotNumber;
@@ -440,9 +443,11 @@ mod native {
         /// Returns the value corresponding to the key or `None` if the key is absent, and a
         /// proof to get the value.
         ///
-        /// The value may be of a newer committed version than this storage's (a storage that
-        /// keeps no tree history, like the NOMT one, proves the newest committed state): the
-        /// returned slot number and root say which version and root it is proven against.
+        /// The value may be of a newer version than this storage's (a storage that keeps no
+        /// tree history, like the NOMT one, proves the newest state it sees: the newest
+        /// committed state, or the newest of its own uncommitted blocks if a storage manager
+        /// built it on some): the returned slot number and root say which version and root it is
+        /// proven against.
         ///
         /// # Errors
         /// If storage is empty or the version is not yet available.
@@ -481,20 +486,24 @@ mod native {
             self.get_root_hash_unbound(self.latest_version_unbound())
         }
 
-        /// Gets the latest committed value for the given key, regardless of the version number
-        /// associated with this storage.
+        /// Gets the newest value for the given key, regardless of the version number associated
+        /// with this storage: the newest committed one, or, for a storage on uncommitted blocks
+        /// (built by a storage manager), the newest of those blocks' values newer than the
+        /// committed state.
         fn get_unbound<N: CompileTimeNamespace>(&self, key: SlotKey) -> Option<SlotValue>;
 
-        /// Gets the latest committed accessory value for the given key, regardless of the
-        /// version number associated with this storage.
+        /// Gets the newest accessory value for the given key at or below `max_version` (`None`:
+        /// any), regardless of the version number associated with this storage: committed, or,
+        /// for a storage on uncommitted blocks (built by a storage manager), of those blocks.
         fn get_accessory_unbound(
             &self,
             key: SlotKey,
             max_version: Option<SlotNumber>,
         ) -> Option<SlotValue>;
 
-        /// Iterates over all committed user key/value pairs whose key starts with `prefix`, in
-        /// ascending key order, starting at `cursor` (inclusive) if given.
+        /// Iterates over the user key/value pairs of this storage's version (committed, or of
+        /// its own uncommitted blocks if a storage manager built it on some) whose key starts
+        /// with `prefix`, in ascending key order, starting at `cursor` (inclusive) if given.
         ///
         /// Returns `None` if the storage does not support iteration. Values written by an
         /// uncommitted [`StateCheckpoint`](crate::StateCheckpoint) are not seen.

@@ -17,19 +17,22 @@ parking_lot = { workspace = true }
 rockbound = { workspace = true }
 selendra-interface = { workspace = true, features = ["native"] }
 selendra-state = { workspace = true, features = ["native", "rockbound"] }
+serde = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
 selendra-state = { workspace = true, features = ["native", "rockbound", "test-utils"] }
+serde = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 test-strategy = { workspace = true }
 
 [features]
-# `harness`: the state databases in a temporary directory, for tests (of this crate and others).
-test-utils = ["dep:tempfile"]
+# `harness`: the state databases and the storage manager in a temporary directory, with a test
+# block header (serde), for tests (of this crate and others).
+test-utils = ["dep:serde", "dep:tempfile"]
 
 [lints]
 workspace = true

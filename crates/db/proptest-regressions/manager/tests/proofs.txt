@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4385c7f64a665a157278774fc1a27bca6f0864c3ffeb91b8b6bf788f40038576 # shrinks to input = _WitnessReplayOnOverlayStorageArgs { blocks: [[], [], [], [ValueDelete, MapRemove(2)], [VecPop, VecPush(192694146), ValueSet(1858717186), ValueDelete, KernelGet(1), KernelGet(1), MapSetIfAbsent(5, 737682120), VecGet(1), ValueGet, Discard]] }

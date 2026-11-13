@@ -12,7 +12,8 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context;
 use nomt::hasher::BinaryHasher;
 use nomt::{FinishedSession, InvalidAncestors, Nomt, Overlay, Session, SessionParams};
-use selendra_interface::common::HexString;
+use rockbound::cache::delta_reader::DeltaReader;
+use selendra_interface::common::{HexString, SlotNumber};
 use selendra_interface::reexports::digest::Digest;
 use selendra_interface::reexports::digest::typenum::U32;
 use selendra_state::StorageRoot;
@@ -20,7 +21,9 @@ use selendra_state::namespaces::ProvableNamespace;
 
 use crate::config::{NomtNamespaceConfig, StateDbConfig};
 use crate::faults::{CommitPoint, Faults};
+use crate::prover::StaleStorage;
 use crate::recovery::RecoveryStep;
+use crate::schema::StateRootHashes;
 
 const KERNEL: &str = "kernel";
 const USER: &str = "user";
@@ -469,6 +472,41 @@ impl StateFinishedSession {
 /// The uncommitted overlays of all blocks a storage manager holds, by block reference.
 pub type SharedOverlays<K> = Arc<RwLock<HashMap<K, StateOverlay>>>;
 
+/// An uncommitted block a [`NomtSessionBuilder`] builds on: its overlay's key in the shared map,
+/// its version and the roots after it.
+#[derive(Clone, Debug)]
+pub(crate) struct OverlayRef<K> {
+    pub(crate) key: K,
+    pub(crate) version: SlotNumber,
+    pub(crate) roots: NomtRoots,
+}
+
+/// The committed root of each version: the flat live DB's root table, without uncommitted
+/// snapshots. The flat live DB is written last by a commit, so a version is here only once its
+/// commit is complete.
+#[derive(Clone)]
+pub(crate) struct CommittedRoots(DeltaReader);
+
+impl CommittedRoots {
+    /// The root table of the flat live DB `live_db`.
+    pub(crate) fn new(live_db: Arc<rockbound::DB>) -> Self {
+        Self(DeltaReader::new(live_db, Vec::new()))
+    }
+
+    /// The committed root of exactly `version` (`None` if `version` is not committed).
+    pub(crate) fn root_at(&self, version: SlotNumber) -> anyhow::Result<Option<NomtRoots>> {
+        self.0.get::<StateRootHashes>(&version)
+    }
+
+    /// The newest committed version (`None`: nothing committed).
+    pub(crate) fn latest_version(&self) -> anyhow::Result<Option<SlotNumber>> {
+        Ok(self
+            .0
+            .get_largest::<StateRootHashes>()?
+            .map(|(version, _)| version))
+    }
+}
+
 /// Opens NOMT sessions on the committed trees plus a chain of uncommitted overlays.
 ///
 /// A session holds NOMT's read lock: committing to the same tree blocks until every session on
@@ -478,11 +516,21 @@ pub type SharedOverlays<K> = Arc<RwLock<HashMap<K, StateOverlay>>>;
 /// writes the trees without the flat store, and a thread holding one while opening another can
 /// deadlock behind a commit, so `begin_both_sessions` (both trees under one lock) is the only
 /// way to hold two.
+///
+/// **Overlays that are gone.** A storage manager removes a block's overlay from the shared map
+/// when it commits the block (under the map's write lock, so a session sees either the overlay
+/// on the old trees or the committed trees), and when it discards the block's fork. A session
+/// therefore checks the overlays it does not find: the newest of them must be committed, with
+/// the same roots (the flat live DB's root at its version), and the overlays it finds must build
+/// on the committed trees. Otherwise the storage is on a discarded fork, and opening a session
+/// fails with [`StaleStorage`] (`discarded_fork`). Upstream assumed every missing overlay was
+/// committed, so a storage on a discarded fork opened its sessions on the winning fork's trees.
 pub struct NomtSessionBuilder<H, K> {
     state_db: Arc<NomtStateDb<H>>,
     /// Newest first (as [`SessionParams::overlay`] expects).
-    relevant_snapshot_refs: Vec<K>,
+    relevant_snapshot_refs: Vec<OverlayRef<K>>,
     all_snapshots: SharedOverlays<K>,
+    committed: CommittedRoots,
 }
 
 impl<H, K: Clone> Clone for NomtSessionBuilder<H, K> {
@@ -491,6 +539,7 @@ impl<H, K: Clone> Clone for NomtSessionBuilder<H, K> {
             state_db: self.state_db.clone(),
             relevant_snapshot_refs: self.relevant_snapshot_refs.clone(),
             all_snapshots: self.all_snapshots.clone(),
+            committed: self.committed.clone(),
         }
     }
 }
@@ -512,24 +561,34 @@ pub(crate) struct SessionsContainer<H> {
 }
 
 impl<H, K> NomtSessionBuilder<H, K> {
-    /// A builder whose sessions see the committed trees plus the overlays `relevant_snapshot_refs`
-    /// (newest first) of `all_snapshots`. Refs missing from `all_snapshots` are skipped: they are
-    /// assumed committed.
-    pub fn new(
+    /// A builder whose sessions see the committed trees plus the overlays
+    /// `relevant_snapshot_refs` (newest first, consecutive versions) of `all_snapshots`; the
+    /// ones missing from `all_snapshots` are checked against `committed` (see the type docs).
+    pub(crate) fn new(
         state_db: Arc<NomtStateDb<H>>,
-        relevant_snapshot_refs: Vec<K>,
+        relevant_snapshot_refs: Vec<OverlayRef<K>>,
         all_snapshots: SharedOverlays<K>,
+        committed: CommittedRoots,
     ) -> Self {
         Self {
             state_db,
             relevant_snapshot_refs,
             all_snapshots,
+            committed,
         }
     }
 
-    /// A builder whose sessions see only the committed trees.
-    pub fn from_committed(state_db: Arc<NomtStateDb<H>>) -> Self {
-        Self::new(state_db, Vec::new(), Arc::default())
+    /// The newest committed version (`None`: nothing committed).
+    pub(crate) fn committed_version(&self) -> anyhow::Result<Option<SlotNumber>> {
+        self.committed.latest_version()
+    }
+
+    /// The committed root of exactly `version` (`None`: not committed).
+    pub(crate) fn committed_root_at(
+        &self,
+        version: SlotNumber,
+    ) -> anyhow::Result<Option<NomtRoots>> {
+        self.committed.root_at(version)
     }
 }
 
@@ -538,27 +597,69 @@ where
     H: Digest<OutputSize = U32> + Send + Sync,
     K: Eq + Hash,
 {
-    /// Runs `f` on the relevant overlays (newest first) under the snapshots read lock.
+    /// Runs `f` on the relevant overlays (newest first) under the snapshots read lock, once
+    /// they are checked (see the type docs).
+    ///
+    /// # Errors
+    /// [`StaleStorage`] (`discarded_fork`) if this builder's blocks are on a discarded fork;
+    /// an `Err` if the lock is poisoned, a newer overlay is missing while an older one is still
+    /// there (a bug: overlays are committed oldest first), or on read errors.
     fn with_overlays<R>(&self, f: impl FnOnce(&[&StateOverlay]) -> R) -> anyhow::Result<R> {
         let snapshots = self
             .all_snapshots
             .read()
             .map_err(|_| anyhow::anyhow!("the NOMT overlays lock is poisoned"))?;
-        let overlays: Vec<&StateOverlay> = self
-            .relevant_snapshot_refs
-            .iter()
-            .filter_map(|overlay_ref| {
-                let overlay = snapshots.get(overlay_ref);
-                if overlay.is_none() {
-                    // Assumed committed. That holds without forks: with forks, a missing
-                    // overlay may belong to a discarded fork, and the session then no longer
-                    // matches the flat-store reader (which holds its own snapshots).
-                    tracing::debug!("NOMT overlay not found, assuming it has been committed");
+        let mut overlays: Vec<&StateOverlay> =
+            Vec::with_capacity(self.relevant_snapshot_refs.len());
+        let mut newest_missing: Option<&OverlayRef<K>> = None;
+        for overlay_ref in &self.relevant_snapshot_refs {
+            match snapshots.get(&overlay_ref.key) {
+                Some(overlay) => {
+                    if let Some(missing) = newest_missing {
+                        tracing::warn!(
+                            missing_version = %missing.version,
+                            present_version = %overlay_ref.version,
+                            "A NOMT overlay is gone while an older one of its chain is still there"
+                        );
+                        anyhow::bail!(
+                            "bug: the NOMT overlay of version {} is gone while the older one of \
+                             version {} is still there (overlays are committed oldest first)",
+                            missing.version,
+                            overlay_ref.version
+                        );
+                    }
+                    overlays.push(overlay);
                 }
-                overlay
-            })
-            .collect();
+                None => {
+                    newest_missing.get_or_insert(overlay_ref);
+                }
+            }
+        }
+        if let Some(missing) = newest_missing {
+            // Committed (with every older one): the trees hold it. Checking the newest is
+            // enough, and costs one read.
+            let committed = self.committed.root_at(missing.version)?;
+            if committed != Some(missing.roots) {
+                return Err(self.discarded_fork()?.into());
+            }
+            tracing::trace!(version = %missing.version, "NOMT overlays committed up to this version");
+        }
+        if let Some(oldest) = overlays.last() {
+            // The oldest uncommitted overlay builds on the committed trees.
+            if oldest.prev_roots() != self.state_db.root_hashes() {
+                return Err(self.discarded_fork()?.into());
+            }
+        }
         Ok(f(&overlays))
+    }
+
+    /// The error of a builder on a discarded fork.
+    fn discarded_fork(&self) -> anyhow::Result<StaleStorage> {
+        Ok(StaleStorage {
+            storage_version: self.relevant_snapshot_refs.first().map(|r| r.version),
+            committed_version: self.committed.latest_version()?,
+            discarded_fork: true,
+        })
     }
 
     /// Opens a session on the user tree, without a witness.
@@ -722,21 +823,44 @@ mod tests {
         assert_eq!(state_db.root_hashes(), roots);
     }
 
-    #[test]
-    fn test_session_can_be_built_while_finalized() {
-        let temp_dir = crate::test_utils::tempdir();
-        let state_db =
-            Arc::new(NomtStateDb::<H>::new(&StateDbConfig::for_tests(temp_dir.path())).unwrap());
+    /// The flat live DB's root table next to the trees (a version is committed once its root
+    /// is there).
+    fn committed_roots(dir: &Path) -> (crate::FlatStateDb, CommittedRoots) {
+        let flat = crate::FlatStateDb::new(dir, 1_000_000, 1_000_000).unwrap();
+        let committed = CommittedRoots::new(flat.live_db().clone());
+        (flat, committed)
+    }
 
-        // First produce some overlays with data.
-        let all_overlays: SharedOverlays<u64> = Arc::default();
-        let rounds = 10;
+    /// Commits `overlay` as `version` the way `DbGroup` does: the trees, then the root (the
+    /// flat live DB is written last).
+    fn commit_overlay(
+        state_db: &NomtStateDb<H>,
+        flat: &crate::FlatStateDb,
+        overlay: StateOverlay,
+        version: u64,
+    ) {
+        let roots = overlay.roots();
+        state_db.commit(overlay, &Faults::default()).unwrap();
+        flat.live_db()
+            .put::<StateRootHashes>(&SlotNumber::new(version), &roots)
+            .unwrap();
+    }
+
+    /// The overlays of the blocks `0..rounds`, each built on the one before: its refs (newest
+    /// first) in `all_overlays`.
+    fn chain_of_overlays(
+        state_db: &Arc<NomtStateDb<H>>,
+        all_overlays: &SharedOverlays<u64>,
+        committed: &CommittedRoots,
+        rounds: u64,
+    ) -> Vec<OverlayRef<u64>> {
+        let mut refs: Vec<OverlayRef<u64>> = Vec::new();
         for this_ref in 0..rounds {
-            let overlay_refs = (0..this_ref).rev().collect::<Vec<_>>();
             let builder = NomtSessionBuilder::<H, u64>::new(
                 state_db.clone(),
-                overlay_refs,
+                refs.clone(),
                 all_overlays.clone(),
+                committed.clone(),
             );
             let user = finish(
                 builder.begin_user_session_without_witness().unwrap(),
@@ -747,12 +871,37 @@ mod tests {
                 this_ref,
             );
             let overlay = StateFinishedSession::new(user, kernel).into_state_overlay();
+            refs.insert(
+                0,
+                OverlayRef {
+                    key: this_ref,
+                    version: SlotNumber::new(this_ref),
+                    roots: overlay.roots(),
+                },
+            );
             all_overlays.write().unwrap().insert(this_ref, overlay);
         }
+        refs
+    }
 
-        let overlay_refs = (0..rounds).rev().collect::<Vec<_>>();
-        let check_builder =
-            NomtSessionBuilder::<H, u64>::new(state_db.clone(), overlay_refs, all_overlays.clone());
+    #[test]
+    fn test_session_can_be_built_while_finalized() {
+        let temp_dir = crate::test_utils::tempdir();
+        let state_db =
+            Arc::new(NomtStateDb::<H>::new(&StateDbConfig::for_tests(temp_dir.path())).unwrap());
+        let (flat, committed) = committed_roots(temp_dir.path());
+
+        // First produce some overlays with data.
+        let all_overlays: SharedOverlays<u64> = Arc::default();
+        let rounds = 10;
+        let refs = chain_of_overlays(&state_db, &all_overlays, &committed, rounds);
+
+        let check_builder = NomtSessionBuilder::<H, u64>::new(
+            state_db.clone(),
+            refs,
+            all_overlays.clone(),
+            committed,
+        );
         for committing_ref in 0..rounds {
             let sessions = check_builder.begin_both_sessions(WitnessMode::Off).unwrap();
             for this_ref in 0..rounds {
@@ -765,13 +914,112 @@ mod tests {
                 assert_eq!(sessions.kernel.read(key_path).unwrap(), expected_value);
             }
             drop(sessions);
-            let overlay = all_overlays
-                .write()
-                .unwrap()
-                .remove(&committing_ref)
-                .unwrap();
-            state_db.commit(overlay, &Faults::default()).unwrap();
+            // Committed under the write lock, as the storage manager does.
+            let mut overlays = all_overlays.write().unwrap();
+            let overlay = overlays.remove(&committing_ref).unwrap();
+            commit_overlay(&state_db, &flat, overlay, committing_ref);
         }
+    }
+
+    /// B6, critique #1: a missing overlay must be committed (its version's committed root is
+    /// its root); otherwise the builder's blocks are on a discarded fork, and no session opens
+    /// (upstream assumed every missing overlay committed, and opened the session on the other
+    /// fork's trees). The overlays present must build on the committed trees.
+    #[test]
+    fn missing_overlays_must_be_committed() {
+        let temp_dir = crate::test_utils::tempdir();
+        let state_db =
+            Arc::new(NomtStateDb::<H>::new(&StateDbConfig::for_tests(temp_dir.path())).unwrap());
+        let (flat, committed) = committed_roots(temp_dir.path());
+        let all_overlays: SharedOverlays<u64> = Arc::default();
+        let refs = chain_of_overlays(&state_db, &all_overlays, &committed, 2);
+        let builder = |refs: Vec<OverlayRef<u64>>| {
+            NomtSessionBuilder::<H, u64>::new(
+                state_db.clone(),
+                refs,
+                all_overlays.clone(),
+                committed.clone(),
+            )
+        };
+        let stale = |result: anyhow::Result<SessionsContainer<H>>| {
+            let err = result.err().expect("a stale storage");
+            err.downcast_ref::<StaleStorage>().cloned().unwrap()
+        };
+
+        // Another block 0 (a sibling, on another fork) is committed: block 0's overlay is
+        // dropped with its fork.
+        let sibling = StateFinishedSession::new(
+            finish(state_db.user.begin_session(SessionParams::default()), 7),
+            finish(state_db.kernel.begin_session(SessionParams::default()), 7),
+        )
+        .into_state_overlay();
+        {
+            let mut overlays = all_overlays.write().unwrap();
+            commit_overlay(&state_db, &flat, sibling, 0);
+            overlays.clear();
+        }
+        assert_eq!(
+            stale(builder(refs.clone()).begin_both_sessions(WitnessMode::Off)),
+            StaleStorage {
+                storage_version: Some(SlotNumber::new(1)),
+                committed_version: Some(SlotNumber::GENESIS),
+                discarded_fork: true,
+            }
+        );
+        // Only the newer block's overlay gone (not committed): the same.
+        assert!(
+            builder(refs[..1].to_vec())
+                .begin_user_session_without_witness()
+                .err()
+                .unwrap()
+                .downcast_ref::<StaleStorage>()
+                .is_some()
+        );
+    }
+
+    /// The overlays present must build on the committed trees, and a newer overlay cannot be
+    /// gone while an older one is there (overlays are committed oldest first).
+    #[test]
+    fn present_overlays_must_build_on_the_committed_trees() {
+        let temp_dir = crate::test_utils::tempdir();
+        let state_db =
+            Arc::new(NomtStateDb::<H>::new(&StateDbConfig::for_tests(temp_dir.path())).unwrap());
+        let (flat, committed) = committed_roots(temp_dir.path());
+        let all_overlays: SharedOverlays<u64> = Arc::default();
+        let refs = chain_of_overlays(&state_db, &all_overlays, &committed, 2);
+        let builder = |refs: Vec<OverlayRef<u64>>| {
+            NomtSessionBuilder::<H, u64>::new(
+                state_db.clone(),
+                refs,
+                all_overlays.clone(),
+                committed.clone(),
+            )
+        };
+        // The newer overlay removed, the older one still there.
+        let newer = all_overlays.write().unwrap().remove(&1).unwrap();
+        let err = builder(refs.clone())
+            .begin_both_sessions(WitnessMode::Off)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{err:#}").contains("is gone while the older one"),
+            "{err:#}"
+        );
+        drop(newer);
+
+        // The trees committed past the older overlay's parent (a sibling of it): it no longer
+        // applies.
+        let sibling = StateFinishedSession::new(
+            finish(state_db.user.begin_session(SessionParams::default()), 7),
+            finish(state_db.kernel.begin_session(SessionParams::default()), 7),
+        )
+        .into_state_overlay();
+        commit_overlay(&state_db, &flat, sibling, 0);
+        let err = builder(refs[1..].to_vec())
+            .begin_both_sessions(WitnessMode::Off)
+            .err()
+            .unwrap();
+        assert!(err.downcast_ref::<StaleStorage>().unwrap().discarded_fork);
     }
 
     #[test]

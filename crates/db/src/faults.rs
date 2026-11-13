@@ -1,6 +1,7 @@
 //! Fault injection for tests: a hook (`CommitHook`, `test-utils` only) that one
 //! [`DbGroup`](crate::DbGroup) instance calls at fixed points of its commits and of its startup
-//! crash recovery ([`CommitPoint`]).
+//! crash recovery, and that a storage manager on it calls between the commits of a
+//! finalization ([`CommitPoint`]).
 //!
 //! A hook returning `Err` is an injected fault: the operation fails there, as if the process had
 //! died at that point. Every write of the state databases is synced to disk before the next
@@ -14,11 +15,12 @@
 
 use crate::recovery::RecoveryStep;
 
-/// A point of [`DbGroup::commit`](crate::DbGroup::commit) or of the startup crash recovery of
-/// [`DbGroup::open`](crate::DbGroup::open) where the commit hook runs.
+/// A point where the commit hook runs: in [`DbGroup::commit`](crate::DbGroup::commit), in the
+/// startup crash recovery of [`DbGroup::open`](crate::DbGroup::open), or between the commits
+/// of a storage manager's finalization ([`BetweenSegments`](Self::BetweenSegments)).
 ///
 /// A commit writes, in this order: the NOMT kernel tree, the NOMT user tree, the ledger DB, the
-/// accessory DB, the flat archival DB, the flat live DB. The points sit between these writes.
+/// accessory DB, the flat archival DB, the flat live DB. Its points sit between these writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CommitPoint {
@@ -46,6 +48,12 @@ pub enum CommitPoint {
     /// After the flat live DB: the commit is complete (an `Err` here still fails the commit, and
     /// poisons the databases).
     AfterLive,
+    /// Between the commits of two blocks of one finalization of the storage manager
+    /// ([`NomtStorageManager::finalize`](crate::NomtStorageManager)): the older block is
+    /// committed and the overlays lock is released, so readers go on. An `Err` here fails the
+    /// finalization with the older blocks committed (nothing is half written, nothing is
+    /// poisoned).
+    BetweenSegments,
     /// Before one step of startup crash recovery (only steps that have work to do).
     Recovery(RecoveryStep),
 }

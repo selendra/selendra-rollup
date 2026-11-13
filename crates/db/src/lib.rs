@@ -22,16 +22,23 @@
 //! Stored data that does not decode, and databases that disagree, are errors, never panics.
 //!
 //! - [`NomtProverStorage`]: the native [`Storage`](selendra_state::Storage) and
-//!   [`NativeStorage`](selendra_state::NativeStorage) on [`DbGroup::readers`]: it executes blocks
-//!   natively and records the witness the zk guest's
-//!   [`NomtVerifierStorage`](selendra_state::NomtVerifierStorage) verifies.
+//!   [`NativeStorage`](selendra_state::NativeStorage) on the databases' readers: it executes
+//!   blocks natively and records the witness the zk guest's
+//!   [`NomtVerifierStorage`](selendra_state::NomtVerifierStorage) verifies. A storage that can
+//!   no longer compute (a newer version committed, or its blocks discarded) fails with a typed
+//!   [`StaleStorage`] error.
+//! - [`NomtStorageManager`]: the node's
+//!   [`HierarchicalStorageManager`](selendra_interface::node::storage::HierarchicalStorageManager):
+//!   forks of uncommitted blocks (NOMT overlays and snapshots of the other databases) on top of
+//!   the committed state, and their finalization ([`StorageManagerConfig`]).
 //!
-//! Not here yet: the storage manager (forks, uncommitted snapshots, finalization, pruning).
+//! Not here yet: pruning.
 //!
 //! # Features
-//! - `test-utils`: `harness` (the databases in a temporary directory, for tests) and fault
-//!   injection: a per-instance `CommitHook` called at every [`CommitPoint`] of a commit and of
-//!   crash recovery (`DbGroup::open_with_hook`).
+//! - `test-utils`: `harness` (the databases and the storage manager in a temporary directory,
+//!   a test block header, for tests) and fault injection: a per-instance `CommitHook` called at
+//!   every [`CommitPoint`] of a commit, of a finalization and of crash recovery
+//!   (`DbGroup::open_with_hook`, `NomtStorageManager::open_with_hook`).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -48,6 +55,7 @@ mod group;
 pub mod harness;
 mod historical;
 pub mod ledger;
+mod manager;
 mod nomt_state;
 mod prover;
 mod recovery;
@@ -64,11 +72,12 @@ pub use flat::{DbCache, FlatStateDb};
 pub use group::{DbGroup, NomtChangeSet, StorageReaders};
 pub use historical::{HistoricalStateReader, KvPair, StateChanges};
 pub use ledger::{LedgerChangeSet, LedgerReader};
+pub use manager::{NomtStorageManager, StorageManagerConfig};
 pub(crate) use nomt_state::SessionsContainer;
 pub use nomt_state::{
     NomtRoots, NomtSessionBuilder, NomtStateDb, SharedOverlays, StateFinishedSession, StateOverlay,
     WitnessMode,
 };
-pub use prover::{NomtProverStorage, NomtStateUpdate};
+pub use prover::{NomtProverStorage, NomtStateUpdate, StaleStorage};
 pub use recovery::{RecoveryReport, RecoveryStep};
 pub use rockbound::versioned_db::HistoricalValueError;

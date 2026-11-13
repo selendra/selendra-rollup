@@ -27,7 +27,8 @@ pub(crate) type KernelValues = NomtStateValues<Kernel>;
 /// *Bound* reads see the state as of this reader's version ([`last_version`](Self::last_version))
 /// even after newer versions are committed: they then read the archival rows, which can fail
 /// with [`HistoricalValueError::PrunedVersion`](crate::HistoricalValueError) once pruned.
-/// *Unbound* reads (`*_unbound`) see the newest committed state.
+/// *Unbound* reads (`*_unbound`) see the newest state: committed, or in this reader's snapshots
+/// newer than the committed version.
 ///
 /// Errors carry rockbound's [`HistoricalValueError`](crate::HistoricalValueError) where it
 /// applies (use `downcast_ref`).
@@ -53,7 +54,7 @@ impl core::fmt::Debug for HistoricalStateReader {
 ///
 /// The batches are shared (`Arc`) so a storage manager can keep them as snapshots for readers
 /// while they wait to be committed.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StateChanges {
     pub(crate) user: Arc<VersionedSchemaBatch<UserValues>>,
     pub(crate) kernel: Arc<VersionedSchemaBatch<KernelValues>>,
@@ -96,8 +97,8 @@ impl HistoricalStateReader {
         kernel: VersionedDeltaReader<KernelValues, DbCache>,
         root_hash_reader: DeltaReader,
     ) -> anyhow::Result<Self> {
-        let user_version = user.latest_version();
-        let kernel_version = kernel.latest_version();
+        let user_version = user.latest_version()?;
+        let kernel_version = kernel.latest_version()?;
         let root_version = Self::last_version_from_reader(&root_hash_reader)?.map(|v| v.get());
         anyhow::ensure!(
             user_version == kernel_version && user_version == root_version,
@@ -130,16 +131,18 @@ impl HistoricalStateReader {
         self.next_version.checked_sub(1)
     }
 
-    /// The newest committed version, which can be newer than [`last_version`](Self::last_version)
-    /// if more was committed since this reader was created. `None` if nothing is committed.
+    /// The newest version this reader can see: the newest committed one, which can be newer
+    /// than [`last_version`](Self::last_version) if more was committed since this reader was
+    /// created, or the newest of this reader's uncommitted snapshots if newer. `None` if neither
+    /// exists.
     ///
     /// Upstream returned genesis for an empty store too, the same as when version 0 is committed.
     pub fn last_version_unbound(&self) -> anyhow::Result<Option<SlotNumber>> {
         Self::last_version_from_reader(&self.root_hash_reader)
     }
 
-    /// The newest committed version and its root (unbound, like
-    /// [`last_version_unbound`](Self::last_version_unbound)).
+    /// The newest version and its root (unbound: the newest committed version or a newer one
+    /// of this reader's snapshots, like [`last_version_unbound`](Self::last_version_unbound)).
     pub fn latest_root_and_version_unbound(
         &self,
     ) -> anyhow::Result<Option<(SlotNumber, NomtRoots)>> {
@@ -158,8 +161,9 @@ impl HistoricalStateReader {
         }
     }
 
-    /// The newest committed value of `key` (unbound). Never reads archival rows, so never fails
-    /// with `PrunedVersion`.
+    /// The newest value of `key` (unbound): the newest committed one, or the newest of this
+    /// reader's snapshots that are newer than the committed version. Never reads archival rows,
+    /// so never fails with `PrunedVersion`.
     pub fn get_value_unbound(
         &self,
         namespace: ProvableNamespace,
@@ -192,7 +196,9 @@ impl HistoricalStateReader {
     /// this reader's version, from `cursor` (inclusive) if given.
     ///
     /// The iterator holds the flat store's cache read lock until dropped: commits wait for it,
-    /// and opening a second iterator on the same thread while a commit waits deadlocks.
+    /// and opening a second iterator on the same thread while a commit waits deadlocks. So does
+    /// opening a NOMT session on the same thread while a storage manager finalizes (its commit
+    /// holds the overlays lock the session waits for, and waits for the iterator).
     ///
     /// # Errors
     /// If the cursor does not start with `prefix`, or if a newer version has been committed
