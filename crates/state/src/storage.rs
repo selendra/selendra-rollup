@@ -375,7 +375,7 @@ mod native {
     ///
     /// # Panics
     /// Methods that return a bare `Option` or value (`get_accessory`, `get_root_hash*`,
-    /// `get_unbound`, `get_accessory_unbound`, `latest_version_unbound`, and [`Storage::get`] /
+    /// `get_unbound`, `latest_version_unbound`, and [`Storage::get`] /
     /// [`Storage::get_leaf`]) and the iterators of `maybe_iter_*` panic if a database read fails,
     /// including a read of a pruned version: `None` means "absent", so an error cannot be
     /// returned as one. The methods returning `anyhow::Result` return such errors.
@@ -495,11 +495,16 @@ mod native {
         /// Gets the newest accessory value for the given key at or below `max_version` (`None`:
         /// any), regardless of the version number associated with this storage: committed, or,
         /// for a storage on uncommitted blocks (built by a storage manager), of those blocks.
+        ///
+        /// # Errors
+        /// If `max_version` has been pruned (an API passes a caller's version: a pruned one
+        /// must be an error for the caller, not a panic of the node, and not "absent"), or if the
+        /// read fails. (Upstream returned a bare `Option` and panicked on any error.)
         fn get_accessory_unbound(
             &self,
             key: SlotKey,
             max_version: Option<SlotNumber>,
-        ) -> Option<SlotValue>;
+        ) -> anyhow::Result<Option<SlotValue>>;
 
         /// Iterates over the user key/value pairs of this storage's version (committed, or of
         /// its own uncommitted blocks if a storage manager built it on some) whose key starts

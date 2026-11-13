@@ -12,7 +12,9 @@ use rockbound::{SchemaBatch, rocksdb};
 use selendra_interface::common::SlotNumber;
 use selendra_state::{SlotKey, SlotValue};
 
+use crate::HistoricalValueError;
 use crate::nomt_state::NomtRoots;
+use crate::pruner::{VersionPin, accessory_pruned_version};
 use crate::schema::{
     ACCESSORY_TABLES, AccessoryKeysByVersion, ModuleAccessoryState, StateRootHashes,
 };
@@ -42,6 +44,21 @@ impl DbOptions {
     }
 }
 
+/// Fails with [`HistoricalValueError::PrunedVersion`] if a read of the database at `version`
+/// may have lost its row to pruning: `version` at or below the watermark.
+fn ensure_not_pruned(db: &DeltaReader, version: SlotNumber) -> anyhow::Result<()> {
+    if let Some(pruned) = accessory_pruned_version(db)?
+        && version <= pruned
+    {
+        return Err(HistoricalValueError::PrunedVersion {
+            requested_version: version.get(),
+            oldest_available_version: pruned.get().checked_add(1),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// A row of [`ModuleAccessoryState`]: `((key, version), value)`.
 type AccessoryRow = ((Vec<u8>, SlotNumber), Option<SlotValue>);
 
@@ -67,7 +84,11 @@ pub(crate) fn ensure_version_is_correct(
 /// A typed reader of the accessory store: the committed database plus uncommitted snapshots.
 ///
 /// Every version of every key is kept (a delete is stored as `None`), so reads at a past version
-/// are exact until pruned.
+/// are exact until pruned. Reads at or below the pruning watermark
+/// ([`MetadataKey::AccessoryPrunedVersion`](crate::schema::MetadataKey)) fail with
+/// [`HistoricalValueError::PrunedVersion`] (inside the `anyhow::Error`): pruning may have
+/// deleted the row they would read (upstream had no watermark, so such a read returned another
+/// key's row's verdict: `None`).
 #[derive(Clone, Debug)]
 pub struct AccessoryDb {
     /// The database plus the snapshots, merged.
@@ -76,6 +97,8 @@ pub struct AccessoryDb {
     /// when the snapshots were taken, and the snapshots (`None`: not known, as for
     /// [`with_reader`](Self::with_reader)).
     layers: Option<Layers>,
+    /// Keeps the base version from being pruned while this reader (or a clone) lives.
+    _pin: Option<VersionPin>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,15 +131,18 @@ impl AccessoryDb {
         Self {
             db: reader,
             layers: None,
+            _pin: None,
         }
     }
 
     /// A reader of `db` at version `base` (`None`: empty) plus `snapshots`, the batches of the
-    /// versions after it, oldest first, one each.
+    /// versions after it, oldest first, one each; `pin` keeps `base` from being pruned while
+    /// the reader lives.
     pub(crate) fn with_snapshots(
         db: Arc<rockbound::DB>,
         base: Option<SlotNumber>,
         snapshots: Vec<Arc<SchemaBatch>>,
+        pin: Option<VersionPin>,
     ) -> Self {
         Self {
             db: DeltaReader::new(db.clone(), snapshots.clone()),
@@ -125,23 +151,29 @@ impl AccessoryDb {
                 base,
                 snapshots,
             }),
+            _pin: pin,
         }
     }
 
     /// The value of `key` at `version`: the newest write at or below it, in the snapshots or
     /// the database (`None` if absent or deleted). Unbound: the database's rows after the
     /// snapshots' base version count too, even if another fork's block wrote them.
+    ///
+    /// # Errors
+    /// [`HistoricalValueError::PrunedVersion`] if `version` is at or below the pruning
+    /// watermark; read errors.
     pub fn get_value_option(
         &self,
         key: &SlotKey,
         version: SlotNumber,
     ) -> anyhow::Result<Option<SlotValue>> {
-        ensure_version_is_correct(
-            key.as_ref(),
-            version,
-            self.db
-                .get_prev::<ModuleAccessoryState>(&(key.as_ref(), version))?,
-        )
+        let found = self
+            .db
+            .get_prev::<ModuleAccessoryState>(&(key.as_ref(), version))?;
+        // After the read: a pass that deleted the row read also moved the watermark, in the same
+        // write.
+        ensure_not_pruned(&self.db, version)?;
+        ensure_version_is_correct(key.as_ref(), version, found)
     }
 
     /// The value of `key` at `version`, a version this reader sees: its newest write in the
@@ -152,6 +184,10 @@ impl AccessoryDb {
     /// are not this reader's: they may be another fork's block of the same version, committed
     /// after the snapshots' block was discarded (the merged read,
     /// [`get_value_option`](Self::get_value_option), would read them as this reader's).
+    ///
+    /// # Errors
+    /// [`HistoricalValueError::PrunedVersion`] if the database is read at a version at or below
+    /// the pruning watermark (`requested_version` is that version); read errors.
     pub(crate) fn get_value_bound(
         &self,
         key: &SlotKey,
@@ -179,13 +215,11 @@ impl AccessoryDb {
             return Ok(None);
         };
         let db_version = version.min(base);
-        ensure_version_is_correct(
-            key.as_ref(),
-            db_version,
-            layers
-                .committed
-                .get_prev::<ModuleAccessoryState>(&(key.as_ref(), db_version))?,
-        )
+        let found = layers
+            .committed
+            .get_prev::<ModuleAccessoryState>(&(key.as_ref(), db_version))?;
+        ensure_not_pruned(&layers.committed, db_version)?;
+        ensure_version_is_correct(key.as_ref(), db_version, found)
     }
 
     /// The writes of one version as a batch: every write is a put (a delete puts `None`, so

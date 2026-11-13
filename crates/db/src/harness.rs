@@ -148,6 +148,11 @@ impl<S: MerkleProofSpec> TestDbs<S> {
         &self.group
     }
 
+    /// The databases' directory.
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
     /// The committed root.
     pub fn root(&self) -> StorageRoot<S> {
         self.group.roots().into()
@@ -188,6 +193,38 @@ impl<S: MerkleProofSpec> TestDbs<S> {
             checkpoint.materialize_update(self.root());
         update.add_accessory_items(accessory.freeze());
         (storage.materialize_changes(update), root)
+    }
+
+    /// Commits `user`, `kernel` and `accessory` (`None`: delete) as the next version, through a
+    /// checkpoint over a new storage. Returns the new root.
+    pub fn commit_writes(
+        &mut self,
+        user: Writes<'_>,
+        kernel: Writes<'_>,
+        accessory: Writes<'_>,
+    ) -> StorageRoot<S> {
+        self.commit_with(WitnessMode::Off, |checkpoint| {
+            for (key, value) in user {
+                let Ok(()) = write::<User, _>(checkpoint, key, value);
+            }
+            for (key, value) in kernel {
+                let Ok(()) = write::<Kernel, _>(checkpoint, key, value);
+            }
+            for (key, value) in accessory {
+                let Ok(()) = write::<Accessory, _>(checkpoint, key, value);
+            }
+        })
+    }
+
+    /// One pruning pass ([`DbGroup::prune`]).
+    pub fn prune(
+        &mut self,
+        versions_to_keep: u64,
+        max_keys_per_run: u64,
+    ) -> anyhow::Result<crate::PruneStats> {
+        let nonzero = |n: u64| core::num::NonZeroU64::new(n).expect("not zero");
+        self.group
+            .prune(nonzero(versions_to_keep), nonzero(max_keys_per_run))
     }
 
     /// Runs `f` on a checkpoint over a new storage, then commits its changes (accessory writes
@@ -365,12 +402,18 @@ impl<S: MerkleProofSpec> TestManager<S> {
     /// Drops the manager (its unfinalized blocks are lost) and opens it again: crash recovery
     /// runs, and the finalized block comes from the ledger.
     pub fn reopen(self) -> Self {
+        self.reopen_with(|_| {})
+    }
+
+    /// [`reopen`](Self::reopen) with the configuration changed by `f` (kept for later reopens).
+    pub fn reopen_with(self, f: impl FnOnce(&mut StorageManagerConfig)) -> Self {
         let Self {
             manager,
             dir,
-            config,
+            mut config,
         } = self;
         drop(manager);
+        f(&mut config);
         let manager = NomtStorageManager::open(config.clone()).expect("reopen the storage manager");
         Self {
             manager,

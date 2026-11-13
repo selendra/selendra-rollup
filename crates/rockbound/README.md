@@ -1,7 +1,4 @@
 # Rockbound
-
-A copy of [Sovereign Labs' rockbound](https://github.com/sovereign-labs/rockbound) at rev
-`0aa43d4e581e047ba8d8e7a662ec6ade32b2cae3` (crate version 0.1.0), with fixes. It is
 Apache-2.0 licensed (see `LICENSE`, `NOTICE`), and parts of it are derived from Aptos'
 `schemadb`. The selendra node uses it as the flat (value) store under NOMT.
 
@@ -44,6 +41,12 @@ Fixes (regression tests in `tests/versioned_db_inner/fixes.rs`):
   DB is still there, else the archive), and a reader built on the empty DB reads only its
   snapshots. If the base version was pruned, `PrunedVersion::requested_version` is the base
   version (the version read, now documented as such), not the requested one.
+- **Pruning kept delete markers forever.** `VersionedDB::collect_pruning_batch` deletes the
+  predecessor of each collected write and keeps a key's newest write at or before the cutoff.
+  Upstream kept that write even when it was a delete marker, so every key ever deleted kept one
+  archival row forever. That marker is now deleted too: every older row of the key is gone by
+  then (each collected write deletes its predecessor), so reads at any version still find the
+  key absent, and the watermark (`PrunedVersion`) is unchanged.
 - **Reader version overflow.** `VersionedDeltaReader::latest_version` (the base version plus one
   per snapshot) was added unchecked, so a reader past `u64::MAX` panicked on every read, or saw
   a wrapped version without overflow checks. It is now checked and returns

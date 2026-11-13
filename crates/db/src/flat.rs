@@ -25,7 +25,9 @@ use crate::nomt_state::NomtRoots;
 use crate::schema::StateRootHashes;
 
 /// The flat value store: for each provable namespace, rockbound's [`VersionedDB`] (one live
-/// value per key plus every past value), and the root of every version.
+/// value per key plus its past values back to the pruning watermark: the pruner
+/// ([`DbGroup::prune`](crate::DbGroup::prune)) deletes archival rows at or below its cutoff),
+/// and the root of every version.
 ///
 /// - The live DB (`state-db`) holds the live values, the committed version and the roots.
 /// - The archival DB (`archival-state-db`) holds the past values, the keys written per version

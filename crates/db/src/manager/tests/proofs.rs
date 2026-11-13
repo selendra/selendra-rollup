@@ -126,7 +126,7 @@ fn with_prefix(state: &BTreeMap<SlotKey, SlotValue>, prefix: &Prefix) -> Vec<(Sl
 }
 
 /// `storage` sees `state`: point reads of every key, and iteration.
-fn assert_state(storage: &TestStorage, state: &InMemoryState) {
+pub(super) fn assert_state(storage: &TestStorage, state: &InMemoryState) {
     assert_point_reads(storage, state);
     for prefix in &USER_PREFIXES {
         let read: Vec<_> = storage
@@ -145,7 +145,7 @@ fn assert_state(storage: &TestStorage, state: &InMemoryState) {
 }
 
 /// `storage`'s point reads of every key see `state`.
-fn assert_point_reads(storage: &TestStorage, state: &InMemoryState) {
+pub(super) fn assert_point_reads(storage: &TestStorage, state: &InMemoryState) {
     let witness = Default::default();
     for key in all_keys() {
         assert_eq!(
@@ -166,7 +166,7 @@ fn assert_point_reads(storage: &TestStorage, state: &InMemoryState) {
 /// Executes `ops` as block `hdr` on `m` with the witness on: the guest verifier, fed only the
 /// witness, replays it to the same results, accesses and root, and consumes the witness. Saves
 /// the block; the state after it is the model's. Returns the model after the block and the root.
-fn execute(
+pub(super) fn execute(
     m: &mut TestStorageManager<Spec>,
     hdr: &TestHeader,
     ops: &[Op],

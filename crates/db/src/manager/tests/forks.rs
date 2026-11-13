@@ -15,17 +15,17 @@ use crate::prover::GetWithProofError;
 /// A fork of `length` blocks starting `start_height` blocks after its parent fork's first block
 /// (the root fork: at height `start_height`), with child forks (upstream `ForkDescription`).
 #[derive(Clone, Debug)]
-struct ForkDescription {
-    start_height: u64,
-    length: u64,
-    child_forks: Vec<ForkDescription>,
+pub(super) struct ForkDescription {
+    pub(super) start_height: u64,
+    pub(super) length: u64,
+    pub(super) child_forks: Vec<ForkDescription>,
 }
 
 /// The blocks of a [`ForkDescription`], each with its children (upstream `ForkMap`).
 #[derive(Default)]
-struct ForkMap {
-    blocks: HashMap<HexHash, (TestHeader, Vec<HexHash>)>,
-    start: Option<HexHash>,
+pub(super) struct ForkMap {
+    pub(super) blocks: HashMap<HexHash, (TestHeader, Vec<HexHash>)>,
+    pub(super) start: Option<HexHash>,
 }
 
 impl From<ForkDescription> for ForkMap {
@@ -61,16 +61,16 @@ impl From<ForkDescription> for ForkMap {
 }
 
 impl ForkMap {
-    fn header(&self, hash: &HexHash) -> &TestHeader {
+    pub(super) fn header(&self, hash: &HexHash) -> &TestHeader {
         &self.blocks[hash].0
     }
 
-    fn children(&self, hash: &HexHash) -> Vec<HexHash> {
+    pub(super) fn children(&self, hash: &HexHash) -> Vec<HexHash> {
         self.blocks[hash].1.clone()
     }
 
     /// The blocks from the first one to `hash` (inclusive).
-    fn chain_up_to(&self, hash: &HexHash) -> Vec<TestHeader> {
+    pub(super) fn chain_up_to(&self, hash: &HexHash) -> Vec<TestHeader> {
         let mut chain = Vec::new();
         let mut current = Some(*hash);
         while let Some(hash) = current {

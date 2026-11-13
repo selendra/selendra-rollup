@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ca98b3c626155f5254676eb21dcd02dd0059f5c23e3eecd766e3d6363fc65289 # shrinks to input = _PruningModelArgs { history: [0, 230, 4366, 51448], versions_to_keep: 1, max_keys_per_run: 4, pins: [(true, 194), (true, 14), (false, 47), (true, 13), (true, 121), (false, 135), (true, 32), (true, 165), (false, 105), (false, 12), (false, 58), (true, 55), (true, 137), (true, 221)] }

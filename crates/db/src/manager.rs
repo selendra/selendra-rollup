@@ -23,6 +23,7 @@ use crate::group::SnapshotGroup;
 use crate::historical::next_version_after;
 use crate::ledger::{self, LedgerChangeSet, LedgerReader, StoredSlot};
 use crate::nomt_state::SharedOverlays;
+use crate::pruner::{PruneStats, PrunerConfig};
 use crate::recovery::RecoveryReport;
 use crate::{DbGroup, NomtChangeSet, NomtProverStorage, NomtRoots, StateDbConfig, WitnessMode};
 
@@ -42,6 +43,8 @@ pub struct StorageManagerConfig {
     /// At most this many uncommitted blocks (executed or being executed, on every fork) are
     /// kept; more is an error of `create_state_for` (finalize first). Upstream had no bound.
     pub max_unfinalized_blocks: NonZeroU64,
+    /// When old versions are pruned ([`PrunerConfig`]; default: never).
+    pub pruning: PrunerConfig,
 }
 
 impl StorageManagerConfig {
@@ -51,12 +54,14 @@ impl StorageManagerConfig {
         None => NonZeroU64::MIN,
     };
 
-    /// A configuration with the state databases `state`, witness `witness`, and the defaults.
+    /// A configuration with the state databases `state`, witness `witness`, and the defaults
+    /// (no pruning).
     pub fn new(state: StateDbConfig, witness: WitnessMode) -> Self {
         Self {
             state,
             witness,
             max_unfinalized_blocks: Self::DEFAULT_MAX_UNFINALIZED_BLOCKS,
+            pruning: PrunerConfig::Off,
         }
     }
 }
@@ -107,6 +112,17 @@ impl StorageManagerConfig {
 /// ([`DbGroup::is_poisoned`]), and the manager with them: every method fails until the manager
 /// is dropped and opened again (crash recovery repairs the databases). Failures before anything
 /// is written (any check) leave the manager usable and unchanged.
+///
+/// **Pruning** ([`StorageManagerConfig::pruning`], [`pruner`](crate::pruner)): synchronous, no
+/// background thread (upstream ran a pruner thread whose batch a later finalization committed,
+/// and could fail a finalization after its commit). [`PrunerConfig::OnceAtStartup`] prunes
+/// while the manager is opened, until nothing is left; [`PrunerConfig::Periodic`] runs one pass
+/// at the end of a finalization, after the commits, bounded by its budget. A failed pass does
+/// not fail the finalization (its blocks are committed: upstream returned an `Err` the runner
+/// stopped on) and poisons nothing: it is kept in [`last_prune_error`](Self::last_prune_error),
+/// logged, and retried at the next finalization. Every storage the manager hands out pins the
+/// committed version it is based on, so pruning never removes what a live storage reads
+/// (upstream's storages older than the pruning window panicked on their next read).
 pub struct NomtStorageManager<S: MerkleProofSpec, Hdr: BlockHeaderTrait> {
     group: DbGroup<S::Hasher>,
     /// The NOMT overlays of the saved blocks, shared with the storages built on them.
@@ -119,6 +135,13 @@ pub struct NomtStorageManager<S: MerkleProofSpec, Hdr: BlockHeaderTrait> {
     max_unfinalized_blocks: NonZeroU64,
     /// Set when the manager's own state can no longer be trusted (an overlay lost).
     poisoned: bool,
+    pruning: PrunerConfig,
+    /// The committed version at the last periodic pass that left no backlog.
+    pruned_at: Option<SlotNumber>,
+    last_prune: Option<PruneStats>,
+    last_prune_error: Option<anyhow::Error>,
+    /// Pruning passes run (tests).
+    prune_runs: u64,
     _spec: PhantomData<fn() -> S>,
 }
 
@@ -129,6 +152,7 @@ impl<S: MerkleProofSpec, Hdr: BlockHeaderTrait> core::fmt::Debug for NomtStorage
             .field("unfinalized", &self.tree.len())
             .field("saved", &self.snapshots.len())
             .field("poisoned", &self.is_poisoned())
+            .field("pruning", &self.pruning)
             .finish_non_exhaustive()
     }
 }
@@ -144,11 +168,13 @@ struct Parent {
 
 impl<S: MerkleProofSpec, Hdr: BlockHeaderTrait> NomtStorageManager<S, Hdr> {
     /// Opens the state databases ([`DbGroup::open`]: crash recovery included) and takes the
-    /// finalized block from the ledger's newest slot.
+    /// finalized block from the ledger's newest slot. With [`PrunerConfig::OnceAtStartup`], then
+    /// prunes until nothing is left (before any storage exists; this blocks for as long as it
+    /// takes).
     ///
     /// # Errors
-    /// If the databases fail to open, or the ledger's newest slot's DA hash is not a valid
-    /// `Hdr::Hash`.
+    /// If the databases fail to open, the ledger's newest slot's DA hash is not a valid
+    /// `Hdr::Hash`, or the startup pruning fails.
     pub fn open(config: StorageManagerConfig) -> anyhow::Result<Self> {
         Self::open_with_faults(config, Faults::default())
     }
@@ -187,7 +213,7 @@ impl<S: MerkleProofSpec, Hdr: BlockHeaderTrait> NomtStorageManager<S, Hdr> {
                 .as_ref()
                 .map(|block| (block.hash.clone(), block.da_height)),
         );
-        Ok(Self {
+        let mut manager = Self {
             group,
             overlays: SharedOverlays::default(),
             snapshots: HashMap::new(),
@@ -196,8 +222,104 @@ impl<S: MerkleProofSpec, Hdr: BlockHeaderTrait> NomtStorageManager<S, Hdr> {
             witness: config.witness,
             max_unfinalized_blocks: config.max_unfinalized_blocks,
             poisoned: false,
+            pruning: config.pruning,
+            pruned_at: None,
+            last_prune: None,
+            last_prune_error: None,
+            prune_runs: 0,
             _spec: PhantomData,
-        })
+        };
+        if let PrunerConfig::OnceAtStartup {
+            versions_to_keep,
+            max_keys_per_run,
+        } = config.pruning
+        {
+            manager
+                .prune_to_completion(versions_to_keep, max_keys_per_run)
+                .context("one-time startup pruning failed")?;
+        }
+        Ok(manager)
+    }
+
+    /// Prunes until no store has a backlog. Every pass consumes the index entries it inspects,
+    /// so this ends (B13: upstream looped while a pass hit its size limit, forever if a pass did
+    /// not consume what it inspected); and it does not stop at a pass that deleted nothing
+    /// (critique #7: a batch of first writes deletes nothing, with prunable rows after it).
+    fn prune_to_completion(
+        &mut self,
+        versions_to_keep: NonZeroU64,
+        max_keys_per_run: NonZeroU64,
+    ) -> anyhow::Result<()> {
+        let start = std::time::Instant::now();
+        let (mut passes, mut rows) = (0u64, 0u64);
+        loop {
+            let stats = self.run_prune(versions_to_keep, max_keys_per_run)?;
+            passes = passes.saturating_add(1);
+            rows = rows.saturating_add(stats.rows_deleted());
+            if !stats.has_backlog() {
+                break;
+            }
+        }
+        tracing::info!(
+            passes,
+            rows_deleted = rows,
+            elapsed = ?start.elapsed(),
+            "Startup pruning done"
+        );
+        Ok(())
+    }
+
+    /// One pruning pass, recorded.
+    fn run_prune(
+        &mut self,
+        versions_to_keep: NonZeroU64,
+        max_keys_per_run: NonZeroU64,
+    ) -> anyhow::Result<PruneStats> {
+        self.prune_runs = self.prune_runs.saturating_add(1);
+        let stats = self.group.prune(versions_to_keep, max_keys_per_run)?;
+        self.last_prune = Some(stats);
+        Ok(stats)
+    }
+
+    /// The periodic pass after a finalization that committed up to `hdr`, if one is due: once
+    /// `every_versions` versions were committed since the last pass that left no backlog (or
+    /// if none ran yet), and after any pass that left a backlog. Errors are kept, not returned.
+    fn prune_after_finalize(&mut self, hdr: &Hdr) {
+        let PrunerConfig::Periodic {
+            every_versions,
+            versions_to_keep,
+            max_keys_per_run,
+        } = self.pruning
+        else {
+            return;
+        };
+        let Some(latest) = self.latest_version() else {
+            return;
+        };
+        // `>=`: upstream's `>` ran an interval-1 pruner every second block.
+        let due = self.pruned_at.is_none_or(|pruned_at| {
+            latest.get().saturating_sub(pruned_at.get()) >= every_versions.get()
+        });
+        if !due {
+            return;
+        }
+        match self.run_prune(versions_to_keep, max_keys_per_run) {
+            Ok(stats) => {
+                if !stats.has_backlog() {
+                    self.pruned_at = Some(latest);
+                }
+                self.last_prune_error = None;
+            }
+            Err(error) => {
+                let error = error.context(format!(
+                    "block {} is finalized and committed, but pruning after it failed (retried \
+                     at the next finalization)",
+                    hdr.display()
+                ));
+                tracing::warn!(error = format!("{error:#}"), "Pruning failed");
+                self.last_prune_error = Some(error);
+            }
+        }
     }
 
     /// The newest committed version: the finalized block's slot (`None`: nothing committed).
@@ -218,6 +340,43 @@ impl<S: MerkleProofSpec, Hdr: BlockHeaderTrait> NomtStorageManager<S, Hdr> {
     /// What startup crash recovery did when the databases were opened.
     pub fn last_recovery(&self) -> &RecoveryReport {
         self.group.last_recovery()
+    }
+
+    /// What the last pruning pass did (`None`: none ran).
+    pub fn last_prune(&self) -> Option<&PruneStats> {
+        self.last_prune.as_ref()
+    }
+
+    /// Why the last periodic pruning pass failed, if it did (cleared by the next one that
+    /// succeeds). A failed pass does not fail the finalization it ran in.
+    pub fn last_prune_error(&self) -> Option<&anyhow::Error> {
+        self.last_prune_error.as_ref()
+    }
+
+    /// The oldest committed version a live storage of this manager is based on: pruning keeps
+    /// it and everything after it.
+    pub fn oldest_pinned_version(&self) -> Option<SlotNumber> {
+        self.group.oldest_pinned_version()
+    }
+
+    /// One pruning pass now, with the configured `versions_to_keep` and budget (tests).
+    ///
+    /// # Errors
+    /// If pruning is off, the manager is poisoned, or the pass fails.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn prune_now(&mut self) -> anyhow::Result<PruneStats> {
+        self.ensure_not_poisoned()?;
+        let (versions_to_keep, max_keys_per_run) = self
+            .pruning
+            .settings()
+            .ok_or_else(|| anyhow::anyhow!("pruning is off"))?;
+        self.run_prune(versions_to_keep, max_keys_per_run)
+    }
+
+    /// The number of pruning passes run since the manager was opened (tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn prune_runs(&self) -> u64 {
+        self.prune_runs
     }
 
     /// Replaces the databases' commit hook (fault injection).
@@ -602,8 +761,12 @@ impl<S: MerkleProofSpec, Hdr: BlockHeaderTrait> HierarchicalStorageManager<Hdr>
     /// other from the finalized block). Each block is then committed under the overlays write
     /// lock, released between blocks ([`CommitPoint::BetweenSegments`]).
     ///
-    /// Never call it while this thread holds a NOMT session or a storage's prefix iterator (see
-    /// [`NomtStorageManager`], Locking).
+    /// With [`PrunerConfig::Periodic`], a pruning pass follows the commits when one is due
+    /// (see [`NomtStorageManager`], Pruning); its failure does not fail the finalization.
+    ///
+    /// Blocking: it writes every database (synced) and prunes. From async code, call it on a
+    /// blocking thread (`spawn_blocking`). Never call it while this thread holds a NOMT session
+    /// or a storage's prefix iterator (see [`NomtStorageManager`], Locking).
     ///
     /// # Errors
     /// While poisoned; if `hdr` is not a saved block (unknown, discarded, not saved) or not
@@ -706,6 +869,7 @@ impl<S: MerkleProofSpec, Hdr: BlockHeaderTrait> HierarchicalStorageManager<Hdr>
                 self.group.hit(CommitPoint::BetweenSegments)?;
             }
         }
+        self.prune_after_finalize(hdr);
         Ok(())
     }
 

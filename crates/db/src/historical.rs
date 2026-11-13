@@ -12,6 +12,7 @@ use selendra_state::{Kernel, SlotKey, SlotValue, User};
 
 use crate::flat::DbCache;
 use crate::nomt_state::NomtRoots;
+use crate::pruner::VersionPin;
 use crate::schema::{NomtStateValues, StateRootHashes};
 
 /// A key and its value, as iterated.
@@ -32,6 +33,10 @@ pub(crate) type KernelValues = NomtStateValues<Kernel>;
 ///
 /// Errors carry rockbound's [`HistoricalValueError`](crate::HistoricalValueError) where it
 /// applies (use `downcast_ref`).
+///
+/// A reader built by [`DbGroup::readers`](crate::DbGroup::readers) or the storage manager pins
+/// its base version (the newest committed version when it was built), so pruning keeps what its
+/// bound reads need while it or a clone lives ([`pruner`](crate::pruner)).
 #[derive(Clone)]
 pub struct HistoricalStateReader {
     user: VersionedDeltaReader<UserValues, DbCache>,
@@ -39,6 +44,8 @@ pub struct HistoricalStateReader {
     root_hash_reader: DeltaReader,
     /// The version the next writes get. Reads are bound to the versions before it.
     next_version: SlotNumber,
+    /// Keeps the base version from being pruned while this reader (or a clone) lives.
+    _pin: Option<VersionPin>,
 }
 
 impl core::fmt::Debug for HistoricalStateReader {
@@ -111,7 +118,19 @@ impl HistoricalStateReader {
             kernel,
             root_hash_reader,
             next_version,
+            _pin: None,
         })
+    }
+
+    /// This reader, holding `pin` (its base version's) while it or a clone lives.
+    pub(crate) fn with_pin(self, pin: Option<VersionPin>) -> Self {
+        Self { _pin: pin, ..self }
+    }
+
+    /// The version this reader pins (tests).
+    #[cfg(test)]
+    pub(crate) fn pinned_version(&self) -> Option<SlotNumber> {
+        self._pin.as_ref().map(VersionPin::version)
     }
 
     /// The newest version with a root in `reader`.

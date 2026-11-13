@@ -483,8 +483,8 @@ mod native {
             &self,
             key: SlotKey,
             _max_version: Option<SlotNumber>,
-        ) -> Option<SlotValue> {
-            self.get_accessory(&key)
+        ) -> anyhow::Result<Option<SlotValue>> {
+            Ok(self.get_accessory(&key))
         }
 
         fn maybe_iter_user_values_with_prefix(
@@ -587,7 +587,7 @@ mod native {
         assert_eq!(storage.get_latest_root_hash(), Some(storage.root()));
         assert_eq!(storage.get_latest_root_hash_unbound(), Some(storage.root()));
         assert_eq!(storage.get_accessory_historical(&key, None).unwrap(), None);
-        assert_eq!(storage.get_accessory_unbound(key, None), None);
+        assert_eq!(storage.get_accessory_unbound(key, None).unwrap(), None);
         // Witness-free: native reads add no hints.
         assert!(crate::Witness::is_empty(&witness));
     }

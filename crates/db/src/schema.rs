@@ -229,7 +229,11 @@ impl ValueCodec<StateRootHashes> for NomtRoots {
 }
 
 define_table!(
-    /// Accessory state (not provable, for JSON-RPC): every version of every key.
+    /// Accessory state (not provable, for JSON-RPC): every version of every key until pruned.
+    /// The pruner ([`crate::pruner`]) deletes each row that a newer row of the same key at or
+    /// below its cutoff replaces, and a key's delete marker once its older rows are gone; reads
+    /// at or below the watermark ([`MetadataKey::AccessoryPrunedVersion`]) are
+    /// [`PrunedVersion`](crate::HistoricalValueError::PrunedVersion).
     ///
     /// The key is borsh `Vec<u8>` (`u32` little-endian length, then the bytes) followed by the
     /// slot number big-endian, so the rows of one key are contiguous and ordered by version:
@@ -240,7 +244,10 @@ define_table!(
 );
 
 define_table!(
-    /// Index of the accessory keys written at each slot number (for rollback).
+    /// Index of the accessory keys written at each slot number (for rollback and pruning). Not
+    /// complete once pruning ran: each pass of the pruner ([`crate::pruner`]) consumes (deletes)
+    /// the oldest entries it processes, up to its cutoff, which may be above
+    /// [`MetadataKey::AccessoryPrunedVersion`].
     AccessoryKeysByVersion, "accessory_keys_by_version", (SlotNumber, Vec<u8>) => ()
 );
 
@@ -369,16 +376,22 @@ pub enum MetadataKey {
     /// [`DbGroup::open`](crate::DbGroup::open) of empty databases and checked by every later
     /// one.
     StateHasher,
+    /// The accessory store's pruning watermark: the newest version whose reads may have lost
+    /// rows to pruning (`u64` big-endian, 8 bytes). Reads at or below it are
+    /// [`HistoricalValueError::PrunedVersion`](crate::HistoricalValueError) errors. Only grows;
+    /// absent until pruning first deleted a row.
+    AccessoryPrunedVersion,
 }
 
 impl MetadataKey {
     /// Every key (decoding looks the stored name up here).
-    const ALL: [Self; 1] = [Self::StateHasher];
+    const ALL: [Self; 2] = [Self::StateHasher, Self::AccessoryPrunedVersion];
 
     /// The stored key bytes.
     fn name(self) -> &'static [u8] {
         match self {
             Self::StateHasher => b"state_hasher",
+            Self::AccessoryPrunedVersion => b"accessory_pruned_version",
         }
     }
 }
@@ -1018,6 +1031,10 @@ mod tests {
     fn metadata_key_encoding_is_pinned() {
         let encoded = <_ as KeyEncoder<DbMetadata>>::encode_key(&MetadataKey::StateHasher).unwrap();
         assert_eq!(encoded, b"state_hasher");
+        let encoded =
+            <_ as KeyEncoder<DbMetadata>>::encode_key(&MetadataKey::AccessoryPrunedVersion)
+                .unwrap();
+        assert_eq!(encoded, b"accessory_pruned_version");
         for key in MetadataKey::ALL {
             let encoded = <_ as KeyEncoder<DbMetadata>>::encode_key(&key).unwrap();
             assert_eq!(

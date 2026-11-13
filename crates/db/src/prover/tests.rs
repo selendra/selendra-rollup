@@ -132,7 +132,9 @@ fn assert_proof_matches_storage_and_accessory(
         (proof, slot_number, root_hash)
     );
     assert_eq!(
-        storage.get_accessory_unbound(accessory_key.clone(), Some(slot_number)),
+        storage
+            .get_accessory_unbound(accessory_key.clone(), Some(slot_number))
+            .unwrap(),
         Some(expected_value.clone())
     );
 }
@@ -1438,9 +1440,11 @@ fn accessory_items_are_committed() {
     let storage = dbs.storage(OFF);
     assert_eq!(stale.get_accessory(&k), Some(slot_value(b"a")));
     assert_eq!(storage.get_accessory(&k), None);
-    assert_eq!(stale.get_accessory_unbound(k.clone(), None), None);
+    assert_eq!(stale.get_accessory_unbound(k.clone(), None).unwrap(), None);
     assert_eq!(
-        storage.get_accessory_unbound(k.clone(), Some(SlotNumber::GENESIS)),
+        storage
+            .get_accessory_unbound(k.clone(), Some(SlotNumber::GENESIS))
+            .unwrap(),
         Some(slot_value(b"a"))
     );
     assert_eq!(

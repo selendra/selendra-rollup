@@ -640,8 +640,16 @@ where
     ///   that every live key has at least one historical entry; see the doc on
     ///   [`VersionedDB`]). These stay point deletes; they are scattered per-key and not
     ///   safely range-able; their space is reclaimed by [`VersionedDB::trigger_compaction`].
+    /// - also deletes that surviving entry when it is a delete marker: every older entry of
+    ///   the key is gone by then, so reads at any version still find the key absent (a
+    ///   deleted key is not live; upstream kept its marker forever).
     /// - writes [`VersionedTableMetadataKey::PrunedVersion`] = the greatest
     ///   `version - 1` for which this batch deleted a historical row, if any.
+    ///
+    /// A reader at a version `p >= cutoff` reads the same values before and after the batch:
+    /// the newest entry at or below `p` of any key is never the predecessor of a collected
+    /// entry (those are below a collected version `<= cutoff`), a deleted marker reads as
+    /// absent like the marker, and the watermark stays below `cutoff`.
     ///
     /// `keep_versions` must be `>= 1`. `max_batch_size`, when set, must be `>= 1`;
     /// use `None` for an uncapped batch. If the database has no committed version yet,
@@ -649,14 +657,16 @@ where
     /// cutoff, the returned batch is empty and `last_pruned_version` is `None`.
     ///
     /// When `max_batch_size` is set, at most that many pruning entries are collected per
-    /// pass, so the batch holds at most that many historical-CF deletes (each entry
-    /// contributes at most one); `hit_size_limit` is `true` when entries remain beyond
-    /// the cap, and the caller should commit the batch and re-invoke to drain the rest.
+    /// pass, so the batch holds at most twice that many historical-CF deletes (each entry
+    /// contributes its predecessor and, last of its key's group, a delete marker);
+    /// `hit_size_limit` is `true` when entries remain beyond the cap, and the caller should
+    /// commit the batch and re-invoke to drain the rest.
     ///
     /// # Performance
     ///
     /// One sequential scan of the pruning index over the collected entries, plus at most
-    /// one historical-CF seek per *distinct key* in the pass: within a key's group of
+    /// one historical-CF seek and one point read (is the survivor a delete marker?) per
+    /// *distinct key* in the pass: within a key's group of
     /// collected versions every predecessor is known from the group itself, and only the
     /// group's oldest version needs a lookup (for a survivor left by an earlier pass).
     /// An uncapped pass buffers all prunable entries in memory (the same order of
@@ -695,7 +705,7 @@ where
         // Phase 1: collect up to `max_batch_size` pruning entries `[V|K]` with
         // `V <= cutoff`, in `[version_be || key]` order. Bounding the collection bounds
         // both this pass's memory and the number of deletes emitted below (each entry
-        // contributes at most one historical delete).
+        // contributes at most two historical deletes: its predecessor and a delete marker).
         let mut iter = self.iter_pruning_keys_up_to_version(cutoff)?;
         let mut collected: Vec<(u64, V::Key)> = Vec::new();
         for prunable in &mut iter {
@@ -750,27 +760,44 @@ where
         // nothing and emits nothing, so passes of either vintage compose safely.) When
         // `V1 == 0` there is nothing before it and the lookup is skipped.
         let mut prev_in_group: Option<(&[u8], u64)> = None;
-        for (version, key) in &collected {
+        for (index, (version, key)) in collected.iter().enumerate() {
             // Deleting this entry's predecessor redirects historical queries in
             // `[predecessor, version - 1]`; `version == 0` has no predecessor.
-            let Some(query_version) = version.checked_sub(1) else {
-                prev_in_group = Some((key.as_ref(), *version));
-                continue;
-            };
-            let prev_version = match prev_in_group {
-                Some((prev_key, prev_version)) if prev_key == key.as_ref() => Some(prev_version),
-                _ => self.get_version_for_key(key, query_version)?,
-            };
-            if let Some(prev_version) = prev_version {
-                batch.delete_cf_raw(
-                    V::HISTORICAL_COLUMN_FAMILY_NAME,
-                    encode_archival_key(key.as_ref(), prev_version),
-                );
-                keys_to_prune += 1;
-                // The watermark must cover the highest redirected query version.
-                last_pruned_version = last_pruned_version.max(Some(query_version));
+            if let Some(query_version) = version.checked_sub(1) {
+                let prev_version = match prev_in_group {
+                    Some((prev_key, prev_version)) if prev_key == key.as_ref() => {
+                        Some(prev_version)
+                    }
+                    _ => self.get_version_for_key(key, query_version)?,
+                };
+                if let Some(prev_version) = prev_version {
+                    batch.delete_cf_raw(
+                        V::HISTORICAL_COLUMN_FAMILY_NAME,
+                        encode_archival_key(key.as_ref(), prev_version),
+                    );
+                    keys_to_prune += 1;
+                    // The watermark must cover the highest redirected query version.
+                    last_pruned_version = last_pruned_version.max(Some(query_version));
+                }
             }
             prev_in_group = Some((key.as_ref(), *version));
+
+            // The group's last entry is the key's newest write at or before the cutoff, and every
+            // older row of the key is now deleted (by this pass or an earlier one: each entry
+            // deletes its predecessor). Its row survives, unless it is a delete marker: a read of
+            // any version then finds no row of the key, which reads as absent, like the marker.
+            // (Upstream kept the marker, so a deleted key kept one row forever.) No read result
+            // changes, so the watermark does not move.
+            let last_of_group = collected
+                .get(index + 1)
+                .is_none_or(|(_, next_key)| next_key.as_ref() != key.as_ref());
+            if last_of_group && self.is_archival_delete(key.as_ref(), *version)? {
+                batch.delete_cf_raw(
+                    V::HISTORICAL_COLUMN_FAMILY_NAME,
+                    encode_archival_key(key.as_ref(), *version),
+                );
+                keys_to_prune += 1;
+            }
         }
 
         if keys_inspected > 0 {
@@ -794,6 +821,16 @@ where
             keys_inspected,
             keys_to_prune,
         })
+    }
+
+    /// Whether the archival row `key ‖ version` is a delete marker (`false` if absent).
+    fn is_archival_delete(&self, key: &[u8], version: u64) -> anyhow::Result<bool> {
+        let is_delete = self.archival_db.get_raw_with_cf_and_decoder(
+            V::HISTORICAL_COLUMN_FAMILY_NAME,
+            &encode_archival_key(key, version),
+            &|data| Ok(decode_archival_value(data)?.is_none()),
+        )?;
+        Ok(is_delete == Some(true))
     }
 
     fn load_committed_version_from_disk(live_db: &DB) -> anyhow::Result<Option<u64>> {
@@ -1089,7 +1126,8 @@ pub struct PruningBatchOutput {
     pub last_pruned_version: Option<u64>,
     /// Number of pruning-CF entries collected (and fully processed) this pass. For metrics.
     pub keys_inspected: usize,
-    /// Number of historical-CF delete operations placed in the batch. For metrics.
+    /// Number of historical-CF delete operations placed in the batch (predecessors and delete
+    /// markers). For metrics.
     pub keys_to_prune: usize,
 }
 

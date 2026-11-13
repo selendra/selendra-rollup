@@ -138,6 +138,12 @@ impl From<anyhow::Error> for GetWithProofError {
 /// disagree must not produce a witness the guest rejects). Historical and unbound reads add no
 /// hints. With [`WitnessMode::Off`] it adds nothing, and reads are not checked against NOMT.
 ///
+/// # Pruning
+/// A storage pins the committed version it is based on until it and all its clones are dropped
+/// ([`pruner`](crate::pruner)): its bound reads stay exact however far pruning has moved, and a
+/// storage held for long holds pruning back. Historical reads of older, pruned versions fail
+/// with [`HistoricalValueError::PrunedVersion`].
+///
 /// # Errors and panics
 /// The [`NativeStorage`] methods that return a bare `Option` or value panic if a database read
 /// fails, like upstream: `None` means "absent", so an error cannot be reported as one.
@@ -342,17 +348,21 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NomtProverStorage<S, K> {
         }
     }
 
-    /// Panics on a failed bound read (`None` would mean "absent"). A pruned version means this
-    /// storage is older than the pruning window (upstream's warning).
+    /// Panics on a failed bound read (`None` would mean "absent"). A storage built on
+    /// [`DbGroup::readers`](crate::DbGroup::readers) or by the storage manager pins its base
+    /// version, so pruning never removes what its bound reads need (upstream's storages older
+    /// than the pruning window panicked here); a pruned version means a reader built otherwise.
     fn read_failed(&self, what: &str, key: &SlotKey, error: &anyhow::Error) -> ! {
-        tracing::warn!(slot = ?self.latest_version(), %key, "reader observed pruned-version race");
+        tracing::warn!(slot = ?self.latest_version(), %key, "a bound read failed");
         panic!("Database error while getting the {what} of key {key}: {error:?}");
     }
 
     /// The result of a read that cannot observe [`HistoricalValueError::PrunedVersion`] (unbound
     /// reads: they read the newest state, committed or in this storage's snapshots, never the
-    /// archival rows; accessory reads; root reads): the value, or a panic on a database error,
-    /// since `None` means "absent".
+    /// archival rows; unbound accessory reads of the newest version, never at or below the
+    /// accessory watermark; root reads, never pruned): the value, or a panic on a database
+    /// error, since `None` means "absent". (Accessory reads of a caller's version return their
+    /// `PrunedVersion` error instead: `get_accessory_unbound`.)
     fn resolve_unbound_read<T>(
         result: anyhow::Result<Option<T>>,
         source: &'static str,
@@ -857,8 +867,8 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NativeStorage for NomtProverStora
     /// committed version.
     ///
     /// On a storage whose blocks were discarded (another fork was committed), this mixes its
-    /// snapshots newer than the committed version with the committed state (TODO.md, storage
-    /// manager item); bound reads and proofs do not.
+    /// snapshots newer than the committed version with the committed state (TODO.md, Phase 13
+    /// state-API item); bound reads and proofs do not.
     fn get_unbound<N: CompileTimeNamespace>(&self, key: SlotKey) -> Option<SlotValue> {
         self.read_value_unbound::<N>(&key)
     }
@@ -869,16 +879,19 @@ impl<S: MerkleProofSpec, K: Clone + Eq + Hash> NativeStorage for NomtProverStora
     ///
     /// On a storage whose blocks were discarded, this mixes its snapshots with the committed
     /// state, as [`get_unbound`](NativeStorage::get_unbound) does.
+    ///
+    /// # Errors
+    /// [`HistoricalValueError::PrunedVersion`] (inside the `anyhow::Error`) if `max_version` is
+    /// at or below the accessory DB's pruning watermark (upstream routed this read through the
+    /// unbound resolver, which panics, so an API request for an old version would crash the
+    /// node's thread once accessory pruning exists); read errors.
     fn get_accessory_unbound(
         &self,
         key: SlotKey,
         max_version: Option<SlotNumber>,
-    ) -> Option<SlotValue> {
-        Self::resolve_unbound_read(
-            self.accessory
-                .get_value_option(&key, max_version.unwrap_or(SlotNumber::MAX)),
-            "the accessory DB",
-        )
+    ) -> anyhow::Result<Option<SlotValue>> {
+        self.accessory
+            .get_value_option(&key, max_version.unwrap_or(SlotNumber::MAX))
     }
 
     /// # Errors

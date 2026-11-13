@@ -1,7 +1,7 @@
 //! Fault injection for tests: a hook (`CommitHook`, `test-utils` only) that one
-//! [`DbGroup`](crate::DbGroup) instance calls at fixed points of its commits and of its startup
-//! crash recovery, and that a storage manager on it calls between the commits of a
-//! finalization ([`CommitPoint`]).
+//! [`DbGroup`](crate::DbGroup) instance calls at fixed points of its commits, of its pruning
+//! passes and of its startup crash recovery, and that a storage manager on it calls between the
+//! commits of a finalization ([`CommitPoint`]).
 //!
 //! A hook returning `Err` is an injected fault: the operation fails there, as if the process had
 //! died at that point. Every write of the state databases is synced to disk before the next
@@ -16,8 +16,9 @@
 use crate::recovery::RecoveryStep;
 
 /// A point where the commit hook runs: in [`DbGroup::commit`](crate::DbGroup::commit), in the
-/// startup crash recovery of [`DbGroup::open`](crate::DbGroup::open), or between the commits
-/// of a storage manager's finalization ([`BetweenSegments`](Self::BetweenSegments)).
+/// startup crash recovery of [`DbGroup::open`](crate::DbGroup::open), between the commits
+/// of a storage manager's finalization ([`BetweenSegments`](Self::BetweenSegments)), or in a
+/// pruning pass ([`DbGroup::prune`](crate::DbGroup::prune)).
 ///
 /// A commit writes, in this order: the NOMT kernel tree, the NOMT user tree, the ledger DB, the
 /// accessory DB, the flat archival DB, the flat live DB. Its points sit between these writes.
@@ -54,6 +55,12 @@ pub enum CommitPoint {
     /// finalization with the older blocks committed (nothing is half written, nothing is
     /// poisoned).
     BetweenSegments,
+    /// In a pruning pass, before the flat store's write (user and kernel values, one write
+    /// batch): nothing of the pass is written. An `Err` fails the pass (nothing is poisoned:
+    /// each store's pass is one atomic write, and the next pass goes on).
+    BeforePruneFlat,
+    /// In a pruning pass, before the accessory store's write: the flat store's is written.
+    BeforePruneAccessory,
     /// Before one step of startup crash recovery (only steps that have work to do).
     Recovery(RecoveryStep),
 }

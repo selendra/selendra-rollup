@@ -246,7 +246,7 @@ big-endian (`u64`: 8 bytes, `u32`: 4 bytes), so byte order is number order.
 | `state_root_hashes` | both, and `accessory/` | version | the 64 bytes `user_root ‖ kernel_root` (= `StorageRoot` borsh) |
 | `module_accessory_state` | `accessory/` | borsh `Vec<u8>` key ‖ version | borsh `Option<Vec<u8>>` (`None`: deleted) |
 | `accessory_keys_by_version` | `accessory/` | version ‖ borsh `Vec<u8>` key | empty |
-| `db_metadata` | `accessory/` | ASCII name: `state_hasher` | `state_hasher`: the 32 bytes `H("SELENDRA/state-hasher/v1")` |
+| `db_metadata` | `accessory/` | ASCII name: `state_hasher`, `accessory_pruned_version` | `state_hasher`: the 32 bytes `H("SELENDRA/state-hasher/v1")`; `accessory_pruned_version`: the accessory pruning watermark (`u64`) |
 | `slot_by_number` | `ledger/` | slot number | borsh `StoredSlot`: DA hash (32), DA height (`u64`), roots (64: `user ‖ kernel`), timestamp (`i64` ms), then the batch, transaction, event and discarded-blob ranges (each `start ‖ end`, `u64`) |
 | `slot_by_hash` | `ledger/` | DA block hash (32) | slot number |
 | `batch_by_number`, `tx_by_number`, `event_by_number`, `discarded_blob_by_number` | `ledger/` | item number | borsh `StoredBatch` (hash, tx range, receipt bytes, slot), `StoredTransaction` (hash, event range, `Option` body bytes, receipt bytes, batch), `StoredEvent`, `StoredDiscardedBlob` (`DiscardedBlob`, slot) |
@@ -283,6 +283,13 @@ big-endian (`u64`: 8 bytes, `u32`: 4 bytes), so byte order is number order.
   databases writes nothing hashed with `H` but can already change files: NOMT's own log replay
   and hash-table growth, RocksDB creating missing column families.) Databases that hold data
   but no tag are refused (databases from before the guard: resync).
+- Pruning (`selendra-db` `pruner`) deletes rows of the archival and accessory stores up to a
+  cutoff version, consuming the index rows (`*_pruning`, `accessory_keys_by_version`) it
+  inspects: a row is deleted when a newer write of its key at or below the cutoff exists, and a
+  key's newest row at or below the cutoff only if it is a delete marker. The watermarks
+  (`[1]` in each `*_version_metadata` of `archival-state-db/`, `db_metadata/accessory_pruned_version`)
+  are the newest version whose reads may have lost a row: reads at or below them are
+  `PrunedVersion` errors. The ledger and `state_root_hashes` are not pruned.
 - Upstream's legacy `*_jmt_values` column-family names are not used (fresh chain).
 
 ## Signatures

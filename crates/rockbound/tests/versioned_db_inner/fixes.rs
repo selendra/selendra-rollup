@@ -8,7 +8,8 @@
 //!   of erroring as stale;
 //! - B15: a reader's latest version (base version plus one per snapshot) was added unchecked;
 //! - a reader read another fork's committed writes as its own once a block of the same version
-//!   as one of its snapshots was committed.
+//!   as one of its snapshots was committed;
+//! - P1: pruning never removed delete markers, so a deleted key kept one archival row forever.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -675,4 +676,106 @@ fn iterator_read_errors_are_not_absent() {
         .collect();
     assert_eq!(items.len(), 1);
     assert!(items[0].is_err());
+}
+
+// ---- P1 ----
+
+/// The history of `pruning_collects_delete_markers`: `a` deleted at 1, `b` deleted at 2, `c`
+/// deleted at 2 and written again at 3, `x` written after the cutoff.
+fn deleted_keys_history(f: &Fixture) {
+    f.commit(
+        0,
+        &[
+            (b"a", Some(b"a0")),
+            (b"b", Some(b"b0")),
+            (b"c", Some(b"c0")),
+        ],
+    );
+    f.commit(1, &[(b"a", None), (b"b", Some(b"b1"))]);
+    f.commit(2, &[(b"b", None), (b"c", None)]);
+    f.commit(3, &[(b"c", Some(b"c3"))]);
+    f.commit(4, &[(b"x", Some(b"x4"))]);
+    f.commit(5, &[(b"x", Some(b"x5"))]);
+}
+
+/// After pruning with cutoff 3 (newest version 5, 2 kept): the reads every version from the
+/// cutoff on sees, the archival rows left, and the watermark `pruned`.
+fn assert_deleted_keys_pruned(f: &Fixture, pruned: u64) {
+    // Every row of `a` and `b` is gone, their delete markers included (upstream kept `a@1` and
+    // `b@2` forever); `c` keeps its newest write, and its markers are gone too.
+    for (key, version) in [(b"a", 0), (b"a", 1), (b"b", 0), (b"b", 1), (b"b", 2)] {
+        assert_eq!(f.raw_row(key, version), None, "{key:?}@{version}");
+    }
+    assert_eq!(f.raw_row(b"c", 0), None);
+    assert_eq!(f.raw_row(b"c", 2), None);
+    assert_eq!(f.raw_row(b"c", 3), Some([&[0x01][..], b"c3"].concat()));
+    assert_eq!(f.raw_row(b"x", 4), Some([&[0x01][..], b"x4"].concat()));
+    assert_eq!(f.db.get_pruned_version().unwrap(), Some(pruned));
+    // Reads at the cutoff and after it are unchanged: the deleted keys read as absent.
+    for version in 3..=5 {
+        let reader = f.reader_at(version);
+        let read = |key: &[u8]| {
+            reader
+                .get_historical_borrowed(&TestKey::from(key.to_vec()), version)
+                .unwrap()
+                .map(|value| value.0)
+        };
+        assert_eq!(read(b"a"), None, "a@{version}");
+        assert_eq!(read(b"b"), None, "b@{version}");
+        assert_eq!(read(b"c"), some(b"c3"), "c@{version}");
+        assert_eq!(f.hist(b"a", version), None);
+        assert_eq!(f.hist(b"b", version), None);
+    }
+    // At and below the watermark, the reader reports the pruned versions.
+    assert!(
+        f.reader_at(5)
+            .get_historical_borrowed(&TestKey::from(b"c".to_vec()), pruned)
+            .is_err()
+    );
+    assert_eq!(f.version_for(b"a", 5), None);
+    assert_eq!(f.version_for(b"b", 5), None);
+    assert_eq!(f.version_for(b"c", 5), Some(3));
+}
+
+/// P1: a key's newest write at or before the cutoff survives pruning (its older rows are
+/// deleted), even when it is a delete marker: upstream kept it, so every key ever deleted kept
+/// one archival row forever. The marker is deleted now; every older row of the key is gone by
+/// then, so reads find no row and the key still reads as absent.
+#[test]
+fn pruning_collects_delete_markers() {
+    let (_dir, f) = fixture();
+    deleted_keys_history(&f);
+    let out = f.db.collect_pruning_batch(2, None).unwrap();
+    assert!(!out.hit_size_limit);
+    assert_eq!(out.keys_inspected, 8);
+    // `a@0`, `b@0`, `b@1`, `c@0`, `c@2` (predecessors) and the markers `a@1`, `b@2`.
+    assert_eq!(out.keys_to_prune, 7);
+    assert_eq!(out.last_pruned_version, Some(2));
+    f.db.archival_db().write_schemas(&out.batch).unwrap();
+    assert_deleted_keys_pruned(&f, 2);
+
+    // In passes of one index entry each: the same rows go. The marker `c@2` goes in the pass of
+    // `(2, c)`, so the pass of `(3, c)` finds no predecessor left and the watermark stays at 1
+    // (reads at version 2 are exact: every key written by then is deleted at 2).
+    let (_dir, f) = fixture();
+    deleted_keys_history(&f);
+    let mut passes = 0;
+    loop {
+        let out = f.db.collect_pruning_batch(2, Some(1)).unwrap();
+        f.db.archival_db().write_schemas(&out.batch).unwrap();
+        passes += 1;
+        if !out.hit_size_limit {
+            break;
+        }
+    }
+    assert_eq!(passes, 8);
+    assert_deleted_keys_pruned(&f, 1);
+    for key in [b"a", b"b", b"c"] {
+        assert_eq!(
+            f.reader_at(5)
+                .get_historical_borrowed(&TestKey::from(key.to_vec()), 2)
+                .unwrap(),
+            None
+        );
+    }
 }

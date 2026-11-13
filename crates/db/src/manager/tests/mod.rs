@@ -1,6 +1,7 @@
 //! Tests of the storage manager on real databases ([`TestManager`]): upstream's generic storage
-//! manager tests (`lifecycle`, `forks`), proofs of unfinalized state (`proofs`), and
-//! `get_with_proof` while a finalization is paused at each commit point (`paused`).
+//! manager tests (`lifecycle`, `forks`), proofs of unfinalized state (`proofs`),
+//! `get_with_proof` while a finalization is paused at each commit point (`paused`), pruning
+//! (`pruning`), and property tests against models (`proptests`).
 //!
 //! Every block writes values derived from its hash ([`Values`]) at the key of its height, in
 //! the user, kernel and accessory namespaces, so a storage's reads show which blocks it sees.
@@ -9,6 +10,8 @@ mod forks;
 mod lifecycle;
 mod paused;
 mod proofs;
+mod proptests;
+mod pruning;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};

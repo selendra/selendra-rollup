@@ -30,15 +30,18 @@
 //! - [`NomtStorageManager`]: the node's
 //!   [`HierarchicalStorageManager`](selendra_interface::node::storage::HierarchicalStorageManager):
 //!   forks of uncommitted blocks (NOMT overlays and snapshots of the other databases) on top of
-//!   the committed state, and their finalization ([`StorageManagerConfig`]).
-//!
-//! Not here yet: pruning.
+//!   the committed state, their finalization, and pruning ([`StorageManagerConfig`]).
+//! - [`pruner`]: pruning of old versions of the flat store and the accessory store
+//!   ([`DbGroup::prune`], [`PrunerConfig`]), which keeps every version a live storage is based
+//!   on (version pins) and turns reads of pruned versions into
+//!   [`HistoricalValueError::PrunedVersion`] errors.
 //!
 //! # Features
 //! - `test-utils`: `harness` (the databases and the storage manager in a temporary directory,
 //!   a test block header, for tests) and fault injection: a per-instance `CommitHook` called at
-//!   every [`CommitPoint`] of a commit, of a finalization and of crash recovery
-//!   (`DbGroup::open_with_hook`, `NomtStorageManager::open_with_hook`).
+//!   every [`CommitPoint`] of a commit, of a finalization, of a pruning pass and of crash
+//!   recovery (`DbGroup::open_with_hook`, `NomtStorageManager::open_with_hook`);
+//!   `NomtStorageManager::prune_now`.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -58,6 +61,7 @@ pub mod ledger;
 mod manager;
 mod nomt_state;
 mod prover;
+pub mod pruner;
 mod recovery;
 pub mod schema;
 #[cfg(any(test, feature = "test-utils"))]
@@ -79,5 +83,6 @@ pub use nomt_state::{
     WitnessMode,
 };
 pub use prover::{NomtProverStorage, NomtStateUpdate, StaleStorage};
+pub use pruner::{PruneStats, PrunerConfig, StorePruneStats};
 pub use recovery::{RecoveryReport, RecoveryStep};
 pub use rockbound::versioned_db::HistoricalValueError;

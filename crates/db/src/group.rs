@@ -2,6 +2,7 @@
 //! DB and the accessory DB; the order they are committed in, and how they are opened (hasher
 //! guard, startup crash recovery).
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -24,6 +25,7 @@ use crate::nomt_state::{
     CommittedRoots, NomtRoots, NomtSessionBuilder, NomtStateDb, OverlayRef, SharedOverlays,
     StateFinishedSession, StateOverlay,
 };
+use crate::pruner::{self, PruneStats, VersionPins};
 use crate::recovery::{Head, RecoveryReport, root_of};
 use crate::schema::{DbMetadata, MetadataKey};
 
@@ -150,6 +152,9 @@ impl SnapshotGroup {
 /// The readers a storage needs, all at the same version: the newest committed one, plus the
 /// same chain of uncommitted blocks (snapshots and NOMT overlays) if a storage manager built
 /// them on one.
+///
+/// The flat-store and accessory readers each pin the committed version they are based on
+/// against pruning while they (or clones) live ([`pruner`](crate::pruner)).
 pub struct StorageReaders<H, K> {
     /// Opens NOMT sessions on the committed trees and the blocks' overlays.
     pub session_builder: NomtSessionBuilder<H, K>,
@@ -178,14 +183,19 @@ impl<H, K> core::fmt::Debug for StorageReaders<H, K> {
 /// **Poisoning.** A commit that fails after it started writing (an I/O error, or an injected
 /// fault) leaves the databases at different versions, and the NOMT trees' in-memory roots may
 /// already have moved. The group is then poisoned: [`commit`](Self::commit),
-/// [`readers`](Self::readers) and [`ledger_reader`](Self::ledger_reader) fail until the
-/// databases are closed and reopened, which repairs them ([`open`](Self::open)). Upstream went
-/// on with the databases out of step.
+/// [`readers`](Self::readers), [`ledger_reader`](Self::ledger_reader) and
+/// [`prune`](Self::prune) fail until the databases are closed and reopened, which repairs them
+/// ([`open`](Self::open)). Upstream went on with the databases out of step.
+///
+/// **Pruning.** [`prune`](Self::prune) deletes old versions of the flat store and the accessory
+/// store, keeping every version a live reader of this group is based on ([`pruner`]).
 pub struct DbGroup<H> {
     nomt: Arc<NomtStateDb<H>>,
     flat: FlatStateDb,
     ledger: Arc<rockbound::DB>,
     accessory: Arc<rockbound::DB>,
+    /// The versions the readers handed out are based on.
+    pins: VersionPins,
     faults: Faults,
     poisoned: bool,
     last_recovery: RecoveryReport,
@@ -285,6 +295,7 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             flat,
             ledger,
             accessory,
+            pins: VersionPins::default(),
             faults,
             poisoned: false,
             last_recovery,
@@ -363,9 +374,14 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
         &self.ledger
     }
 
+    /// The oldest version a live reader of these databases is based on (pruning keeps it).
+    pub fn oldest_pinned_version(&self) -> Option<SlotNumber> {
+        self.pins.oldest()
+    }
+
     /// Readers of the committed state, all at the newest committed version. They see later
     /// commits only through their unbound reads. (The storage manager's readers add uncommitted
-    /// blocks.)
+    /// blocks.) They pin that version against pruning while they live.
     ///
     /// # Errors
     /// If the databases are poisoned ([`is_poisoned`](Self::is_poisoned)), or on read errors.
@@ -379,6 +395,10 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
     /// and its snapshot), and a ledger reader with the same blocks. The blocks' versions must
     /// follow the newest committed version one by one (from genesis if nothing is committed),
     /// each building on the roots of the one before it, the first on the committed roots.
+    ///
+    /// The flat-store and accessory readers pin the newest committed version (their base:
+    /// they read a key the blocks do not write there) until they and their clones are dropped,
+    /// so [`prune`](Self::prune) keeps it.
     ///
     /// # Errors
     /// If the databases are poisoned, if the blocks are not such a chain (upstream did not
@@ -445,11 +465,14 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             })
             .collect();
         let base_version = base.map(|version| version.get());
+        // Not racing a pruning pass: `prune` takes `&mut self`.
+        let pin = base.map(|base| self.pins.pin(base));
         let historical_state = HistoricalStateReader::new(
             VersionedDeltaReader::new(self.flat.user_db().clone(), base_version, user),
             VersionedDeltaReader::new(self.flat.kernel_db().clone(), base_version, kernel),
             DeltaReader::new(self.flat.live_db().clone(), roots),
-        )?;
+        )?
+        .with_pin(pin.clone());
         let readers = StorageReaders {
             session_builder: NomtSessionBuilder::new(
                 self.nomt.clone(),
@@ -458,7 +481,7 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
                 CommittedRoots::new(self.flat.live_db().clone()),
             ),
             historical_state,
-            accessory: AccessoryDb::with_snapshots(self.accessory.clone(), base, accessory),
+            accessory: AccessoryDb::with_snapshots(self.accessory.clone(), base, accessory, pin),
         };
         Ok((readers, LedgerReader::new(self.ledger.clone(), ledger)))
     }
@@ -584,6 +607,72 @@ impl<H: Digest<OutputSize = U32> + Send + Sync> DbGroup<H> {
             historical_state.root()
         );
         ledger::check_builds_on_head(&self.ledger, ledger)
+    }
+
+    /// One pruning pass (see [`pruner`] for what it deletes and why reads stay exact): the
+    /// cutoff is `min(L - versions_to_keep, oldest pinned version)` (`L`: the newest committed
+    /// version); every version from the cutoff on reads as before, older ones may fail with
+    /// [`HistoricalValueError::PrunedVersion`](crate::HistoricalValueError). It consumes at
+    /// most `max_keys_per_run` index entries of each of the user values, the kernel values and
+    /// the accessory store, and writes each store's part in one write (the flat store's first,
+    /// [`CommitPoint::BeforePruneFlat`], then the accessory store's,
+    /// [`CommitPoint::BeforePruneAccessory`]). Run it again while
+    /// [`PruneStats::has_backlog`].
+    ///
+    /// # Errors
+    /// If the databases are poisoned, on read or write errors (nothing is poisoned: the pass's
+    /// writes are each atomic, and the next pass goes on), or if a store's versions disagree
+    /// with the committed version.
+    pub fn prune(
+        &mut self,
+        versions_to_keep: NonZeroU64,
+        max_keys_per_run: NonZeroU64,
+    ) -> anyhow::Result<PruneStats> {
+        self.ensure_not_poisoned()?;
+        let latest = self.latest_version()?;
+        let oldest_pin = self.pins.oldest();
+        if let (Some(latest), Some(pin)) = (latest, oldest_pin) {
+            let age = latest.get().saturating_sub(pin.get());
+            if age > versions_to_keep.get().saturating_mul(10) {
+                tracing::warn!(
+                    pinned = %pin,
+                    %latest,
+                    versions_to_keep = versions_to_keep.get(),
+                    "A storage based on an old version is still alive: pruning keeps that \
+                     version and everything after it until the storage is dropped"
+                );
+            }
+        }
+        let Some((latest, cutoff)) =
+            latest.zip(pruner::cutoff(latest, versions_to_keep, oldest_pin))
+        else {
+            return Ok(PruneStats::default());
+        };
+        let (flat_batch, flat_user, flat_kernel) =
+            pruner::collect_flat(&self.flat, latest, cutoff, max_keys_per_run)?;
+        self.faults.hit(CommitPoint::BeforePruneFlat)?;
+        if !flat_batch.is_empty() {
+            self.flat
+                .archival_db()
+                .write_schemas(&flat_batch)
+                .context("writing the flat store's pruning batch")?;
+        }
+        let (accessory_batch, accessory) =
+            pruner::collect_accessory(&self.accessory, cutoff, max_keys_per_run)?;
+        self.faults.hit(CommitPoint::BeforePruneAccessory)?;
+        if !accessory_batch.is_empty() {
+            self.accessory
+                .write_schemas(&accessory_batch)
+                .context("writing the accessory store's pruning batch")?;
+        }
+        let stats = PruneStats {
+            cutoff: Some(cutoff),
+            flat_user,
+            flat_kernel,
+            accessory,
+        };
+        tracing::debug!(?stats, "Pruned old versions");
+        Ok(stats)
     }
 
     /// The writes of [`commit`](Self::commit), in order, with the fault points in between.
