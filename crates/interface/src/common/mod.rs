@@ -1,9 +1,15 @@
 //! Common types used throughout Selendra.
 
+mod consensus_type;
 mod hex_string;
+mod safe_string;
+pub mod safe_vec;
 mod slot_numbering;
 
+pub use consensus_type::ConsensusType;
 pub use hex_string::*;
+pub use safe_string::{DEFAULT_MAX_STRING_LENGTH, SafeString, SafeStringError, SizedSafeString};
+pub use safe_vec::SafeVec;
 pub use slot_numbering::*;
 
 /// Deserializes a struct, accepting only the object form in human-readable formats.

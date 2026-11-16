@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::BasicAddress;
+use crate::common::ConsensusType;
 
 /// The blob hash type of a given [`DaSpec`].
 pub type DaBlobHash<Da> = <<Da as DaSpec>::BlobTransaction as BlobReaderTrait>::BlobHash;
@@ -16,8 +17,8 @@ pub type DaBlobHash<Da> = <<Da as DaSpec>::BlobTransaction as BlobReaderTrait>::
 pub trait DaSpec:
     'static + Default + Debug + PartialEq + Eq + Clone + Send + Sync + BorshSerialize + BorshDeserialize
 {
-    /// The hash of a DA layer block
-    type SlotHash: BlockHashTrait;
+    /// The hash of a DA layer block. Modules store it (e.g. in proof public data).
+    type SlotHash: BlockHashTrait + ConsensusType;
 
     /// The block header type used by the DA layer
     type BlockHeader: BlockHeaderTrait<Hash = Self::SlotHash> + Send + Sync;
@@ -28,8 +29,9 @@ pub trait DaSpec:
     /// How transactions can be identified on the DA layer.
     type TransactionId: Serialize + DeserializeOwned + Clone + Debug + Display + Send + Sync;
 
-    /// The type used to represent addresses on the DA layer.
-    type Address: BasicAddress + Send + Sync;
+    /// The type used to represent addresses on the DA layer. Modules store it (e.g. the
+    /// sequencer registry).
+    type Address: BasicAddress + ConsensusType + Send + Sync;
 
     /// A proof that each tx in a set of blob transactions is included in a given block.
     type InclusionMultiProof: Serialize + DeserializeOwned + Clone + Send + Sync;
@@ -336,6 +338,8 @@ pub struct Time {
     /// The number of milliseconds since the unix epoch.
     millis: i64,
 }
+
+crate::impl_consensus_type!(Time);
 
 impl Time {
     /// Get the current time

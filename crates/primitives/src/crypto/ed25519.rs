@@ -467,6 +467,8 @@ mod private_key {
     }
 }
 
+selendra_interface::impl_consensus_type!(Ed25519PublicKey, Ed25519Signature);
+
 #[cfg(test)]
 mod tests {
     use curve25519_dalek_ng::edwards::CompressedEdwardsY;

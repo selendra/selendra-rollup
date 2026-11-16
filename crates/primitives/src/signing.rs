@@ -15,6 +15,11 @@
 //!   Selendra message signed with a secp256k1 key is never also a valid Ethereum payload.
 //!
 //! Native transactions (Phase 5) and sequencer blobs (Phase 9) must sign through this module.
+//! The signed bytes are a [`SigningBytes`], which only [`signing_bytes`] can build: an API that
+//! takes `&SigningBytes` (a transaction's `verify_signature`, the authenticator) cannot be
+//! handed a bare payload. [`selendra_interface::crypto::Signature::verify`] and
+//! `PrivateKey::sign` take any bytes: they are
+//! the low-level layer below this module, for key tests and test vectors only.
 //!
 //! Exception: Ethereum transactions (EIP-155 legacy/typed and EIP-712 typed data) keep their
 //! Ethereum signing rules, because browser and hardware Ethereum wallets cannot sign
@@ -57,15 +62,73 @@ pub enum SigningDomain {
     OffchainMessage = 3,
 }
 
+/// The exact bytes a Selendra signature covers: the header (magic, version, domain, chain ID)
+/// followed by the payload.
+///
+/// Only [`signing_bytes`] builds one, so holding a `SigningBytes` proves the header is there.
+/// P5-07 (regression, the type part): upstream's signed bytes were a bare `Vec<u8>`, so code
+/// could sign or verify a payload without the header. The field is private:
+///
+/// ```compile_fail,E0603
+/// use selendra_primitives::signing::SigningBytes;
+/// let bare = SigningBytes(b"payload".to_vec());
+/// ```
+///
+/// ```
+/// use selendra_primitives::signing::{SELENDRA_CHAIN_ID, SigningDomain, signing_bytes};
+/// let bytes = signing_bytes(SigningDomain::Transaction, SELENDRA_CHAIN_ID, b"payload");
+/// assert!(bytes.as_bytes().ends_with(b"payload"));
+/// ```
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct SigningBytes(Vec<u8>);
+
+impl SigningBytes {
+    /// The signed bytes, header included.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// The length of the signed bytes, header included.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Always `false`: the header is never empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl AsRef<[u8]> for SigningBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl core::fmt::Debug for SigningBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "SigningBytes(0x{})", hex::encode(&self.0))
+    }
+}
+
 /// Returns the exact bytes that are signed for `payload` in `domain` on `chain_id`.
-pub fn signing_bytes(domain: SigningDomain, chain_id: u64, payload: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(HEADER_LEN + payload.len());
+pub fn signing_bytes(domain: SigningDomain, chain_id: u64, payload: &[u8]) -> SigningBytes {
+    let mut bytes = Vec::with_capacity(HEADER_LEN.saturating_add(payload.len()));
     bytes.extend_from_slice(MAGIC);
     bytes.push(SIGNING_VERSION);
     bytes.push(domain as u8);
     bytes.extend_from_slice(&chain_id.to_le_bytes());
     bytes.extend_from_slice(payload);
-    bytes
+    SigningBytes(bytes)
+}
+
+/// Verifies `signature` over already-built signing bytes.
+pub fn verify_signing_bytes<S: Signature>(
+    signature: &S,
+    public_key: &S::PublicKey,
+    bytes: &SigningBytes,
+) -> Result<(), SigVerificationError> {
+    signature.verify(public_key, bytes.as_bytes())
 }
 
 /// Verifies `signature` over `payload` in `domain` on `chain_id`.
@@ -76,7 +139,20 @@ pub fn verify<S: Signature>(
     chain_id: u64,
     payload: &[u8],
 ) -> Result<(), SigVerificationError> {
-    signature.verify(public_key, &signing_bytes(domain, chain_id, payload))
+    verify_signing_bytes(
+        signature,
+        public_key,
+        &signing_bytes(domain, chain_id, payload),
+    )
+}
+
+/// Signs already-built signing bytes. Only available with the `native` feature.
+#[cfg(feature = "native")]
+pub fn sign_signing_bytes<K: selendra_interface::crypto::PrivateKey>(
+    key: &K,
+    bytes: &SigningBytes,
+) -> K::Signature {
+    key.sign(bytes.as_bytes())
 }
 
 /// Signs `payload` in `domain` on `chain_id`. Only available with the `native` feature.
@@ -87,7 +163,7 @@ pub fn sign<K: selendra_interface::crypto::PrivateKey>(
     chain_id: u64,
     payload: &[u8],
 ) -> K::Signature {
-    key.sign(&signing_bytes(domain, chain_id, payload))
+    sign_signing_bytes(key, &signing_bytes(domain, chain_id, payload))
 }
 
 #[cfg(test)]
@@ -100,6 +176,7 @@ mod tests {
     #[test]
     fn header_layout_is_fixed() {
         let bytes = signing_bytes(SigningDomain::Transaction, SELENDRA_CHAIN_ID, b"abc");
+        let bytes = bytes.as_bytes();
         let mut expected = b"\xb5SELENDRA".to_vec();
         expected.push(1); // version
         expected.push(1); // Transaction
@@ -166,6 +243,33 @@ mod tests {
                 b"payload"
             )
             .is_err()
+        );
+    }
+
+    fn check_signing_bytes_api<K: PrivateKey>(key: K) {
+        let pk = key.pub_key();
+        let bytes = signing_bytes(SigningDomain::OffchainMessage, 7, b"msg");
+        let sig = sign_signing_bytes(&key, &bytes);
+        verify_signing_bytes(&sig, &pk, &bytes).unwrap();
+        verify(&sig, &pk, SigningDomain::OffchainMessage, 7, b"msg").unwrap();
+        let other = signing_bytes(SigningDomain::OffchainMessage, 8, b"msg");
+        assert!(verify_signing_bytes(&sig, &pk, &other).is_err());
+        // The convenience functions sign the same bytes.
+        let sig = sign(&key, SigningDomain::OffchainMessage, 7, b"msg");
+        verify_signing_bytes(&sig, &pk, &bytes).unwrap();
+    }
+
+    #[test]
+    fn signing_bytes_api_matches_the_convenience_functions() {
+        check_signing_bytes_api(Ed25519PrivateKey::generate());
+        check_signing_bytes_api(EthereumPrivateKey::generate());
+        let bytes = signing_bytes(SigningDomain::SequencerBlob, 1, b"");
+        assert_eq!(bytes.len(), HEADER_LEN);
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes.as_ref(), bytes.as_bytes());
+        assert_eq!(
+            format!("{bytes:?}"),
+            format!("SigningBytes(0x{})", hex::encode(bytes.as_bytes()))
         );
     }
 

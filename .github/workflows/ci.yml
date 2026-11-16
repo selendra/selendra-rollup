@@ -112,7 +112,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [addresses, keys, state_keys, state_witness, tx_decoding]
+        target: [addresses, keys, safe_types, state_keys, state_witness, tx_decoding]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

@@ -391,6 +391,8 @@ mod private_key {
     }
 }
 
+selendra_interface::impl_consensus_type!(EthereumPublicKey, EthereumSignature);
+
 #[cfg(test)]
 mod tests {
     use selendra_interface::crypto::{PrivateKey, PublicKey, Signature};

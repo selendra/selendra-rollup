@@ -26,7 +26,25 @@ pub type MultiAddressEvm = MultiAddress<EthereumAddress>;
 /// There is deliberately no `From<CredentialId>`: a credential does not say which kind of
 /// key produced it, so converting one would silently pick a variant (upstream picked
 /// `Standard`, giving Ethereum keys a meaningless `sel1…` account). Get the address from the
-/// key instead: `MultiAddressEvm::from(&public_key)`.
+/// key instead: `MultiAddressEvm::from(&public_key)`. P5-08 (regression): this must not
+/// compile:
+///
+/// ```compile_fail,E0277
+/// use selendra_interface::crypto::CredentialId;
+/// use selendra_primitives::MultiAddressEvm;
+/// let address = MultiAddressEvm::from(CredentialId::from_bytes([1; 32]));
+/// ```
+///
+/// ```
+/// use selendra_interface::crypto::PublicKey;
+/// use selendra_primitives::crypto::Ed25519PublicKey;
+/// use selendra_primitives::{Address, MultiAddressEvm};
+/// let key: Ed25519PublicKey =
+///     "0x022e229198d957bf0c0a504e7d7bcec99a1d62cccc7861ed2452676ad0323ad8".parse().unwrap();
+/// let address = MultiAddressEvm::from(&key);
+/// let native = Address::from_hash_prefix(key.credential_id().as_bytes());
+/// assert_eq!(address, MultiAddressEvm::Standard(native));
+/// ```
 #[derive(
     Clone,
     Copy,
@@ -84,7 +102,7 @@ impl From<EthereumAddress> for MultiAddressEvm {
 /// An ed25519 key owns the native account of its credential (`sel1…`).
 impl From<&Ed25519PublicKey> for MultiAddressEvm {
     fn from(key: &Ed25519PublicKey) -> Self {
-        Self::Standard(Address::from(key.credential_id()))
+        Self::Standard(Address::from_hash_prefix(key.credential_id().as_bytes()))
     }
 }
 
@@ -210,6 +228,11 @@ impl<VmAddress: schemars::JsonSchema> schemars::JsonSchema for MultiAddress<VmAd
     }
 }
 
+impl<VmAddress: selendra_interface::common::ConsensusType> selendra_interface::common::ConsensusType
+    for MultiAddress<VmAddress>
+{
+}
+
 impl<VmAddress> BasicAddress for MultiAddress<VmAddress> where
     VmAddress: BasicAddress + Not28Bytes + FromStr<Err: Into<anyhow::Error>>
 {
@@ -319,7 +342,7 @@ mod tests {
         let ed = Ed25519PrivateKey::generate().pub_key();
         assert_eq!(
             MultiAddressEvm::from(&ed),
-            MultiAddressEvm::Standard(Address::from(ed.credential_id()))
+            MultiAddressEvm::Standard(Address::from_hash_prefix(ed.credential_id().as_bytes()))
         );
 
         // Private key 1: the secp256k1 key owns 0x7E5F…, not a sel1 address.

@@ -55,6 +55,19 @@ mod tests {
 
     use super::*;
 
+    /// Keys, signatures and addresses can be stored and signed (D20 of the Phase 5 plan).
+    #[test]
+    fn stored_types_are_consensus_types() {
+        fn consensus<T: selendra_interface::common::ConsensusType>() {}
+        consensus::<Ed25519PublicKey>();
+        consensus::<Ed25519Signature>();
+        consensus::<EthereumPublicKey>();
+        consensus::<EthereumSignature>();
+        consensus::<crate::Address>();
+        consensus::<crate::EthereumAddress>();
+        consensus::<crate::MultiAddressEvm>();
+    }
+
     /// Both crypto specs hash with the state hasher (SHA-256): checked at compile time.
     #[test]
     fn crypto_spec_hashers_are_the_state_hasher() {

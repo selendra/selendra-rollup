@@ -15,11 +15,14 @@ use selendra_interface::common::HexString;
 /// Containers decode stored values with [`StateItemDecoder::decode_unwrap`], which panics. That
 /// is sound only if, for **every** value `v` of the stored type that can be constructed,
 /// `try_decode(encode(v))` succeeds and returns `v`. A type whose decoder is stricter than its
-/// encoder breaks this: e.g. `selendra_interface::stf::RawTx` has a public `data` field and an
-/// unbounded encoder, but its decoder rejects more than `MAX_RAW_TX_SIZE` bytes, so a stored
-/// over-size `RawTx` would panic on every later read. Such a type must enforce its bound at
-/// construction, or must not be stored directly. Containers check this precondition with a
-/// `debug_assert!` on every write (debug builds only).
+/// encoder breaks this: e.g. a type with a public `Vec` field whose decoder caps the length (as
+/// `selendra_interface::stf::RawTx` had before it got private fields and a fallible
+/// constructor bounded by `MAX_RAW_TX_SIZE`): a stored over-size value would panic on every
+/// later read. Such a type must enforce its bound at construction (like `RawTx`, `SafeVec` and
+/// `SizedSafeString` do), or must not be stored directly. Containers check this precondition
+/// with a `debug_assert!` on every write (debug builds only). Stored types must also be
+/// consensus types (`selendra_interface::common::ConsensusType`: no `usize`, floats or hash
+/// collections at any depth).
 pub trait StateItemCodec<V>: StateItemEncoder<V> + StateItemDecoder<V> {}
 
 /// A trait for types that can serialize values into storage.

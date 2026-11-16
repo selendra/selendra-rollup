@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use selendra_interface::BasicAddress;
-use selendra_interface::crypto::CredentialId;
 
 use crate::bech32::{self, Bech32ParseError};
 
@@ -45,17 +44,41 @@ impl Address {
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
         &self.0
     }
-}
 
-/// The address of a credential is its first 28 bytes. For an ed25519 key the credential
-/// id is the public key itself, so this is the public key truncated to 28 bytes.
-impl From<CredentialId> for Address {
-    fn from(credential_id: CredentialId) -> Self {
+    /// The address made of the first 28 bytes of a 32-byte hash or key.
+    ///
+    /// This is how a native account is derived from an ed25519 public key (its credential id
+    /// is the key itself) and from a multisig credential hash. It is **not** how an account is
+    /// derived from any credential: a secp256k1 key's credential id is its padded Ethereum
+    /// address, and its account is that `0x…` address (`MultiAddress::Vm`), never a `sel1…`
+    /// address. That is why there is no `From<CredentialId>`: a credential does not say which
+    /// kind of key produced it. P5-08 (regression, the `Address` part): upstream's
+    /// `From<CredentialId>` gave an Ethereum key a `sel1…` account:
+    ///
+    /// ```compile_fail,E0277
+    /// use selendra_interface::crypto::CredentialId;
+    /// use selendra_primitives::Address;
+    /// let address = Address::from(CredentialId::from_bytes([1; 32]));
+    /// ```
+    ///
+    /// ```
+    /// use selendra_interface::crypto::CredentialId;
+    /// use selendra_primitives::Address;
+    /// let credential = CredentialId::from_bytes([1; 32]);
+    /// assert_eq!(Address::from_hash_prefix(credential.as_bytes()), Address::new([1; 28]));
+    /// ```
+    pub const fn from_hash_prefix(hash: &[u8; 32]) -> Self {
         let mut addr = [0u8; Self::LENGTH];
-        addr.copy_from_slice(&credential_id.0.0[..Self::LENGTH]);
+        let mut i = 0;
+        while i < Self::LENGTH {
+            addr[i] = hash[i];
+            i += 1;
+        }
         Self(addr)
     }
 }
+
+selendra_interface::impl_consensus_type!(Address);
 
 impl From<[u8; Address::LENGTH]> for Address {
     fn from(addr: [u8; Address::LENGTH]) -> Self {
@@ -172,7 +195,7 @@ mod tests {
             "0x022e229198d957bf0c0a504e7d7bcec99a1d62cccc7861ed2452676ad0323ad8"
                 .parse()
                 .unwrap();
-        let addr = Address::from(pk.credential_id());
+        let addr = Address::from_hash_prefix(pk.credential_id().as_bytes());
         assert_eq!(addr.as_bytes()[..], pk.bytes()[..28]);
         assert_eq!(
             addr.to_string(),
@@ -189,7 +212,7 @@ mod tests {
                 .parse()
                 .unwrap();
         assert_eq!(
-            Address::from(pk.credential_id()).to_string(),
+            Address::from_hash_prefix(pk.credential_id().as_bytes()).to_string(),
             "sel1fs6stajfuu65eavsgujjx2slhydhk7xakzlqum35cs72ydqpl45"
         );
     }
@@ -254,7 +277,8 @@ mod tests {
 
     #[test]
     fn encodings_roundtrip() {
-        let addr = Address::from(Ed25519PrivateKey::generate().pub_key().credential_id());
+        let key = Ed25519PrivateKey::generate().pub_key();
+        let addr = Address::from_hash_prefix(key.credential_id().as_bytes());
 
         assert_eq!(borsh::to_vec(&addr).unwrap(), addr.as_bytes());
         assert_eq!(borsh::from_slice::<Address>(addr.as_bytes()).unwrap(), addr);

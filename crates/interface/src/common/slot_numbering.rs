@@ -109,7 +109,7 @@ impl SlotNumber {
     }
 
     /// The current [`SlotNumber`] as a [`u64`].
-    pub fn get(&self) -> u64 {
+    pub const fn get(&self) -> u64 {
         self.0
     }
 
@@ -271,7 +271,7 @@ impl VisibleSlotNumber {
     /// Wraps a [`u64`] into a [`VisibleSlotNumber`].
     /// This method should be used with caution,
     /// since passing a [`VisibleSlotNumber`] that is not a valid height can lead to unexpected results.
-    pub fn new_dangerous(height: u64) -> Self {
+    pub const fn new_dangerous(height: u64) -> Self {
         Self(SlotNumber::new(height))
     }
 
@@ -293,8 +293,13 @@ impl VisibleSlotNumber {
     /// encouraged as it can easily lead to bugs. TODO(@neysofu): carefully
     /// review all type casts and possibly remove this method.
     /// </div>
-    pub fn as_true(&self) -> SlotNumber {
+    pub const fn as_true(&self) -> SlotNumber {
         self.0
+    }
+
+    /// The slot number as a [`u64`] (the same as `as_true().get()`, usable in `const`).
+    pub const fn get(&self) -> u64 {
+        self.0.get()
     }
 }
 
@@ -350,12 +355,12 @@ impl RollupHeight {
     pub const MAX: Self = Self(u64::MAX);
 
     /// Create a new rollup height from a u64.
-    pub fn new(height: u64) -> Self {
+    pub const fn new(height: u64) -> Self {
         Self(height)
     }
 
     /// Returns the inner value of a rollup height.
-    pub fn get(&self) -> u64 {
+    pub const fn get(&self) -> u64 {
         self.0
     }
 
@@ -389,9 +394,26 @@ impl RollupHeight {
     }
 }
 
+crate::impl_consensus_type!(SlotNumber, VisibleSlotNumber, RollupHeight);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Version tables (Phase 5) are `const` items built from heights.
+    #[test]
+    fn heights_and_slot_numbers_work_in_const_context() {
+        const HEIGHT: RollupHeight = RollupHeight::new(5);
+        const HEIGHT_VALUE: u64 = HEIGHT.get();
+        const SLOT_VALUE: u64 = SlotNumber::new(7).get();
+        const VISIBLE: VisibleSlotNumber = VisibleSlotNumber::new_dangerous(9);
+        const VISIBLE_VALUE: u64 = VISIBLE.get();
+        const VISIBLE_TRUE: SlotNumber = VISIBLE.as_true();
+        const _: () = assert!(HEIGHT_VALUE == 5 && SLOT_VALUE == 7 && VISIBLE_VALUE == 9);
+        assert_eq!(HEIGHT, RollupHeight::new(5));
+        assert_eq!(VISIBLE_TRUE, SlotNumber::new(9));
+        assert_eq!(VISIBLE.get(), VISIBLE.as_true().get());
+    }
 
     #[test]
     fn only_the_canonical_decimal_string_is_accepted() {

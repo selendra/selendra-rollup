@@ -21,7 +21,7 @@ use digest::typenum::U32;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::common::SlotNumber;
+use crate::common::{ConsensusType, SlotNumber};
 use crate::crypto::{PublicKey, Signature};
 use crate::da::{DaSpec, RelevantBlobs, RelevantProofs};
 use crate::zk::aggregated_proof::SerializedAggregatedProof;
@@ -125,8 +125,9 @@ pub trait CodeCommitmentTrait:
 /// A Zk proof system capable of proving and verifying arbitrary Rust code
 /// Must support recursive proofs.
 pub trait ZkVerifier: Default + Clone + Send + Sync + 'static {
-    /// A commitment to the zkVM program which is being proven
-    type CodeCommitment: CodeCommitmentTrait;
+    /// A commitment to the zkVM program which is being proven. Modules store it (e.g. the
+    /// accepted code commitments of prover incentives).
+    type CodeCommitment: CodeCommitmentTrait + ConsensusType;
 
     /// Defines the cryptographic operations provided natively by the Zkvm.
     type CryptoSpec: CryptoSpec;
@@ -205,6 +206,12 @@ pub struct StateTransitionPublicData<Address, Da: DaSpec, Root> {
 
     /// Prover address.
     pub prover_address: Address,
+}
+
+/// `Da::SlotHash` is a consensus type by the [`DaSpec`] bounds.
+impl<Address: ConsensusType, Da: DaSpec, Root: ConsensusType> ConsensusType
+    for StateTransitionPublicData<Address, Da, Root>
+{
 }
 
 impl<Address, Da: DaSpec, Root> StateTransitionPublicData<Address, Da, Root> {

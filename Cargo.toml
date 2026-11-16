@@ -97,6 +97,7 @@ serde = { version = "1.0.208", default-features = false, features = ["alloc", "d
 serde_with = { version = "3", default-features = false, features = ["alloc", "base64", "macros"] }
 sha2 = { version = "=0.10.9", default-features = false } # zkVM-patched (SP1), see digest
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+stats_alloc = "0.1.10" # tests only: counts allocations
 tempfile = "3.27"
 test-strategy = "0.4.0"
 thiserror = "2"

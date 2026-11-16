@@ -36,7 +36,14 @@ impl CredentialId {
     pub fn from_bytes(value: [u8; 32]) -> Self {
         Self(HexHash::new(value))
     }
+
+    /// The 32 bytes of the credential.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0.0
+    }
 }
+
+crate::impl_consensus_type!(CredentialId);
 
 impl schemars::JsonSchema for CredentialId {
     fn schema_name() -> std::borrow::Cow<'static, str> {

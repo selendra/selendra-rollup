@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::{StateTransitionPublicData, ZkVerifier};
-use crate::common::SlotNumber;
+use crate::common::{ConsensusType, SlotNumber};
 use crate::da::DaSpec;
 use crate::zk::SerializedZkProof;
 
@@ -44,6 +44,12 @@ pub struct BlockProof<Address, Da: DaSpec, Root> {
     Debug, Eq, PartialEq, BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Default,
 )]
 pub struct CodeCommitmentHash([u8; CodeCommitmentHash::HASH_LEN]);
+
+crate::impl_consensus_type!(
+    CodeCommitmentHash,
+    SerializedAggregatedProof,
+    SerializedPartialProofReceipt
+);
 
 impl From<[u8; CodeCommitmentHash::HASH_LEN]> for CodeCommitmentHash {
     fn from(bytes: [u8; CodeCommitmentHash::HASH_LEN]) -> Self {
@@ -127,6 +133,12 @@ pub struct AggregatedProofPublicData<Address, Da: DaSpec, Root> {
     pub outer_vk_hash: CodeCommitmentHash,
     /// These are the addresses of the provers who proved individual blocks.
     pub rewarded_addresses: Vec<Address>,
+}
+
+/// `Da::SlotHash` is a consensus type by the [`DaSpec`] bounds.
+impl<Address: ConsensusType, Da: DaSpec, Root: ConsensusType> ConsensusType
+    for AggregatedProofPublicData<Address, Da, Root>
+{
 }
 
 impl<Address, Da: DaSpec, Root: AsRef<[u8]>> core::fmt::Display

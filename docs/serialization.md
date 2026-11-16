@@ -52,7 +52,9 @@ Every decoder may receive attacker-controlled bytes (from DA blobs, txs, RPC).
 
 - Never panic: no `unwrap`/`expect`/indexing on input-dependent values. A panic in the zk guest
   stops proving for everyone (liveness attack).
-- Bound lengths **before** allocating, e.g. `RawTx` ≤ 1 MiB, `FullyBakedTx` ≤ 1.05 MiB.
+- Bound lengths **before** allocating, e.g. `RawTx` ≤ 1 MiB, `FullyBakedTx` ≤ 1.05 MiB. Every
+  variable-length field of a decoded input (call messages) is a `SafeVec<T, N>` or a
+  `SizedSafeString<N>` (see "Bounded containers and strings"), never a bare `Vec`/`String`.
 - Do length arithmetic without overflow. The SP1 guest is **32-bit** (`usize` = 32 bits) and
   overflow checks are on in release builds, so `a + b` on two decoded lengths can panic there.
   Compare by subtraction (`b > MAX - a`) or use `checked_*` / `saturating_*`.
@@ -60,6 +62,76 @@ Every decoder may receive attacker-controlled bytes (from DA blobs, txs, RPC).
   Their borsh decoding rejects unsorted or duplicate keys only because the workspace enables
   borsh's `de_strict_order` feature. A "sorted `Vec`" needs its own strictly-increasing check.
 - No floats in consensus code (`float_arithmetic` is denied workspace-wide).
+
+## Consensus types
+
+Every type stored in state, signed, sent in a call message or event, or committed to by a
+proof is a **consensus type**: it implements the marker trait
+`selendra_interface::common::ConsensusType`. The trait is implemented only for types that
+contain, at no depth, any of:
+
+- `usize` / `isize`: borsh encodes them as 64 bits, and the 32-bit zk guest fails to decode a
+  value above `u32::MAX` that a native node accepts (the block becomes unprovable). Use `u64`
+  or `u32`;
+- `f32` / `f64` (see above);
+- `HashMap` / `HashSet` (iteration order depends on a per-process seed). Use
+  `BTreeMap`/`BTreeSet`.
+
+It is implemented for `bool`, the fixed-width integers, `String`, `str`, `()`, `Bytes`, and
+for `Vec`, slices, arrays, `Option`, `Box`, `BTreeMap`, `BTreeSet` and tuples (up to 12) of
+consensus types; for `PhantomData<T>` with any `T` (it stores nothing); and for the consensus
+types of the Selendra crates (heights and slot numbers, `HexString`, `CredentialId`,
+`SafeVec`, `SizedSafeString`, `RawTx`, `FullyBakedTx`, events, proof public data, `Time`,
+addresses, keys, signatures, …). Because containers implement it only when their contents do,
+the check sees through type aliases, nested structs and generic parameters, which a check of
+field syntax cannot. The `DaSpec` slot hash and address and the zkVM code commitment must be
+consensus types (trait bounds). Module crates derive it (`#[derive(ConsensusType)]`, from
+Phase 5's macros); a hand-written impl outside the Selendra crates is a review flag. Foreign
+types get a newtype. The `BorshCodec` bounds (every stored key and value), call messages,
+events and transactions require it as the module system lands.
+
+What the trait does not check: that `BorshSerialize` never fails (a documented rule), and the
+round-trip precondition below.
+
+## Bounded containers and strings
+
+`selendra_interface::common`:
+
+| Type | borsh | JSON / serde | JSON schema |
+|---|---|---|---|
+| `SafeVec<T, N>` (at most `N` elements) | as `Vec<T>`: `u32` LE length, then the elements | as `Vec<T>` (a sequence) | `SafeVec_{N}_of_{T}`: `type: array`, `maxItems: N` |
+| `SizedSafeString<N>` (at most `N` bytes of printable ASCII `0x20..=0x7e`); `SafeString` = `SizedSafeString<128>` | as `String` | a JSON string | `SafeStringMax{N}`: `maxLength: N`, `pattern: ^[\x20-\x7e]*$` |
+| `HexString<SafeVec<u8, N>>` | as `SafeVec<u8, N>` | `0x` + lowercase hex, at most `2N` digits | `HexBytesMax{N}`: `pattern: ^0x(?:[a-f0-9]{2}){0,N}$` |
+
+- Every decoder (borsh, any serde format, `FromStr`) rejects more than `N` elements or bytes
+  before allocating for them. borsh and binary serde formats check the claimed length, and
+  the count as elements arrive. A string (`SizedSafeString`, a hex string in JSON) is checked
+  as the format hands it over, before it is copied or hex-decoded; the format's own buffer
+  (e.g. serde_json's for an escaped string) is bounded by the input.
+  `crates/interface/tests/decode_allocations.rs` counts the allocations. `HexString` takes the
+  cap from its inner type (`HexBytes::MAX_LEN`: `N` for `SafeVec<u8, N>` and `[u8; N]`).
+- `SafeVec` rejects collections of zero-sized types (as borsh does for `Vec`). A serde size
+  hint only sizes the first allocation: elements are read until the sequence ends, so an
+  under-reported hint is accepted.
+- Every operation that can grow a `SafeVec` is fallible (`try_*`) and changes nothing when it
+  fails; an invalid range is an error, never a panic. So every value that can be built
+  encodes to bytes the decoders accept.
+- Schema names include `N` (upstream named every capped hex string `HexHash`, so schemas of
+  different caps collided), and patterns are lowercase, like the accepted strings.
+
+## Transactions
+
+`RawTx` (at most `MAX_RAW_TX_SIZE` = 1 MiB) and `FullyBakedTx` (data and sequencing data
+together at most `MAX_FULLY_BAKED_TX_SIZE` = 1.05 MiB) have private fields and fallible
+constructors (`RawTx::new`, `FullyBakedTx::new` / `with_sequencing_data`, `TxTooLarge`), with
+the same caps as their decoders: a value that no decoder accepts cannot be built. Encodings:
+
+- `RawTx`: borsh as `Vec<u8>`; JSON `{"data": [bytes…]}` (an object, no unknown fields).
+- `FullyBakedTx`: borsh `data` (as `Vec<u8>`), then `sequencing_data` (`Option`, tag `0`/`1`
+  only); JSON `{"data": base64, "sequencing_data": base64 | null}` (canonical padded base64,
+  no unknown fields). `len()` is the borsh length.
+- `MAX_RAW_TX_SIZE + 5 ≤ MAX_FULLY_BAKED_TX_SIZE` (compile-time assertion): a `RawTx` behind
+  a one-byte tag always fits in a `FullyBakedTx`.
 
 ## State keys
 
@@ -93,8 +165,9 @@ state root (a fork).
   shows at most 32 bytes). A failure means one of:
   - the stored type breaks the **round-trip precondition**: for every value `v` that can be
     constructed, `decode(encode(v))` must succeed and give `v`. A type whose decoder is stricter
-    than its encoder (`RawTx`/`FullyBakedTx` today: public fields, unbounded encoder, size-capped
-    decoder) must enforce its bound at construction or must not be stored, otherwise whoever
+    than its encoder (e.g. a public `Vec` field with a size-capped decoder, as `RawTx` and
+    `FullyBakedTx` had upstream) must enforce its bound at construction (like `RawTx`,
+    `FullyBakedTx`, `SafeVec` and `SizedSafeString` do) or must not be stored, otherwise whoever
     chooses the stored value can make every later read panic. Containers `debug_assert!` the
     round trip on every write (debug builds only);
   - two items share a prefix, or the database is corrupt (bugs);
@@ -299,8 +372,20 @@ Never sign or verify a bare payload. Use `selendra_primitives::signing`, which s
 its purpose (`SigningDomain`) and its network (`SELENDRA_CHAIN_ID` = 1961) and can never be a
 valid Ethereum transaction or EIP-191/712 message.
 
+The signed bytes are a `SigningBytes`, a newtype with a private field that only
+`signing_bytes(domain, chain_id, payload)` builds; `verify_signing_bytes` and
+`sign_signing_bytes` take it, and the `verify`/`sign` convenience functions build it. APIs that
+verify signatures over protocol messages (transactions, the authenticator) take
+`&SigningBytes`, so a bare payload is a type error. `Signature::verify` / `PrivateKey::sign` on
+raw bytes are the low-level layer (key tests, RFC 8032 vectors).
+
+Account addresses: an ed25519 key's native account (and a multisig credential's) is
+`Address::from_hash_prefix` of its 32-byte credential (the first 28 bytes); a secp256k1 key's
+account is its Ethereum address (`MultiAddress::Vm`). There is no `From<CredentialId>` for
+`Address` or `MultiAddress`: a credential does not say which kind of key produced it.
+
 ## Checking
 
 - `cargo test` — unit tests, including known-answer vectors and rejection tests.
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `state_keys`, `state_witness`, `tx_decoding`
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

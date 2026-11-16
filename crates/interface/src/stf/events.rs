@@ -65,6 +65,8 @@ impl EventKey {
     }
 }
 
+crate::impl_consensus_type!(StoredEvent, EventKey, EventValue);
+
 /// The value of an event. This is a wrapper around a `Vec<u8>`.
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "arbitrary"), derive(proptest_derive::Arbitrary))]

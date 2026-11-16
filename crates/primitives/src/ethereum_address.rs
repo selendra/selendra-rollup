@@ -167,6 +167,8 @@ impl schemars::JsonSchema for EthereumAddress {
 }
 
 impl BasicAddress for EthereumAddress {}
+
+selendra_interface::impl_consensus_type!(EthereumAddress);
 impl Not28Bytes for EthereumAddress {}
 
 #[cfg(test)]

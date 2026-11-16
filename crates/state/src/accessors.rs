@@ -145,7 +145,8 @@ pub trait StateReader<N: CompileTimeNamespace> {
     /// validation. Every key is written only by the container that owns its prefix, with that
     /// container's codec, so a decode failure means one of:
     /// - **the value type breaks the round-trip precondition** of [`StateItemCodec`]: its decoder
-    ///   rejects some value its encoder accepts (e.g. an over-size `RawTx`). This is a bug in the
+    ///   rejects some value its encoder accepts (e.g. an over-length `Vec` in a type whose decoder
+    ///   caps it but whose constructor does not; `RawTx` used to be one). This is a bug in the
     ///   module's choice of stored type, and it can be triggered by whoever chooses the stored
     ///   value, so stored types must make it impossible;
     /// - two containers share a prefix (a bug), or the native database is corrupt;
