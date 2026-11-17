@@ -137,7 +137,7 @@ impl WitnessMode {
 /// them alone, or bring in sessions of another NOMT database (whose nodes may be hashed with
 /// another hasher: NOMT only checks an overlay's previous root, never its hasher). Each of
 /// these fails to compile only because the item is private (the last example compiles with
-/// the same names; the error codes are checked only on nightly):
+/// the same names; nightly rustdoc checks the error codes: `make doctest-codes`):
 ///
 /// ```compile_fail,E0624
 /// # fn f(config: &selendra_db::StateDbConfig) {

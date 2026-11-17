@@ -6,7 +6,7 @@ use std::io::Read;
 use borsh::{BorshDeserialize, BorshSerialize};
 use nomt_core::proof::{MultiPathProof, MultiProof, PathProof, PathProofTerminal};
 use nomt_core::trie_pos::TriePosition;
-use selendra_interface::common::HexString;
+use selendra_interface::common::{ConsensusType, HexString};
 use serde::{Deserialize, Serialize};
 
 /// The deepest a terminal can be: key paths are 256 bits.
@@ -389,6 +389,17 @@ fn unreachable_shape<T>(offset: usize, start_depth: usize) -> Result<T, InvalidN
     })
 }
 
+/// The borsh encoding is nomt-core's `MultiProof`'s, which has two `usize` fields (a path's
+/// `depth`, a terminator position's `node_index`, each borsh-encoded as a `u64`), so the
+/// decoder, not the type, makes it a consensus type: every accepted proof has a `depth` of at
+/// most 256 and a `node_index` derived from a path of at most 256 bits (below 2^32), and
+/// anything else is rejected. On a 32-bit target borsh rejects a `u64` above `u32::MAX` for a
+/// `usize` before the check; natively the check rejects it. So the same bytes are accepted on
+/// every target (`usize_fields_above_u32_max_are_rejected`), each proof with one encoding (the
+/// decoder re-encodes and compares). The rest is `Vec`s (`u32` lengths), byte arrays and enum
+/// tags the derived decoder checks.
+impl ConsensusType for NomtProof {}
+
 impl BorshSerialize for NomtProof {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         BorshSerialize::serialize(&self.0, writer)
@@ -620,7 +631,7 @@ pub(crate) mod tests {
 
     /// Byte offset of the first terminator position's fields in `three_terminal_proof`'s
     /// encoding: paths length (4) | path 0: tag (1) + leaf (64) + depth (8) | path 1: tag (1).
-    const TERMINATOR_AT: usize = 4 + 1 + 64 + 8 + 1;
+    pub(crate) const TERMINATOR_AT: usize = 4 + 1 + 64 + 8 + 1;
 
     #[test]
     fn a_non_canonical_terminator_is_rejected() {
@@ -657,6 +668,37 @@ pub(crate) mod tests {
             NomtProof::new(proof),
             Err(InvalidNomtProof::NonCanonicalTerminator { index: 1 })
         );
+    }
+
+    /// The two `usize` fields of nomt-core's encoding (a path's `depth`, a terminator's
+    /// `node_index`) are encoded as `u64`s. A value above `u32::MAX` is rejected on every
+    /// target: by borsh on a 32-bit one (the zk guest), by the checks natively. So native and
+    /// guest accept the same bytes, which makes `NomtProof` a consensus type.
+    #[test]
+    fn usize_fields_above_u32_max_are_rejected() {
+        let encoded = bytes(&three_terminal_proof());
+        // Path 0's depth: after the paths length (4), the tag (1) and the leaf (64).
+        const DEPTH_AT: usize = 4 + 1 + 64;
+        assert_eq!(encoded[DEPTH_AT..DEPTH_AT + 8], 1u64.to_le_bytes());
+        // The terminator's `node_index`: after its path (32) and depth (2).
+        const NODE_INDEX_AT: usize = TERMINATOR_AT + 34;
+        assert!(
+            u64::from_le_bytes(
+                encoded[NODE_INDEX_AT..NODE_INDEX_AT + 8]
+                    .try_into()
+                    .unwrap()
+            ) < 1 << 32
+        );
+        for at in [DEPTH_AT, NODE_INDEX_AT] {
+            // Bit 32: the same low 32 bits, so a 32-bit decoder that truncated would accept it.
+            let mut high = encoded.clone();
+            high[at + 4] |= 1;
+            assert!(decode(&high).is_err(), "offset {at}");
+            let mut max = encoded.clone();
+            max[at..at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            assert!(decode(&max).is_err(), "offset {at}");
+        }
+        assert!(decode(&encoded).is_ok());
     }
 
     /// A position decoded from its fields (the constructors only build canonical ones).

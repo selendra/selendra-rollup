@@ -16,6 +16,13 @@
 //!   read or written is a first read, verified like any other.
 //!
 //! Either way the values come from the checkpoint's own (written or verified) state.
+//!
+//! A refresh commits everything revertable in the checkpoint, so it happens between
+//! transactions. For transactions run on a [`TxScratchpad`](crate::TxScratchpad) (and its
+//! [`MeteredTx`](crate::MeteredTx) phases) the compiler enforces it: they own the checkpoint
+//! until the transaction ends, so a refresh in between does not compile (see
+//! [`refresh_versions`](StateCheckpoint::refresh_versions), which also says what this does not
+//! cover).
 
 use std::convert::Infallible;
 

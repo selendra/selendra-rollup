@@ -179,13 +179,86 @@ impl<St: Storage> StateCheckpoint<St> {
     /// from outside.
     ///
     /// Then commits the revertable part of the caches: every read and write since the last
-    /// commit, and the closure's reads. So a later
+    /// commit or discard, and the closure's reads. So a later
     /// [`discard_revertable_storage_cache`](Self::discard_revertable_storage_cache) can drop
-    /// neither the reads nor the writes the versions were read from. Call it at a transaction
-    /// boundary.
+    /// neither the reads nor the writes the versions were read from.
     ///
     /// Public because the state transition function calls it; modules never hold a
     /// `&mut StateCheckpoint`.
+    ///
+    /// # Never while a transaction is in flight (compile-time)
+    /// A transaction runs on a [`TxScratchpad`](crate::TxScratchpad), which takes the
+    /// checkpoint by value and gives it back only when the transaction ends
+    /// ([`commit`](crate::TxScratchpad::commit), [`revert`](crate::TxScratchpad::revert)); its
+    /// metered phases ([`MeteredTx`](crate::MeteredTx)) own the scratchpad until
+    /// [`finalize`](crate::MeteredTx::finalize) returns it, and neither lends the checkpoint
+    /// out. So while a scratchpad or a metered phase over a checkpoint is alive, the checkpoint
+    /// cannot be refreshed: its variable was moved (E0382)...
+    ///
+    /// ```compile_fail,E0382
+    /// use selendra_state::{CheckpointVersions, StateCheckpoint, Storage, TxScratchpad};
+    ///
+    /// fn refresh_mid_transaction<St: Storage>(mut checkpoint: StateCheckpoint<St>) {
+    ///     let scratchpad = TxScratchpad::new(checkpoint);
+    ///     checkpoint.refresh_versions(|_| CheckpointVersions::GENESIS);
+    ///     let _ = scratchpad.commit();
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0382
+    /// use selendra_state::metered::{StateAccessCosts, StateGasMeter, TxRights};
+    /// use selendra_state::{CheckpointVersions, MeteredTx, StateCheckpoint, Storage, TxScratchpad};
+    ///
+    /// fn refresh_mid_phase<St: Storage, M: StateGasMeter>(
+    ///     mut checkpoint: StateCheckpoint<St>,
+    ///     meter: M,
+    ///     costs: StateAccessCosts<M::Gas>,
+    /// ) {
+    ///     let scratchpad = TxScratchpad::new(checkpoint);
+    ///     let phase = MeteredTx::<St, M, TxRights>::new(scratchpad, meter, costs);
+    ///     checkpoint.refresh_versions(|_| CheckpointVersions::GENESIS);
+    ///     let _ = phase.finalize(Ok::<(), ()>(()));
+    /// }
+    /// ```
+    ///
+    /// ...and it cannot be reached through them (private fields, E0616):
+    ///
+    /// ```compile_fail,E0616
+    /// use selendra_state::{CheckpointVersions, Storage, TxScratchpad};
+    ///
+    /// fn refresh_through<St: Storage>(scratchpad: &mut TxScratchpad<St>) {
+    ///     scratchpad.checkpoint.refresh_versions(|_| CheckpointVersions::GENESIS);
+    /// }
+    /// ```
+    ///
+    /// Between transactions it compiles:
+    ///
+    /// ```
+    /// use selendra_state::metered::{StateAccessCosts, StateGasMeter, TxRights};
+    /// use selendra_state::{CheckpointVersions, MeteredTx, StateCheckpoint, Storage, TxScratchpad};
+    ///
+    /// fn refresh_between<St: Storage, M: StateGasMeter>(
+    ///     checkpoint: StateCheckpoint<St>,
+    ///     meter: M,
+    ///     costs: StateAccessCosts<M::Gas>,
+    /// ) -> StateCheckpoint<St> {
+    ///     let scratchpad = TxScratchpad::new(checkpoint);
+    ///     let phase = MeteredTx::<St, M, TxRights>::new(scratchpad, meter, costs);
+    ///     let mut checkpoint = phase.finalize(Ok::<(), ()>(())).scratchpad.commit();
+    ///     checkpoint.refresh_versions(|_| CheckpointVersions::GENESIS);
+    ///     let mut checkpoint = TxScratchpad::new(checkpoint).revert();
+    ///     checkpoint.refresh_versions(|_| CheckpointVersions::GENESIS);
+    ///     checkpoint
+    /// }
+    /// ```
+    ///
+    /// What this does **not** cover: writes made on the checkpoint itself, outside a
+    /// scratchpad (its own [`StateWriter`] impls: genesis, the kernel, block hooks), and the
+    /// writes of a committed scratchpad, are in the revertable part this commits. A caller that
+    /// may still drop them with
+    /// [`discard_revertable_storage_cache`](Self::discard_revertable_storage_cache) (upstream's
+    /// sequencer, for a transaction it drops from a batch) must not refresh before deciding:
+    /// after the refresh they can no longer be discarded. The compiler does not check that.
     pub fn refresh_versions(
         &mut self,
         read_versions: impl FnOnce(&mut BootstrapReader<'_, St>) -> CheckpointVersions,

@@ -71,6 +71,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make test32
 
+  # Stable rustdoc does not check the error code a `compile_fail` doctest pins
+  # (```compile_fail,E0277); nightly rustdoc does. See `make doctest-codes`.
+  doctest-codes:
+    runs-on: ubuntu-24.04
+    if: hashFiles('crates/**/Cargo.toml') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      # RocksDB (`rockbound`, used by `selendra-db`) is built from source: bindgen needs libclang.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libclang-dev
+      - run: make doctest-codes # sets `RUSTFLAGS=""` itself: nightly may add new warnings
+
   deny:
     runs-on: ubuntu-24.04
     if: hashFiles('crates/**/Cargo.toml') != ''

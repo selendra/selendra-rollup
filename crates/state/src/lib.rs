@@ -53,6 +53,7 @@ mod accessors;
 mod cache;
 mod checkpoint;
 pub mod codec;
+mod consensus_types;
 pub mod containers;
 pub mod metered;
 pub mod namespaces;

@@ -55,6 +55,10 @@ mod tests;
 #[cfg(test)]
 mod vectors;
 
+/// `proof`'s test helpers, for the crate's other tests.
+#[cfg(test)]
+pub(crate) use proof::tests as proof_test_utils;
+
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 

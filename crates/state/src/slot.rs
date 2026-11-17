@@ -4,7 +4,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use selendra_interface::common::{HexString, hex_string_serde};
+use selendra_interface::common::{ConsensusType, HexString, hex_string_serde};
 
 use crate::codec::EncodeLike;
 
@@ -47,6 +47,9 @@ impl Prefix {
         [self.module, self.item]
     }
 }
+
+/// borsh: two `u8`s, every byte pair valid: one encoding per prefix, the same on every target.
+impl ConsensusType for Prefix {}
 
 impl fmt::Display for Prefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -218,6 +221,11 @@ impl BorshDeserialize for SlotKey {
     }
 }
 
+/// borsh: a `u32` length and the bytes (no `usize`: borsh lengths are `u32` on every target),
+/// and the decoder accepts exactly what the encoder writes for a key of at least
+/// [`Prefix::LENGTH`] bytes (shorter ones, which no constructor builds, are rejected).
+impl ConsensusType for SlotKey {}
+
 impl serde::Serialize for SlotKey {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         hex_string_serde::serialize(&self.0, serializer)
@@ -316,6 +324,10 @@ impl BorshDeserialize for SlotValue {
         Vec::<u8>::deserialize_reader(reader).map(Self::from)
     }
 }
+
+/// borsh: a `u32` length and the bytes, like `Vec<u8>` (a consensus type): every byte string
+/// is a value, with one encoding, the same on every target.
+impl ConsensusType for SlotValue {}
 
 impl serde::Serialize for SlotValue {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {

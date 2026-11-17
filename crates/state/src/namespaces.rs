@@ -1,6 +1,7 @@
 //! Defines namespaces that are used to partition the state of the rollup.
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use selendra_interface::common::ConsensusType;
 use serde::Serialize;
 
 /// The namespaces used in the rollup. Related to the db's namespaces.
@@ -54,6 +55,14 @@ pub enum ProvableNamespace {
     /// The kernel namespace.
     Kernel,
 }
+
+/// borsh: one tag byte, `0..=2`; the derived decoder rejects any other tag. One encoding per
+/// variant, the same on every target.
+impl ConsensusType for Namespace {}
+
+/// borsh: one tag byte, `0..=1`; the derived decoder rejects any other tag. One encoding per
+/// variant, the same on every target.
+impl ConsensusType for ProvableNamespace {}
 
 /// Implements `Deserialize` for a fieldless enum: human-readable formats (JSON) accept only the
 /// variant name as a string, so each value has one JSON encoding; binary formats keep serde's
