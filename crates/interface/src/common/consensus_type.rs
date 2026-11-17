@@ -9,7 +9,8 @@ use std::marker::PhantomData;
 /// Every value of a consensus type must encode and decode the same way natively and in the
 /// 32-bit zk guest, and have one encoding. So a consensus type never contains, at any depth:
 /// - `usize` or `isize`: borsh encodes them as 64 bits, and the 32-bit guest fails to decode
-///   a value above `u32::MAX` that a native node accepts, which makes the block unprovable;
+///   a value above `u32::MAX` that a native node accepts, which makes the block unprovable
+///   (one exception, below);
 /// - `f32` or `f64`: banned in consensus code (borsh refuses NaN, and float arithmetic is not
 ///   reproducible everywhere);
 /// - `HashMap` or `HashSet`: their iteration order depends on a per-process seed.
@@ -20,6 +21,14 @@ use std::marker::PhantomData;
 /// generic parameters. Module crates derive it (`#[derive(ConsensusType)]`); a hand-written
 /// impl outside the Selendra crates is a review flag. Types not listed here (e.g. a foreign
 /// crate's types) need a newtype.
+///
+/// The one exception to the `usize` rule: a hand-written impl in the Selendra crates for a type
+/// whose own `BorshDeserialize` rejects every `usize` value above `u32::MAX` on every target,
+/// so native nodes and the 32-bit guest accept exactly the same bytes. The impl must document
+/// the bound, and a test must feed the decoder each such field above `u32::MAX`. Today this is
+/// only `selendra_state::NomtProof` (nomt-core's `MultiProof` has two `usize` fields, which its
+/// validating decoder bounds; test `usize_fields_above_u32_max_are_rejected`). Every other
+/// type, and every derive, follows the rule as stated.
 ///
 /// It is not a check of everything consensus data needs: `BorshSerialize` must still be
 /// infallible, and decoding must accept everything encoding produces (the round-trip

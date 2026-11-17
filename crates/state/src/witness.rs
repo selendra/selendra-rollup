@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use selendra_interface::common::HexString;
+use selendra_interface::common::{ConsensusType, HexString};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -16,7 +16,48 @@ use serde::de::DeserializeOwned;
 /// the native storage adds a hint, and the guest storage reads the same hint back. Hints are
 /// replayed by [`Witness::get_hint`] in the same order they were added by
 /// [`Witness::add_hint`]. A hint is the borsh encoding of a value (`docs/serialization.md`,
-/// "Witness hints").
+/// "Witness hints"). Hints are [`ConsensusType`]s: the 32-bit guest decodes what the native
+/// prover encoded, so a hint type must decode the same on both (no floats or hash collections,
+/// and no `usize` unless the type's own decoder bounds it below `u32::MAX`, as
+/// [`NomtProof`](crate::NomtProof)'s does). Neither side compiles with a plain `usize` (E0277):
+/// encoding it,
+///
+/// ```compile_fail,E0277
+/// use selendra_state::{ArrayWitness, Witness};
+///
+/// ArrayWitness::default().add_hint(&0usize);
+/// ```
+///
+/// decoding it (the guest side, where a 32-bit `usize` would diverge),
+///
+/// ```compile_fail,E0277
+/// use selendra_state::{ArrayWitness, Witness};
+///
+/// let _ = ArrayWitness::default().try_get_hint::<usize>();
+/// ```
+///
+/// or decoding it with the panicking [`get_hint`](Witness::get_hint):
+///
+/// ```compile_fail,E0277
+/// use selendra_state::{ArrayWitness, Witness};
+///
+/// let _: usize = ArrayWitness::default().get_hint();
+/// ```
+///
+/// The same calls with a `u64` compile (the empty witness has no hint to decode):
+///
+/// ```
+/// use selendra_state::{ArrayWitness, Witness};
+///
+/// let witness = ArrayWitness::default();
+/// witness.add_hint(&0u64);
+/// assert_eq!(witness.try_get_hint::<u64>(), Ok(0));
+/// assert!(ArrayWitness::default().try_get_hint::<u64>().is_err());
+/// let witness = ArrayWitness::default();
+/// witness.add_hint(&7u64);
+/// let hint: u64 = witness.get_hint();
+/// assert_eq!(hint, 7);
+/// ```
 ///
 /// # Hints are untrusted
 /// In the zk guest every hint comes from the prover. A hint is only a claim: the guest
@@ -36,7 +77,7 @@ pub trait Witness:
     /// # Panics
     /// If `hint` can't be borsh-encoded (see [`BorshCodec`](crate::BorshCodec) for when borsh
     /// refuses). Hints are storage values, leaves and proofs, whose encoding never fails.
-    fn add_hint<T: BorshSerialize>(&self, hint: &T);
+    fn add_hint<T: BorshSerialize + ConsensusType>(&self, hint: &T);
 
     /// Removes the next hint and decodes it as a `T`, rejecting trailing bytes (each hint has
     /// exactly one accepted encoding).
@@ -44,14 +85,14 @@ pub trait Witness:
     /// # Errors
     /// If there is no hint left, or the next hint does not decode as a `T`. The hint is consumed
     /// either way.
-    fn try_get_hint<T: BorshDeserialize>(&self) -> Result<T, InvalidWitness>;
+    fn try_get_hint<T: BorshDeserialize + ConsensusType>(&self) -> Result<T, InvalidWitness>;
 
     /// Removes the next hint and decodes it as a `T`.
     ///
     /// # Panics
     /// If the witness is invalid ([`Witness::try_get_hint`] fails): see the trait docs for why
     /// panicking is the intended result.
-    fn get_hint<T: BorshDeserialize>(&self) -> T {
+    fn get_hint<T: BorshDeserialize + ConsensusType>(&self) -> T {
         match self.try_get_hint() {
             Ok(hint) => hint,
             Err(err) => panic!("{err}"),
@@ -160,12 +201,12 @@ impl ArrayWitness {
 }
 
 impl Witness for ArrayWitness {
-    fn add_hint<T: BorshSerialize>(&self, hint: &T) {
+    fn add_hint<T: BorshSerialize + ConsensusType>(&self, hint: &T) {
         let encoded = borsh::to_vec(hint).expect("a witness hint must be borsh-encodable");
         self.hints().push_back(encoded);
     }
 
-    fn try_get_hint<T: BorshDeserialize>(&self) -> Result<T, InvalidWitness> {
+    fn try_get_hint<T: BorshDeserialize + ConsensusType>(&self) -> Result<T, InvalidWitness> {
         let type_name = core::any::type_name::<T>();
         // The guard is a temporary: the lock is released before decoding.
         let hint = self
@@ -185,6 +226,11 @@ impl Witness for ArrayWitness {
         ArrayWitness::is_empty(self)
     }
 }
+
+/// borsh: like a `Vec<Vec<u8>>` (a consensus type): a `u32` count, then each hint as a `u32`
+/// length and its bytes. One encoding per witness, the same on every target; it is the zk
+/// guest's input.
+impl ConsensusType for ArrayWitness {}
 
 impl BorshSerialize for ArrayWitness {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {

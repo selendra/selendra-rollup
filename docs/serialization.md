@@ -72,7 +72,9 @@ contain, at no depth, any of:
 
 - `usize` / `isize`: borsh encodes them as 64 bits, and the 32-bit zk guest fails to decode a
   value above `u32::MAX` that a native node accepts (the block becomes unprovable). Use `u64`
-  or `u32`;
+  or `u32`. One exception: a hand-written impl in the Selendra crates for a type whose own
+  decoder rejects every such value above `u32::MAX` on every target, documented on the impl
+  and tested; today only `NomtProof` (below);
 - `f32` / `f64` (see above);
 - `HashMap` / `HashSet` (iteration order depends on a per-process seed). Use
   `BTreeMap`/`BTreeSet`.
@@ -95,6 +97,21 @@ types get a newtype.
 value stored with it, in any module and with or without a derive, is one: `StateValue<usize>`
 or `StateMap<u64, f64>` does not compile (E0277). Call messages, events and transactions
 require it as the module system lands.
+
+Every public borsh type of `selendra-state` is a consensus type, each impl documenting why
+its encoding is canonical and the same on 32 and 64 bits: `Prefix`, `SlotKey`, `SlotValue`,
+`Namespace`, `ProvableNamespace`, `NodeLeaf`, `StorageProof<P>` (when `P` is), `NomtProof`,
+`StorageRoot` and `ArrayWitness`. `Storage::Proof` must be one (like `Storage::Root`), so
+`StorageProof<<S as Storage>::Proof>` can be stored or signed generically, and so must every
+witness hint (`Witness::add_hint`/`get_hint`): the 32-bit guest decodes what the native
+prover encoded. `NomtProof` is the one case where the decoder, not the field types, makes
+the encoding safe: nomt-core's `MultiProof` has two `usize` fields (a path's `depth`, a
+terminator's `node_index`, borsh `u64`s), and `NomtProof`'s decoder accepts only depths up to
+256 and the `node_index` derived from the path, so a value above `u32::MAX` is rejected
+natively by that check and on 32 bits by borsh: both accept the same bytes. A compile-time
+assertion in `selendra-state` (`consensus_types.rs`) lists them; tests check each round trip
+and the rejection of non-canonical bytes (other tags, trailing bytes, short keys, the
+`usize` fields above `u32::MAX`).
 
 What the trait does not check: that `BorshSerialize` never fails (a documented rule), and the
 round-trip precondition below.
@@ -275,6 +292,11 @@ consumes them in the same order.
   after `materialize_update` (Phase 8; upstream asserts `witness.is_empty()` there).
 - `ArrayWitness` itself: borsh like `Vec<Vec<u8>>` (the remaining hints); serde a sequence of
   hints, each `0x` + lowercase hex in JSON and a byte sequence in binary formats.
+- Hints are consensus types (`Witness::add_hint`, `try_get_hint` and `get_hint` require
+  `ConsensusType`; `compile_fail` doctests on `Witness` pin each with a `usize`): the 32-bit
+  guest decodes what the native prover encoded, so every hint type decodes the same natively
+  and on 32 bits. No hint has an unbounded `usize`: the only `usize` fields are the two in
+  `NomtProof` (the multi-proof hint), which its decoder bounds (see "Consensus types").
 - Hint types: a read value is `Option<SlotValue>`; a size query's answer is the bare leaf,
   `Option<NodeLeaf>` (never upstream's `NodeLeafAndMaybeValue` with a `ReadType` tag the guest
   had to check). The exact sequence, including the proof hints of `compute_state_update`, is
@@ -289,6 +311,16 @@ consumes them in the same order.
 
   Either way the reads are committed at once, so a later `discard_revertable_storage_cache`
   cannot drop them (or the writes they read) from verification.
+
+  `refresh_versions` commits everything revertable in the checkpoint, so it belongs between
+  transactions. The compiler enforces that for transactions run on a `TxScratchpad`: the
+  scratchpad (and the `MeteredTx` phases that own it) takes the checkpoint by value and gives
+  it back only from `commit`/`revert`, with no way to reach it in between, so refreshing
+  during a transaction does not compile (E0382, E0616; doctests on `refresh_versions`). It
+  does not cover writes made on the checkpoint directly (genesis, kernel, block hooks) or a
+  committed scratchpad's writes: a caller that may still drop those with
+  `discard_revertable_storage_cache` (a sequencer dropping a transaction) must decide before
+  refreshing.
 
 State leaves (changing either changes every state root or witness):
 
@@ -469,5 +501,8 @@ account is its Ethereum address (`MultiAddress::Vm`). There is no `From<Credenti
 ## Checking
 
 - `cargo test` — unit tests, including known-answer vectors and rejection tests.
+- `make doctest-codes` — the doctests on nightly rustdoc, which (unlike stable) checks the
+  error code each `compile_fail` doctest pins, so a type-level rule (`ConsensusType`, sealed
+  traits, private constructors) is proven by the error it is meant to cause.
 - `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

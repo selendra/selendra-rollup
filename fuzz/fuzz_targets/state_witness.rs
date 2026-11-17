@@ -193,7 +193,10 @@ fn json_canonical<T: serde::de::DeserializeOwned + serde::Serialize>(s: &str) ->
 
 /// Decodes `hint` as a `T` through a witness: never panics, and a hint accepted as a `T` is the
 /// canonical encoding of the decoded value.
-fn hint_canonical<T: borsh::BorshDeserialize + borsh::BorshSerialize>(hint: &[u8]) {
+fn hint_canonical<T>(hint: &[u8])
+where
+    T: borsh::BorshDeserialize + borsh::BorshSerialize + selendra_interface::common::ConsensusType,
+{
     let witness = ArrayWitness::from_hints(vec![hint.to_vec()]);
     if let Ok(value) = witness.try_get_hint::<T>() {
         assert_eq!(

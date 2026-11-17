@@ -69,7 +69,7 @@ pub enum SigningDomain {
 /// P5-07 (regression, the type part): upstream's signed bytes were a bare `Vec<u8>`, so code
 /// could sign or verify a payload without the header. The field is private:
 ///
-/// ```compile_fail,E0603
+/// ```compile_fail,E0423
 /// use selendra_primitives::signing::SigningBytes;
 /// let bare = SigningBytes(b"payload".to_vec());
 /// ```

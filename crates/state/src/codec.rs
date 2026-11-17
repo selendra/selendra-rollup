@@ -21,8 +21,9 @@ use selendra_interface::common::{ConsensusType, HexString};
 /// later read. Such a type must enforce its bound at construction (like `RawTx`, `SafeVec` and
 /// `SizedSafeString` do), or must not be stored directly. Containers check this precondition
 /// with a `debug_assert!` on every write (debug builds only). Stored types must also be
-/// consensus types (`selendra_interface::common::ConsensusType`: no `usize`, floats or hash
-/// collections at any depth), which [`BorshCodec`] requires of every key and value type.
+/// consensus types (`selendra_interface::common::ConsensusType`: no floats or hash
+/// collections at any depth, and no `usize` unless the type's own decoder bounds it below
+/// `u32::MAX`), which [`BorshCodec`] requires of every key and value type.
 pub trait StateItemCodec<V>: StateItemEncoder<V> + StateItemDecoder<V> {}
 
 /// A trait for types that can serialize values into storage.
@@ -154,9 +155,11 @@ where
 ///
 /// # Consensus types only
 /// It encodes and decodes only [`ConsensusType`]s: every key and value type stored with it,
-/// in any module, contains no `usize`, `isize`, float, `HashMap` or `HashSet` at any depth
-/// (`docs/serialization.md`, "Consensus types"). A `usize` stored natively above `u32::MAX`
-/// would not decode in the 32-bit zk guest, and a stored NaN float would panic on encoding:
+/// in any module, contains no float, `HashMap` or `HashSet` at any depth, and no `usize` or
+/// `isize` except where the type's own decoder rejects every value above `u32::MAX` on every
+/// target (only [`NomtProof`](crate::NomtProof); `docs/serialization.md`, "Consensus types").
+/// A `usize` stored natively above `u32::MAX` would not decode in the 32-bit zk guest, and a
+/// stored NaN float would panic on encoding:
 ///
 /// ```
 /// use selendra_state::{BorshCodec, Prefix, StateItemEncoder, StateMap, StateValue, StateVec};

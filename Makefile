@@ -1,7 +1,8 @@
-# Mirrors .github/workflows/ci.yml so the same checks run locally (`udeps` and `fuzz` need nightly).
-.PHONY: ci fmt clippy guest test test32 deny audit udeps fuzz upstream-diff
+# Mirrors .github/workflows/ci.yml so the same checks run locally (`doctest-codes`, `udeps` and
+# `fuzz` need nightly).
+.PHONY: ci fmt clippy guest test test32 doctest-codes deny audit udeps fuzz upstream-diff
 
-ci: fmt clippy guest test test32 deny audit udeps fuzz
+ci: fmt clippy guest test test32 doctest-codes deny audit udeps fuzz
 
 fmt:
 	cargo fmt --all -- --check
@@ -39,6 +40,19 @@ test32:
 	rustup target add i686-unknown-linux-musl
 	cargo test --workspace --exclude rockbound --exclude selendra-db --features $(TEST32_FEATURES) --locked --target i686-unknown-linux-musl
 	cargo test -p selendra-state --no-default-features --locked --target i686-unknown-linux-musl
+
+# `compile_fail` doctests pin the error they fail with (```compile_fail,E0277). Stable rustdoc
+# only checks that compilation fails, so a doctest broken by a typo or a missing import would
+# still pass; nightly rustdoc also checks the code. Every `compile_fail` doctest must name one
+# (the grep: `compile_fail` anywhere in a fence's info string, e.g. ```rust,compile_fail, must
+# be followed in it by an `E####` code), and every doctest runs on nightly in both
+# configurations `make test` and `make guest` run doctests in (all features; `selendra-state`
+# without default features).
+# `RUSTFLAGS=""`: nightly may add warnings unrelated to the doctests.
+doctest-codes:
+	! grep -rnE --include='*.rs' '```[^`]*compile_fail' crates | grep -vE '```[^`]*compile_fail[^`]*E[0-9]{4}'
+	RUSTFLAGS="" cargo +nightly test --doc --workspace --all-features --locked --no-fail-fast
+	RUSTFLAGS="" cargo +nightly test --doc -p selendra-state --no-default-features --locked
 
 deny:
 	cargo deny check advisories bans licenses sources

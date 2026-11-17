@@ -89,6 +89,10 @@ pub struct NodeLeaf {
     pub val_hash: [u8; 32],
 }
 
+/// borsh: a `u32` and 32 bytes, every 36-byte string valid: one encoding per leaf, the same on
+/// every target. A leaf hint in a witness is decoded by the 32-bit guest.
+impl ConsensusType for NodeLeaf {}
+
 impl NodeLeaf {
     /// The leaf of `value`: its size and `H(value)`.
     pub fn make_leaf<H: Digest<OutputSize = U32>>(value: &SlotValue) -> NodeLeaf {
@@ -150,6 +154,12 @@ pub struct StorageProof<P> {
     /// The namespace of the key.
     pub namespace: ProvableNamespace,
 }
+
+/// borsh: the fields in order, each a consensus type ([`SlotKey`], an `Option` of a
+/// [`SlotValue`] with tag `0`/`1`, `P`, [`ProvableNamespace`]), so canonical and the same on every
+/// target iff `P` is. Every [`Storage::Proof`] is a consensus type, so a storage proof can be
+/// stored, signed or sent in a call message generically.
+impl<P: ConsensusType> ConsensusType for StorageProof<P> {}
 
 impl<'de, P: Deserialize<'de>> Deserialize<'de> for StorageProof<P> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -276,7 +286,11 @@ pub trait Storage: Clone + fmt::Debug {
     type Witness: Witness + Send + Sync + fmt::Debug;
 
     /// A cryptographic proof that a particular key has a particular value, or is absent.
-    type Proof: Serialize
+    ///
+    /// A [`ConsensusType`], like [`Root`](Self::Root): proofs are witness hints (decoded by the
+    /// 32-bit guest) and may be stored or sent in call messages (as a [`StorageProof`]).
+    type Proof: ConsensusType
+        + Serialize
         + DeserializeOwned
         + fmt::Debug
         + Clone
