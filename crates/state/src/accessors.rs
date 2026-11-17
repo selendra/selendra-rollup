@@ -1,8 +1,9 @@
 //! Traits through which containers read and write state, one implementation per namespace.
 //!
 //! An accessor implements [`StateReader<N>`] / [`StateWriter<N>`] for each namespace `N` it may
-//! touch, so access rights are checked at compile time: e.g. the transaction accessor (Phase 5)
-//! will write but not read [`Accessory`] state. Container methods that only write
+//! touch, so access rights are checked at compile time: e.g. the transaction accessors
+//! ([`Metered`](crate::metered::Metered) with [`TxRights`](crate::metered::TxRights)) write but
+//! never read [`Accessory`] state. Container methods that only write
 //! (`set`, `delete` on values and maps) need only a [`StateWriter`]:
 //!
 //! ```
@@ -111,8 +112,10 @@
 //! # Errors and atomicity
 //! Container operations make several accessor calls and are **not atomic**: one that returns
 //! `Err` (e.g. out of gas) may have applied some of its writes. The caller must then discard all
-//! of the accessor's writes (the Phase 5 transaction accessor reverts the transaction) and must
-//! not catch the error and carry on with them kept. `StateVec` orders its writes so that even
+//! of the accessor's writes and must not catch the error and carry on with them kept. The
+//! metered transaction accessors enforce it: their first failure poisons the metered phase
+//! ([`MeteredTx`](crate::metered::MeteredTx)), which is then reverted whatever the module
+//! returns. `StateVec` orders its writes so that even
 //! then every element in `0..len` stays present and reads stay in bounds, but its contents are
 //! unspecified.
 
@@ -137,8 +140,9 @@ pub trait StateReader<N: CompileTimeNamespace> {
 
     /// Gets a value from the storage and decodes it with the codec's value codec.
     ///
-    /// The default implementation calls [`StateReader::get`] and decodes; gas-metered accessors
-    /// (Phase 5) override it to also charge for decoding.
+    /// The default implementation calls [`StateReader::get`] and decodes; the metered accessors
+    /// ([`Metered`](crate::metered::Metered)) override it to also charge for decoding, per byte,
+    /// before decoding.
     ///
     /// # Panics
     /// If the stored bytes do not decode ([`StateItemDecoder::decode_unwrap`]). This is not input

@@ -6,6 +6,12 @@
 //! a block's reads and writes, and the versions it executes at ([`VersionReader`], read from
 //! its own state through a [`BootstrapReader`]).
 //!
+//! Transactions run on top of the checkpoint with metered access ([`metered`]): a journal per
+//! transaction ([`TxScratchpad`]), metered phases ([`MeteredTx`]) whose first failed access
+//! poisons and reverts them, nested scopes, and the hook ([`Metered`]) through which every
+//! transaction accessor gets gas-charging [`StateReader`]/[`StateWriter`] impls for the
+//! namespaces its rights grant.
+//!
 //! The NOMT state trees: their root ([`StorageRoot`]), the canonical multi-proof
 //! ([`NomtProof`]), proof verification ([`verify_storage_proof`], [`verify_namespace`]) and the
 //! zk-guest storage ([`NomtVerifierStorage`]). All of it is in the guest build too. The native
@@ -27,8 +33,8 @@
 //! - `rockbound` (implies `native`): rockbound's `VersionedSchemaKeyMarker` and `HasPrefix` for
 //!   [`SlotKey`], so the node's flat store (RocksDB) can key values by it.
 //! - `arbitrary`: `NamespacedStateMap::arbitrary_state_map`.
-//! - `test-utils`: [`test_utils`], helpers for the node's storage tests (random container
-//!   operations, a model of a checkpoint, witness helpers); [`test_storage`], an in-memory
+//! - `test-utils`: `test_utils`, helpers for the node's storage tests (random container
+//!   operations, a model of a checkpoint, witness helpers); `test_storage`, an in-memory
 //!   [`Storage`] with a prover and a verifier mode, for tests of crates built on this one
 //!   (also on 32-bit targets and in the guest configuration); `test_vectors`, the known-answer
 //!   vectors of the state trees; and the checkpoint constructors that start at the genesis
@@ -48,6 +54,7 @@ mod cache;
 mod checkpoint;
 pub mod codec;
 pub mod containers;
+pub mod metered;
 pub mod namespaces;
 mod nomt;
 mod slot;
@@ -96,6 +103,10 @@ pub use containers::{
 };
 #[cfg(feature = "native")]
 pub use containers::{RawMapEntry, StateVecRawIter};
+pub use metered::{
+    Metered, MeteredRef, MeteredTx, MeteredView, ScopeEnd, ScopeToken, StateAccessError,
+    TxScratchpad,
+};
 pub use namespaces::{
     Accessory, CompileTimeNamespace, Kernel, Namespace, ProvableCompileTimeNamespace,
     ProvableNamespace, User,

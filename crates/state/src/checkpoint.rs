@@ -215,7 +215,8 @@ impl<St: Storage> StateCheckpoint<St> {
     }
 
     /// Gets the size of a value without reading it in full (in the zk guest only its leaf is
-    /// taken from the witness). For gas metering (Phase 5).
+    /// taken from the witness). Metered reads charge for the value by this size before fetching
+    /// it ([`metered`](crate::metered)).
     pub fn get_size(&mut self, namespace: ProvableNamespace, key: &SlotKey) -> Option<u32> {
         match namespace {
             ProvableNamespace::User => {
@@ -229,7 +230,11 @@ impl<St: Storage> StateCheckpoint<St> {
         }
     }
 
-    fn get_value(&mut self, namespace: ProvableNamespace, key: &SlotKey) -> Option<SlotValue> {
+    pub(crate) fn get_value(
+        &mut self,
+        namespace: ProvableNamespace,
+        key: &SlotKey,
+    ) -> Option<SlotValue> {
         match namespace {
             ProvableNamespace::User => {
                 self.user_cache
@@ -243,6 +248,7 @@ impl<St: Storage> StateCheckpoint<St> {
     }
 
     fn set_value(&mut self, namespace: ProvableNamespace, key: &SlotKey, value: SlotValue) {
+        debug_assert_unmetered_size(key, &value);
         match namespace {
             ProvableNamespace::User => self.user_cache.set(key, value),
             ProvableNamespace::Kernel => self.kernel_cache.set(key, value),
@@ -366,12 +372,24 @@ impl<St: Storage> VersionReader for StateCheckpoint<St> {
     }
 }
 
+/// Unmetered writes (the checkpoint's, a scratchpad's) are not bounded in release builds yet
+/// (Phase 8: a release-mode error, never a panic, which would halt the chain on a user-sized
+/// value); debug builds check them against `MAX_STATE_VALUE_SIZE` like metered writes.
+pub(crate) fn debug_assert_unmetered_size(key: &SlotKey, value: &SlotValue) {
+    debug_assert!(
+        value.len() <= crate::metered::MAX_STATE_VALUE_SIZE,
+        "unmetered write of {} bytes to {key}",
+        value.len()
+    );
+}
+
 /// `StateCheckpoint` reads and writes its own caches without metering.
 ///
-/// Phase 5 adds a metering hook trait with blanket `StateReader`/`StateWriter` impls in this
-/// crate (TODO.md). These concrete impls stay coherent with those blankets only as long as
-/// `StateCheckpoint` never implements the hook trait (gas belongs to the transaction accessors
-/// built on top of a checkpoint, not to the checkpoint).
+/// The metered accessors get their `StateReader`/`StateWriter` impls from the blanket impls over
+/// [`Metered`](crate::metered::Metered) (`metered/blanket.rs`). `StateCheckpoint` does not
+/// implement `Metered` (gas belongs to the transaction accessors built on top of a checkpoint),
+/// so rustc proves these concrete impls disjoint from the blankets; implementing `Metered` for
+/// it would fail with E0119.
 macro_rules! impl_provable_access {
     ($namespace:ty, $provable:expr) => {
         impl<St: Storage> StateReader<$namespace> for StateCheckpoint<St> {
@@ -405,6 +423,7 @@ impl<St: Storage> StateWriter<Accessory> for StateCheckpoint<St> {
     type Error = Infallible;
 
     fn set(&mut self, key: &SlotKey, value: SlotValue) -> Result<(), Self::Error> {
+        debug_assert_unmetered_size(key, &value);
         self.accessory_writes.insert(key.clone(), Some(value));
         Ok(())
     }

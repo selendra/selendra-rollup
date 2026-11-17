@@ -31,8 +31,9 @@ use crate::{Prefix, SlotKey, StateReader, StateReaderAndWriter, StateWriter};
 /// An operation whose accessor returns `Err` (e.g. out of gas) may have applied some of its
 /// writes: it can leave elements past `len` behind (unreadable, and overwritten by a later
 /// `push`/`set_all`) and leave `0..len` partly updated (e.g. `remove` mid-shift). Operations are
-/// not atomic: on `Err` the caller must discard all of the accessor's writes (the Phase 5
-/// transaction accessor reverts the transaction).
+/// not atomic: on `Err` the caller must discard all of the accessor's writes (a metered
+/// accessor's failure poisons its phase, which is then reverted:
+/// [`MeteredTx`](crate::metered::MeteredTx)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespacedStateVec<N, V, Codec = BorshCodec>
 where
@@ -161,7 +162,9 @@ where
     /// Returns the value for the given index, or `None` if it is out of bounds.
     ///
     /// Reads the length and then the element (upstream skipped the length read, which returned
-    /// elements left past `len` by a failed operation).
+    /// elements left past `len` by a failed operation). So with a metered accessor it costs two
+    /// reads (upstream: one): loops over elements should use [`iter`](Self::iter), which reads
+    /// the length once.
     pub fn get<Reader: StateReader<N>>(
         &self,
         index: u64,

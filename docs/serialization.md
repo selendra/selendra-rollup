@@ -161,10 +161,11 @@ state root (a fork).
 - A vec stores exactly elements `0..len` (`pop`, `remove`, `clear`, `set_all` delete what they
   drop) **as long as no operation failed**. Container operations make several accessor calls and
   are not atomic: when an accessor returns `Err` (e.g. out of gas) the caller must discard all
-  of that accessor's writes (Phase 5: the transaction is reverted), never catch the error and
-  keep them. Even so, `StateVec` shrinks its length before deleting and grows it after writing,
-  so after a failure every element in `0..len` is still present, and every read is
-  bounds-checked against `len` (a leftover element past `len` is never returned).
+  of that accessor's writes (a metered accessor's failure poisons its phase, whose writes are
+  then reverted: see "Metered state access"), never catch the error and keep them. Even so,
+  `StateVec` shrinks its length before deleting and grows it after writing, so after a failure
+  every element in `0..len` is still present, and every read is bounds-checked against `len` (a
+  leftover element past `len` is never returned).
 - `User`, `Kernel` and `Accessory` are separate key spaces: the same key in two namespaces
   is two different values.
 - Decoding a stored value panics on failure (`StateItemDecoder::decode_unwrap`; the message
@@ -192,6 +193,70 @@ state root (a fork).
   - `Prefix`: borsh the 2 bytes; JSON and `Display` `"0x0102"`.
   - `Namespace` / `ProvableNamespace`: borsh one tag byte (`0` user, `1` kernel, `2` accessory);
     JSON only the snake_case string (`"user"`). Serde's derived decoding would also accept `{"user":null}`.
+
+## Metered state access
+
+Transactions access state through metered accessors (`selendra_state::metered`). Their gas
+and the order of their storage accesses are part of consensus: the native node and the zk
+guest must charge the same gas, fail at the same access, and record the same reads and
+witness hints. Changing anything below changes `gas_used` (a fork).
+
+**Formulas.** Every term comes from the spec's gas schedule (`StateAccessCosts`). `key_len` is
+the whole `SlotKey` (prefix included), `size`/`len` the value's bytes. All arithmetic is
+checked: an overflow is a `GasOverflow` failure, never a wrap or a panic.
+
+| Access | First charge, before touching storage | Second charge, once the value is known present |
+|---|---|---|
+| read (`get`) | `access + hash_update + hash_per_byte·key_len + read` | `read_per_byte·size + hash_update + hash_per_byte·size` |
+| read and decode (`get_decoded`, every typed container read) | the same | the same `+ decode_per_byte·size` |
+| `set` (User, Kernel) | `access + hash_update + hash_per_byte·key_len + write + write_per_byte·len + hash_update + hash_per_byte·len` | – |
+| `delete` (User, Kernel) | `set` with `len = 0` | – |
+| `set`/`delete` (Accessory) | `accessory_write + accessory_write_per_byte·(key_len + len)` (`len = 0` for a delete) | – |
+| open a nested scope (`open_scope`) | `scope_open`, before the scope is pushed | – |
+
+- A read takes `size` from the transaction's journal, or from the checkpoint's size query
+  (in the guest only the value's leaf comes from the witness); an absent value gets no second
+  charge. The value is fetched only after the second charge succeeds.
+- A read of a key the transaction wrote (a journal hit) is charged the full formula, like a
+  first read. `StateVec::get` is two reads (the length, then the element); `iter()` reads the
+  length once.
+- Accessory writes are charged (upstream: free) and journaled like the others.
+- Opening a nested scope is charged `scope_open` (upstream's `to_revertable`: free, so the
+  scopes a call opened were bounded only by the number of calls). It is charged only after
+  the phase and the accessor's scope are checked, so opening on a poisoned phase or through a
+  stale accessor charges nothing. A refused charge opens nothing. Closing a scope is free, and so is the phase's base scope (opened by the state
+  transition function, not a module).
+- **Value size bound:** a metered write of more than `MAX_STATE_VALUE_SIZE` = 1 MiB
+  (`1 << 20` bytes, checked on the value's length before any charge) fails with
+  `ValueTooLarge`. Unmetered writes (kernel, genesis, block hooks) are only checked in debug
+  builds until Phase 8.
+
+**Failures and reverts.** A metered phase (`MeteredTx`: pre-execution, or the call with its
+hooks) runs in a base scope of the transaction's journal (`TxScratchpad`) over the block's
+checkpoint.
+- The first failed access (`OutOfGas`, `GasOverflow`, `ValueTooLarge`, `ScopeMisuse`; a
+  refused scope open included) **poisons** the phase. A refused charge charges nothing. Every
+  later access returns `Poisoned` before touching the meter or storage, so it adds neither gas
+  nor a witness hint.
+- `MeteredTx::finalize(result)` commits the base scope into the scratchpad only if the phase
+  is not poisoned **and** `result` is `Ok`; otherwise it reverts it. The gas used is kept either
+  way. Reverting a nested scope never clears the poison.
+- Nested scopes (`open_scope`/`close_scope`) commit into their parent or revert. Closing a
+  scope out of order, twice, or from another phase is `ScopeMisuse` (and poisons). A scope left
+  open (a leaked guard) is reverted by the next access through an enclosing accessor and by
+  `finalize`. `open_scope` itself never returns an error: if it fails (poisoned phase, closed
+  accessor scope, refused `scope_open` charge) it poisons the phase, opens nothing and returns
+  a token that matches no scope.
+- A scope token is valid only in the phase that issued it: it carries a serial number unique
+  within the phase and the phase's identity (a shared allocation compared by address, never
+  read as a value), so a token of another phase never matches, even one of another
+  checkpoint alive at the same time with the same depth and serial. The identity never
+  reaches state, the witness or gas. Tokens are neither `Send` nor `Sync`, so no safe `static`
+  can hold one (only a `static mut` could, which needs `unsafe`, forbidden in the workspace;
+  the identity check still rejects such a token in a later phase).
+- `TxScratchpad::commit` applies the journal to the checkpoint in key order (namespace, then
+  key); `revert` drops it, accessory writes included. Reads stay recorded in the checkpoint
+  either way, so they are verified against the state root.
 
 ## Witness hints and storage proofs
 

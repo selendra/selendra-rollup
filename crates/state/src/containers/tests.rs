@@ -554,7 +554,7 @@ fn accessory_and_infallible_helper_traits() {
     );
 }
 
-/// An accessor that can write the accessory namespace but not read it, like the Phase 5
+/// An accessor that can write the accessory namespace but not read it, like the metered
 /// transaction accessor.
 #[derive(Default)]
 struct WriteOnlyAccessory {
@@ -574,7 +574,7 @@ impl StateWriter<Accessory> for WriteOnlyAccessory {
 }
 
 /// Writing accessory state needs only a `StateWriter<Accessory>` (pins the method bounds: a
-/// refactor requiring a reader too would break the Phase 5 write-only transaction accessor).
+/// refactor requiring a reader too would break the write-only metered transaction accessors).
 #[test]
 fn accessory_writes_need_only_a_writer() {
     let mut state = WriteOnlyAccessory::default();
