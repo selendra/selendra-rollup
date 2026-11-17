@@ -82,13 +82,19 @@ for `Vec`, slices, arrays, `Option`, `Box`, `BTreeMap`, `BTreeSet` and tuples (u
 consensus types; for `PhantomData<T>` with any `T` (it stores nothing); and for the consensus
 types of the Selendra crates (heights and slot numbers, `HexString`, `CredentialId`,
 `SafeVec`, `SizedSafeString`, `RawTx`, `FullyBakedTx`, events, proof public data, `Time`,
-addresses, keys, signatures, …). Because containers implement it only when their contents do,
+addresses, keys, signatures, the state roots `StorageRoot` and `TestRoot`, …). Every
+`StateRoot` is one (a supertrait), so generic code can store `<S as Storage>::Root` and put it
+in proof public data. Because containers implement it only when their contents do,
 the check sees through type aliases, nested structs and generic parameters, which a check of
 field syntax cannot. The `DaSpec` slot hash and address and the zkVM code commitment must be
 consensus types (trait bounds). Module crates derive it (`#[derive(ConsensusType)]`, from
 Phase 5's macros); a hand-written impl outside the Selendra crates is a review flag. Foreign
-types get a newtype. The `BorshCodec` bounds (every stored key and value), call messages,
-events and transactions require it as the module system lands.
+types get a newtype.
+
+`selendra-state`'s `BorshCodec` encodes and decodes consensus types only, so every key and
+value stored with it, in any module and with or without a derive, is one: `StateValue<usize>`
+or `StateMap<u64, f64>` does not compile (E0277). Call messages, events and transactions
+require it as the module system lands.
 
 What the trait does not check: that `BorshSerialize` never fails (a documented rule), and the
 round-trip precondition below.
@@ -175,9 +181,10 @@ state root (a fork).
     checked against the state root only later. Panicking (no proof) is the intended result; this
     must never become a recoverable error, or control flow would depend on unverified bytes.
 - Encoding a stored key or value panics where borsh refuses it: a collection longer than
-  `u32::MAX` or of zero-sized types, a **NaN float**, or an error from a hand-written
-  `BorshSerialize`. So state key and value types contain **no floats** (see "Untrusted input")
-  and have infallible `BorshSerialize` impls.
+  `u32::MAX` or of zero-sized types, a NaN float, or an error from a hand-written
+  `BorshSerialize`. State key and value types are consensus types (`BorshCodec` requires it, see
+  "Consensus types"), so they contain **no floats**, and their `BorshSerialize` impls must be
+  infallible.
 - Encodings of the key types (each has exactly one accepted encoding):
   - `SlotKey`: borsh like `Vec<u8>` (the whole key, prefix included), at least 2 bytes. JSON and
     `Display` use `0x` + lowercase hex. `SlotKey::try_from_bytes` rejects < 2 bytes and never panics.
@@ -207,6 +214,16 @@ consumes them in the same order.
   `Option<NodeLeaf>` (never upstream's `NodeLeafAndMaybeValue` with a `ReadType` tag the guest
   had to check). The exact sequence, including the proof hints of `compute_state_update`, is
   defined by each storage (see the `Storage` docs, "The witness protocol").
+- A checkpoint's versions (visible slot number, rollup height) are read from its own state,
+  never passed in from outside the checkpoint:
+  - by the closure of `StateCheckpoint::new_with`: the checkpoint's first reads, so their
+    hints come first in the witness and they are verified against the prior state root;
+  - by the closure of `refresh_versions`: reads of the checkpoint's current state, so values
+    the kernel wrote earlier in the block come from the checkpoint's write cache (no hint);
+    only a key not yet read or written is a first read, with a hint, verified.
+
+  Either way the reads are committed at once, so a later `discard_revertable_storage_cache`
+  cannot drop them (or the writes they read) from verification.
 
 State leaves (changing either changes every state root or witness):
 

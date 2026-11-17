@@ -1,4 +1,8 @@
-//! An in-memory [`Storage`] for tests that models the witness protocol.
+//! An in-memory [`Storage`] for tests that models the witness protocol ([`TestStorage`]).
+//!
+//! Compiled for this crate's tests and with the `test-utils` feature only: never in the zk
+//! guest or a node build. It needs no database, so tests of crates built on this one can use it
+//! on every target, 32-bit and the guest configuration included.
 //!
 //! - **Prover** mode holds the committed state (`BTreeMap`s) and records a hint for every read,
 //!   like a native storage.
@@ -26,10 +30,10 @@ use crate::{
 };
 
 /// The contents of one provable namespace.
-pub(crate) type NamespaceState = BTreeMap<SlotKey, SlotValue>;
+pub type NamespaceState = BTreeMap<SlotKey, SlotValue>;
 
-/// The root of a namespace.
-pub(crate) fn namespace_root(state: &NamespaceState) -> [u8; 32] {
+/// The root of a namespace: `SHA-256(borsh(state))`, `[0; 32]` when empty.
+pub fn namespace_root(state: &NamespaceState) -> [u8; 32] {
     if state.is_empty() {
         [0; 32]
     } else {
@@ -37,7 +41,7 @@ pub(crate) fn namespace_root(state: &NamespaceState) -> [u8; 32] {
     }
 }
 
-/// `user_root ‖ kernel_root`.
+/// The root of a [`TestStorage`]: `user_root ‖ kernel_root` (see [`namespace_root`]).
 #[derive(
     Clone,
     Copy,
@@ -48,7 +52,7 @@ pub(crate) fn namespace_root(state: &NamespaceState) -> [u8; 32] {
     serde::Serialize,
     serde::Deserialize,
 )]
-pub(crate) struct TestRoot(#[serde(with = "hex_string_serde")] [u8; 64]);
+pub struct TestRoot(#[serde(with = "hex_string_serde")] [u8; 64]);
 
 impl TestRoot {
     const fn from_roots(user: [u8; 32], kernel: [u8; 32]) -> Self {
@@ -81,6 +85,9 @@ impl AsRef<[u8]> for TestRoot {
     }
 }
 
+/// borsh: the 64 raw bytes.
+impl selendra_interface::common::ConsensusType for TestRoot {}
+
 impl StateRoot for TestRoot {
     fn global_root(&self) -> [u8; 32] {
         Sha256::digest(self.0).into()
@@ -102,12 +109,15 @@ impl StateRoot for TestRoot {
 
 /// Committed state of a prover storage.
 #[derive(Debug, Default)]
-pub(crate) struct Committed {
-    pub(crate) user: NamespaceState,
-    pub(crate) kernel: NamespaceState,
-    pub(crate) accessory: NamespaceState,
+pub struct Committed {
+    /// The user namespace.
+    pub user: NamespaceState,
+    /// The kernel namespace.
+    pub kernel: NamespaceState,
+    /// The accessory namespace (not part of the root).
+    pub accessory: NamespaceState,
     /// Number of commits so far.
-    pub(crate) version: u64,
+    pub version: u64,
 }
 
 impl Committed {
@@ -123,10 +133,14 @@ impl Committed {
     }
 }
 
-/// See the module docs.
+/// An in-memory storage that models the witness protocol (see the module docs). The default
+/// is an empty prover storage.
 #[derive(Debug, Clone)]
-pub(crate) enum TestStorage {
+pub enum TestStorage {
+    /// Holds the committed state and records a hint for every read, like a native storage.
     Prover(Arc<Committed>),
+    /// Holds nothing: answers reads from witness hints only and verifies them in
+    /// `compute_state_update`, like the zk guest.
     Verifier,
 }
 
@@ -138,7 +152,7 @@ impl Default for TestStorage {
 
 /// The state after an update, and the accessory items added to it.
 #[derive(Debug)]
-pub(crate) struct TestStateUpdate {
+pub struct TestStateUpdate {
     user: NamespaceState,
     kernel: NamespaceState,
     accessory: Vec<(SlotKey, Option<SlotValue>)>,
@@ -155,20 +169,31 @@ impl StateUpdate for TestStateUpdate {
 }
 
 impl TestStorage {
-    pub(crate) fn committed(&self) -> &Committed {
+    /// The committed state.
+    ///
+    /// # Panics
+    /// On a verifier storage, which holds no state.
+    pub fn committed(&self) -> &Committed {
         match self {
             Self::Prover(committed) => committed,
             Self::Verifier => panic!("a verifier storage holds no state"),
         }
     }
 
-    /// The root of the committed state (prover only).
-    pub(crate) fn root(&self) -> TestRoot {
+    /// The root of the committed state.
+    ///
+    /// # Panics
+    /// On a verifier storage, which holds no state.
+    pub fn root(&self) -> TestRoot {
         self.committed().root()
     }
 
-    /// Runs `f` on a checkpoint over this storage, then commits it (with the accessory writes).
-    pub(crate) fn commit_with(self, f: impl FnOnce(&mut StateCheckpoint<Self>)) -> Self {
+    /// Runs `f` on a checkpoint over this storage (at the genesis versions), then commits it
+    /// (with the accessory writes).
+    ///
+    /// # Panics
+    /// On a verifier storage, which holds no state.
+    pub fn commit_with(self, f: impl FnOnce(&mut StateCheckpoint<Self>)) -> Self {
         let prev_root = self.root();
         let mut checkpoint = StateCheckpoint::new(self);
         f(&mut checkpoint);
@@ -230,7 +255,7 @@ impl TestStorage {
 }
 
 impl Storage for TestStorage {
-    type Hasher = Sha256;
+    type Hasher = crate::StateHasher;
     type Witness = ArrayWitness;
     /// The whole namespace map.
     type Proof = NamespaceState;
@@ -355,7 +380,7 @@ impl Storage for TestStorage {
 }
 
 #[cfg(feature = "native")]
-pub(crate) use native::ProvenTestAccessor;
+pub use native::ProvenTestAccessor;
 
 #[cfg(feature = "native")]
 mod native {
@@ -367,7 +392,7 @@ mod native {
     use crate::namespaces::{
         CompileTimeNamespace, Kernel, Namespace, ProvableCompileTimeNamespace, User,
     };
-    use crate::storage::{NodeLeaf, NodeLeafAndMaybeValue};
+    use crate::storage::NodeLeafAndMaybeValue;
     use crate::{
         NativeStorage, ProofOutput, ProvenStateAccessor, SlotKey, SlotValue, StateReader,
         StorageProof,
@@ -514,7 +539,7 @@ mod native {
 
     /// An API-like accessor: reads committed state and proves it (the role of
     /// `ApiStateAccessor`, Phase 13).
-    pub(crate) struct ProvenTestAccessor(pub(crate) TestStorage);
+    pub struct ProvenTestAccessor(pub TestStorage);
 
     macro_rules! impl_proven {
         ($namespace:ty) => {
@@ -547,6 +572,7 @@ mod native {
 
     #[test]
     fn native_reads_and_versions() {
+        use crate::storage::NodeLeaf;
         use crate::{BorshCodec, KernelStateMap, Prefix, StateMap};
 
         let storage = TestStorage::default().commit_with(|state| {

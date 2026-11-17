@@ -292,6 +292,8 @@ fn borrowed_mut_guard_moves_through_unwrap() {
 #[derive(Debug, borsh::BorshSerialize)]
 struct BoundedBytes(Vec<u8>);
 
+impl selendra_interface::common::ConsensusType for BoundedBytes {}
+
 impl borsh::BorshDeserialize for BoundedBytes {
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
         let bytes = Vec::<u8>::deserialize_reader(reader)?;

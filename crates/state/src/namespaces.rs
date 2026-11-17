@@ -96,13 +96,62 @@ string_only_enum_deserialize!(ProvableNamespace {
     Kernel => "kernel",
 });
 
+mod sealed {
+    /// Only this crate's namespace markers implement it.
+    pub trait Sealed {}
+
+    impl Sealed for super::User {}
+    impl Sealed for super::Kernel {}
+    impl Sealed for super::Accessory {}
+}
+
 /// Converts a type into a runtime namespace.
-pub trait CompileTimeNamespace: core::fmt::Debug + Send + Sync + 'static {
+///
+/// Sealed: only [`User`], [`Kernel`] and [`Accessory`] implement it. Access rights are checked
+/// per namespace marker (`StateReader<N>`, `StateWriter<N>`), so a marker defined elsewhere
+/// with `NAMESPACE = Kernel` would get an accessor's kernel rights under another name.
+/// Upstream's namespace traits were not sealed.
+///
+/// The markers can be used anywhere:
+///
+/// ```
+/// use selendra_state::namespaces::{
+///     Accessory, CompileTimeNamespace, Kernel, Namespace, ProvableCompileTimeNamespace, User,
+/// };
+///
+/// fn namespace<N: CompileTimeNamespace>() -> Namespace {
+///     N::NAMESPACE
+/// }
+/// fn provable<N: ProvableCompileTimeNamespace>() -> Namespace {
+///     N::NAMESPACE
+/// }
+///
+/// assert_eq!(namespace::<Accessory>(), Namespace::Accessory);
+/// assert_eq!(provable::<User>(), Namespace::User);
+/// assert_eq!(provable::<Kernel>(), Namespace::Kernel);
+/// ```
+///
+/// but no other crate can add one (E0277: the marker does not implement the private `Sealed`
+/// supertrait):
+///
+/// ```compile_fail,E0277
+/// use selendra_state::namespaces::{CompileTimeNamespace, Namespace};
+///
+/// #[derive(Debug)]
+/// struct FakeKernel;
+///
+/// impl CompileTimeNamespace for FakeKernel {
+///     const NAMESPACE: Namespace = Namespace::Kernel;
+/// }
+/// ```
+pub trait CompileTimeNamespace: sealed::Sealed + core::fmt::Debug + Send + Sync + 'static {
     /// The runtime namespace variant associated with the type.
     const NAMESPACE: Namespace;
 }
 
 /// Converts a type into a Provable Namespace at compile time.
+///
+/// Sealed like [`CompileTimeNamespace`]: only [`User`] and [`Kernel`] implement it.
 pub trait ProvableCompileTimeNamespace: CompileTimeNamespace {
     /// The runtime namespace variant associated with the type.
     const PROVABLE_NAMESPACE: ProvableNamespace;

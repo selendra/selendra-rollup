@@ -637,14 +637,12 @@ fn historical_reads_bypass_the_checkpoint() {
     let key = map().slot_key(&1);
     let mut checkpoint = StateCheckpoint::new(storage.clone());
     let throwaway = ArrayWitness::default();
-    let version = Some(checkpoint.storage().latest_version());
-    let old = checkpoint
-        .storage()
+    let version = Some(storage.latest_version());
+    let old = storage
         .get_historical::<User>(&key, version, &throwaway)
         .unwrap();
     assert_eq!(old, Some(SlotValue::from(10u32.to_le_bytes().to_vec())));
-    checkpoint
-        .storage()
+    storage
         .get_leaf_historical::<User>(&key, version, &throwaway)
         .unwrap();
     assert_eq!(

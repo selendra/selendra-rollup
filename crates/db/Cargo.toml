@@ -31,8 +31,9 @@ test-strategy = { workspace = true }
 
 [features]
 # `harness`: the state databases and the storage manager in a temporary directory, with a test
-# block header (serde), for tests (of this crate and others).
-test-utils = ["dep:serde", "dep:tempfile"]
+# block header (serde), for tests (of this crate and others). Builds checkpoints with
+# `StateCheckpoint::new` (`selendra-state/test-utils`).
+test-utils = ["dep:serde", "dep:tempfile", "selendra-state/test-utils"]
 
 [lints]
 workspace = true

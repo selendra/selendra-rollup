@@ -44,8 +44,12 @@ native = ["selendra-interface/native"]
 rockbound = ["native", "dep:rockbound"]
 # `NamespacedStateMap::arbitrary_state_map`.
 arbitrary = ["dep:arbitrary"]
-# `test_utils` and `test_vectors`: helpers and known-answer vectors for the node's storage tests
-# (`selendra-db` dev-dependency). Never in a node or guest build.
+# Test support for this crate and the crates built on it (`selendra-db`'s `test-utils` feature
+# and dev-dependency; later the module-system crates): `test_utils` and `test_vectors` (helpers
+# and known-answer vectors for the node's storage tests), `test_storage` (`TestStorage`, an
+# in-memory `Storage` with prover and verifier modes, usable on 32-bit and in the guest
+# configuration) and the genesis-version constructors `StateCheckpoint::new`/`with_witness`.
+# Never in a node or guest build.
 test-utils = ["dep:proptest", "dep:test-strategy"]
 
 [lints]

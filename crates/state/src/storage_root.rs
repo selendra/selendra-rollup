@@ -6,7 +6,7 @@ use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use selendra_interface::common::{HexString, hex_string_serde};
+use selendra_interface::common::{ConsensusType, HexString, hex_string_serde};
 use selendra_interface::reexports::digest::Digest;
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +117,10 @@ impl<S> AsRef<[u8]> for StorageRoot<S> {
     }
 }
 
+/// The borsh encoding is the 64 raw bytes (no `usize`, float or hash collection), whatever `S`
+/// is: `S` is only a marker.
+impl<S> ConsensusType for StorageRoot<S> {}
+
 impl<S> BorshSerialize for StorageRoot<S> {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         // A `[u8; 64]` is borsh-encoded as its raw bytes.
@@ -210,6 +214,56 @@ mod tests {
         );
         assert_eq!(Root::PRE_GENESIS.as_ref(), [0u8; 64]);
         assert_ne!(Root::new([1; 32], [2; 32]), Root::new([2; 32], [1; 32]));
+    }
+
+    /// A state root is a consensus type (D20): it is committed to by the proof's public data
+    /// and stored by modules (per-slot roots), so `BorshCodec` must accept it, also generically
+    /// as `<St as Storage>::Root` (which needs the `StateRoot: ConsensusType` supertrait).
+    #[test]
+    fn roots_are_stored_with_the_borsh_codec() {
+        use selendra_interface::da::DaSpec;
+        use selendra_interface::zk::StateTransitionPublicData;
+
+        use crate::test_state::UnwrapInfallible;
+        use crate::test_storage::{TestRoot, TestStorage};
+        use crate::{BorshCodec, Prefix, StateCheckpoint, StateMap, StateValue, Storage};
+
+        fn consensus<T: ConsensusType>() {}
+        #[expect(
+            dead_code,
+            reason = "compile-time check: this crate has no `DaSpec` to call it with"
+        )]
+        fn generic<St: Storage, Da: DaSpec>() {
+            consensus::<St::Root>();
+            consensus::<StateTransitionPublicData<[u8; 32], Da, St::Root>>();
+        }
+        consensus::<Root>();
+        consensus::<TestRoot>();
+
+        // Generic code storing the storage's own root type.
+        fn latest<St: Storage>() -> StateValue<St::Root> {
+            StateValue::with_codec(Prefix::new(1, 0), BorshCodec)
+        }
+        let roots = || StateMap::<u64, Root>::with_codec(Prefix::new(1, 1), BorshCodec);
+
+        let first = TestStorage::default();
+        let test_root = first.root();
+        let storage = first.commit_with(|state| {
+            latest::<TestStorage>()
+                .set(&test_root, state)
+                .unwrap_infallible();
+            roots().set(&7, &root(), state).unwrap_infallible();
+        });
+        // Read back from the committed storage (decoded, not from the write cache).
+        let mut state = StateCheckpoint::new(storage);
+        assert_eq!(
+            latest::<TestStorage>().get(&mut state).unwrap_infallible(),
+            Some(test_root)
+        );
+        assert_eq!(
+            roots().get(&7, &mut state).unwrap_infallible(),
+            Some(root())
+        );
     }
 
     #[test]

@@ -5,9 +5,12 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::marker::PhantomData;
 
+use selendra_interface::common::{RollupHeight, SlotNumber, VisibleSlotNumber};
+
 use crate::cache::{AccessSize, IsValueCached, ProvableStorageCache, StateAccesses};
 use crate::namespaces::{Accessory, Kernel, Namespace, ProvableNamespace, User};
 use crate::storage::{NodeLeafAndMaybeValue, Storage};
+use crate::version::{BootstrapReader, CheckpointVersions, VersionReader};
 use crate::{SlotKey, SlotValue, StateReader, StateWriter};
 
 /// The read/write set of a block on top of a [`Storage`]: a cache per provable namespace, the
@@ -17,6 +20,12 @@ use crate::{SlotKey, SlotValue, StateReader, StateWriter};
 /// storage, which adds a hint to the witness, and records the read, which the state update
 /// later verifies. Writes stay in the checkpoint until it is frozen
 /// ([`freeze`](Self::freeze), [`materialize_update`](Self::materialize_update)).
+///
+/// # Versions
+/// A checkpoint executes at a visible slot number and a rollup height ([`VersionReader`]),
+/// which it reads from its own state when it is created ([`new_with`](Self::new_with)) and
+/// again when the kernel moves them on ([`refresh_versions`](Self::refresh_versions)). They
+/// are never passed in: in the zk guest a value from outside the checkpoint is unverified.
 ///
 /// # Access rights
 /// [`StateReader`] and [`StateWriter`] (both infallible) for [`User`] and [`Kernel`], and
@@ -62,11 +71,10 @@ use crate::{SlotKey, SlotValue, StateReader, StateWriter};
 /// }
 /// ```
 ///
-/// # Not yet here
-/// Upstream's checkpoint also carries the visible slot number and rollup height (read from the
-/// kernel when it is created, `VersionReader`), a per-block cache (`TempCache`), metrics, gas
-/// metering and the sequencer's uncommitted-changes overlay. Those come with the module system
-/// (Phase 5), the kernel (Phase 8) and the sequencer (Phase 11).
+/// # Not here
+/// Upstream's checkpoint also carries a per-block cache (`TempCache`, Phase 7), metrics
+/// (dropped) and the sequencer's uncommitted-changes overlay (Phase 11). Gas metering is not
+/// the checkpoint's: the metered transaction accessors are built on top of it.
 pub struct StateCheckpoint<St: Storage> {
     storage: St,
     witness: St::Witness,
@@ -74,6 +82,7 @@ pub struct StateCheckpoint<St: Storage> {
     kernel_cache: ProvableStorageCache<Kernel>,
     /// `None` is a delete.
     accessory_writes: BTreeMap<SlotKey, Option<SlotValue>>,
+    versions: CheckpointVersions,
 }
 
 impl<St: Storage> std::fmt::Debug for StateCheckpoint<St> {
@@ -93,27 +102,102 @@ pub struct FirstTimeReads {
 }
 
 impl<St: Storage> StateCheckpoint<St> {
+    /// Creates a checkpoint with no changes over `storage` and `witness` (empty for native
+    /// execution, which fills it; the zk guest replays the witness the native execution
+    /// recorded), then reads its versions with `read_versions`.
+    ///
+    /// The closure's reads are the checkpoint's first reads: recorded, put in the witness and
+    /// verified against the state root like any other, in the same order natively and in the
+    /// guest. They are committed right after the closure returns, so a later
+    /// [`discard_revertable_storage_cache`](Self::discard_revertable_storage_cache) cannot drop
+    /// them from verification (upstream's bootstrap reads stayed revertable).
+    ///
+    /// The closure is the kernel's (Phase 8). E.g., reading the versions from two kernel values
+    /// (absent before the first block):
+    ///
+    /// ```
+    /// use selendra_interface::common::{RollupHeight, VisibleSlotNumber};
+    /// use selendra_state::{
+    ///     BorshCodec, CheckpointVersions, KernelStateValue, Prefix, StateCheckpoint, Storage,
+    /// };
+    ///
+    /// fn open<St: Storage>(storage: St, witness: St::Witness) -> StateCheckpoint<St> {
+    ///     let visible = KernelStateValue::<u64>::with_codec(Prefix::new(1, 0), BorshCodec);
+    ///     let height = KernelStateValue::<u64>::with_codec(Prefix::new(1, 1), BorshCodec);
+    ///     StateCheckpoint::new_with(storage, witness, |reader| {
+    ///         let Ok(visible) = visible.get(reader);
+    ///         let Ok(height) = height.get(reader);
+    ///         CheckpointVersions {
+    ///             visible_slot_number: VisibleSlotNumber::new_dangerous(visible.unwrap_or(0)),
+    ///             rollup_height: RollupHeight::new(height.unwrap_or(0)),
+    ///         }
+    ///     })
+    /// }
+    /// ```
+    pub fn new_with(
+        storage: St,
+        witness: St::Witness,
+        read_versions: impl FnOnce(&mut BootstrapReader<'_, St>) -> CheckpointVersions,
+    ) -> Self {
+        let mut checkpoint = Self::empty(storage, witness);
+        checkpoint.refresh_versions(read_versions);
+        checkpoint
+    }
+
     /// Creates a checkpoint with no changes over `storage`, with an empty witness (native
-    /// execution, which fills it).
+    /// execution, which fills it) and [`CheckpointVersions::GENESIS`]. Tests only
+    /// (`test-utils`): real checkpoints read their versions
+    /// ([`new_with`](Self::new_with)).
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new(storage: St) -> Self {
         Self::with_witness(storage, Default::default())
     }
 
     /// Creates a checkpoint with no changes over `storage` and `witness` (the zk guest replays
-    /// the witness the native execution recorded).
+    /// the witness the native execution recorded), with [`CheckpointVersions::GENESIS`]. Tests
+    /// only (`test-utils`), like [`new`](Self::new).
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn with_witness(storage: St, witness: St::Witness) -> Self {
+        Self::empty(storage, witness)
+    }
+
+    fn empty(storage: St, witness: St::Witness) -> Self {
         Self {
             storage,
             witness,
             user_cache: Default::default(),
             kernel_cache: Default::default(),
             accessory_writes: BTreeMap::new(),
+            versions: CheckpointVersions::GENESIS,
         }
     }
 
-    /// Returns the storage underlying the checkpoint.
-    pub fn storage(&self) -> &St {
-        &self.storage
+    /// Reads the versions again with `read_versions`, after the kernel has written new ones
+    /// (Phase 8: the next rollup height and visible slot number at the start of a block;
+    /// Phase 11: the sequencer advancing the visible slot number), and executes at them from
+    /// now on. The values come from the checkpoint's own state, written or verified, never
+    /// from outside.
+    ///
+    /// Then commits the revertable part of the caches: every read and write since the last
+    /// commit, and the closure's reads. So a later
+    /// [`discard_revertable_storage_cache`](Self::discard_revertable_storage_cache) can drop
+    /// neither the reads nor the writes the versions were read from. Call it at a transaction
+    /// boundary.
+    ///
+    /// Public because the state transition function calls it; modules never hold a
+    /// `&mut StateCheckpoint`.
+    pub fn refresh_versions(
+        &mut self,
+        read_versions: impl FnOnce(&mut BootstrapReader<'_, St>) -> CheckpointVersions,
+    ) {
+        let versions = read_versions(&mut BootstrapReader::new(self));
+        self.commit_revertable_storage_cache();
+        self.versions = versions;
+    }
+
+    /// The versions the checkpoint executes at (see [`VersionReader`]).
+    pub fn versions(&self) -> CheckpointVersions {
+        self.versions
     }
 
     /// Checks if a key is in the checkpoint's cache (i.e. a read would not go to storage).
@@ -221,6 +305,7 @@ impl<St: Storage> StateCheckpoint<St> {
             user_cache,
             kernel_cache,
             accessory_writes,
+            versions: _,
         } = self;
         let accesses = StateAccesses {
             user: user_cache.to_ordered_writes_and_reads(),
@@ -263,6 +348,21 @@ impl<St: Storage> StateCheckpoint<St> {
             Err(err) => panic!("state update computation failed: {err:#}"),
         };
         (root, update, accessory, witness, storage)
+    }
+}
+
+/// The checkpoint's versions; the largest slot number it may access is the visible one.
+impl<St: Storage> VersionReader for StateCheckpoint<St> {
+    fn max_allowed_slot_number_to_access(&self) -> SlotNumber {
+        self.versions.visible_slot_number.as_true()
+    }
+
+    fn current_visible_slot_number(&self) -> VisibleSlotNumber {
+        self.versions.visible_slot_number
+    }
+
+    fn rollup_height_to_access(&self) -> RollupHeight {
+        self.versions.rollup_height
     }
 }
 

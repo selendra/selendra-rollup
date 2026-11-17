@@ -3,7 +3,8 @@
 //! containers modules keep their state in ([`StateValue`], [`StateMap`], [`StateVec`] and their
 //! kernel and accessory variants), and the layer under them: the [`Storage`] interface, the
 //! [`Witness`] the native prover records for the zk guest, and the [`StateCheckpoint`] holding
-//! a block's reads and writes.
+//! a block's reads and writes, and the versions it executes at ([`VersionReader`], read from
+//! its own state through a [`BootstrapReader`]).
 //!
 //! The NOMT state trees: their root ([`StorageRoot`]), the canonical multi-proof
 //! ([`NomtProof`]), proof verification ([`verify_storage_proof`], [`verify_namespace`]) and the
@@ -27,8 +28,17 @@
 //!   [`SlotKey`], so the node's flat store (RocksDB) can key values by it.
 //! - `arbitrary`: `NamespacedStateMap::arbitrary_state_map`.
 //! - `test-utils`: [`test_utils`], helpers for the node's storage tests (random container
-//!   operations, a model of a checkpoint, witness helpers), and `test_vectors`, the
-//!   known-answer vectors of the state trees. Never in a node or guest build.
+//!   operations, a model of a checkpoint, witness helpers); [`test_storage`], an in-memory
+//!   [`Storage`] with a prover and a verifier mode, for tests of crates built on this one
+//!   (also on 32-bit targets and in the guest configuration); `test_vectors`, the known-answer
+//!   vectors of the state trees; and the checkpoint constructors that start at the genesis
+//!   versions (`StateCheckpoint::new`, `StateCheckpoint::with_witness`). Never in a node or
+//!   guest build.
+
+// Doctests run in the guest configuration too (`cargo test --no-default-features`), where
+// neither `cfg(test)` nor `test-utils` is set. So they never use `StateCheckpoint::new`,
+// `StateCheckpoint::with_witness` or `test_storage`: they are generic over `St: Storage`, or
+// build checkpoints with `StateCheckpoint::new_with(NomtVerifierStorage::new(), ..)`.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -45,10 +55,11 @@ mod storage;
 mod storage_root;
 #[cfg(test)]
 mod test_state;
-#[cfg(test)]
-mod test_storage;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_storage;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+mod version;
 mod witness;
 
 // `selendra-interface/native` marks a node build, where this crate's node-only items
@@ -104,6 +115,7 @@ pub use storage::{
 #[cfg(feature = "native")]
 pub use storage::{NativeStorage, ProofOutput};
 pub use storage_root::{GLOBAL_ROOT_TAG, StorageRoot};
+pub use version::{BootstrapReader, CheckpointVersions, VersionReader};
 pub use witness::{ArrayWitness, InvalidWitness, Witness};
 
 /// The state hasher: SHA-256, the only hash function of state. The NOMT trees (key paths,

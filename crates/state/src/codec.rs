@@ -7,7 +7,7 @@
 use core::fmt;
 use std::io::Write;
 
-use selendra_interface::common::HexString;
+use selendra_interface::common::{ConsensusType, HexString};
 
 /// A trait for types that can serialize and deserialize values for storage access.
 ///
@@ -22,7 +22,7 @@ use selendra_interface::common::HexString;
 /// `SizedSafeString` do), or must not be stored directly. Containers check this precondition
 /// with a `debug_assert!` on every write (debug builds only). Stored types must also be
 /// consensus types (`selendra_interface::common::ConsensusType`: no `usize`, floats or hash
-/// collections at any depth).
+/// collections at any depth), which [`BorshCodec`] requires of every key and value type.
 pub trait StateItemCodec<V>: StateItemEncoder<V> + StateItemDecoder<V> {}
 
 /// A trait for types that can serialize values into storage.
@@ -152,21 +152,61 @@ where
 
 /// A [`StateCodec`] that uses [`borsh`] for all keys and values.
 ///
-/// Encoding panics wherever borsh returns an error, which for borsh 1.8.1 is:
+/// # Consensus types only
+/// It encodes and decodes only [`ConsensusType`]s: every key and value type stored with it,
+/// in any module, contains no `usize`, `isize`, float, `HashMap` or `HashSet` at any depth
+/// (`docs/serialization.md`, "Consensus types"). A `usize` stored natively above `u32::MAX`
+/// would not decode in the 32-bit zk guest, and a stored NaN float would panic on encoding:
+///
+/// ```
+/// use selendra_state::{BorshCodec, Prefix, StateItemEncoder, StateMap, StateValue, StateVec};
+///
+/// assert_eq!(BorshCodec.encode_to_vec(&1u64), [1, 0, 0, 0, 0, 0, 0, 0]);
+/// let _ = StateValue::<u64>::with_codec(Prefix::new(1, 0), BorshCodec);
+/// let _ = StateValue::<i64>::with_codec(Prefix::new(1, 1), BorshCodec);
+/// let _ = StateMap::<u64, Vec<u32>>::with_codec(Prefix::new(1, 2), BorshCodec);
+/// let _ = StateVec::<(u8, String)>::with_codec(Prefix::new(1, 3), BorshCodec);
+/// ```
+///
+/// Each of these fails with E0277 (`usize`, `f64` (borsh would panic on a NaN), and a `usize`
+/// key):
+///
+/// ```compile_fail,E0277
+/// use selendra_state::{BorshCodec, Prefix, StateValue};
+///
+/// let _ = StateValue::<usize>::with_codec(Prefix::new(1, 0), BorshCodec);
+/// ```
+///
+/// ```compile_fail,E0277
+/// use selendra_state::{BorshCodec, StateItemEncoder};
+///
+/// let _ = BorshCodec.encode_to_vec(&f64::NAN);
+/// ```
+///
+/// ```compile_fail,E0277
+/// use selendra_state::{BorshCodec, Prefix, StateMap, StateReader, User};
+///
+/// fn read<R: StateReader<User>>(state: &mut R) {
+///     let map = StateMap::<usize, u32>::with_codec(Prefix::new(1, 2), BorshCodec);
+///     let _ = map.get(&1, state);
+/// }
+/// ```
+///
+/// # Panics
+/// Encoding panics wherever borsh returns an error, which for borsh 1.8.1 and consensus types
+/// is:
 /// - a collection longer than `u32::MAX` elements (impossible on the 32-bit zk guest);
 /// - a collection of zero-sized types;
-/// - a NaN `f32`/`f64`, anywhere in the value (borsh refuses to encode NaN);
 /// - any error returned by a hand-written [`borsh::BorshSerialize`] impl.
 ///
-/// So key and value types stored with this codec must not contain floats (also banned in
-/// consensus code: `docs/serialization.md`), and their `BorshSerialize` must be infallible.
-/// Decoding rejects trailing bytes.
+/// So the `BorshSerialize` of stored types must be infallible. (Borsh also refuses a NaN
+/// float, which the [`ConsensusType`] bound keeps out.) Decoding rejects trailing bytes.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 pub struct BorshCodec;
 
 impl<V> StateItemEncoder<V> for BorshCodec
 where
-    V: borsh::BorshSerialize + ?Sized,
+    V: borsh::BorshSerialize + ConsensusType + ?Sized,
 {
     fn encode(&self, value: &V, writer: &mut impl Write) {
         borsh::to_writer(writer, value).expect("Failed to serialize value");
@@ -179,7 +219,7 @@ where
 
 impl<V> StateItemDecoder<V> for BorshCodec
 where
-    V: borsh::BorshDeserialize,
+    V: borsh::BorshDeserialize + ConsensusType,
 {
     type Error = std::io::Error;
 
@@ -206,7 +246,7 @@ impl StateCodec for BorshCodec {
 // including the zero-sized-element case, which both refuse.
 impl<T> EncodeLike<[T], Vec<T>> for BorshCodec
 where
-    T: borsh::BorshSerialize,
+    T: borsh::BorshSerialize + ConsensusType,
 {
     fn encode_like(&self, borrowed: &[T], writer: &mut impl Write) {
         borsh::to_writer(writer, borrowed).expect("Failed to serialize value");
@@ -298,12 +338,5 @@ mod tests {
             format!("0x{}", "01".repeat(DECODE_PANIC_PREVIEW_BYTES))
         );
         assert_eq!(BytesPreview(&[]).to_string(), "0x");
-    }
-
-    /// Pins a documented panic: borsh refuses to encode NaN, so floats must not be stored.
-    #[test]
-    #[should_panic(expected = "Failed to serialize value")]
-    fn borsh_codec_encode_panics_on_nan() {
-        let _ = BorshCodec.encode_to_vec(&f64::NAN);
     }
 }

@@ -252,7 +252,7 @@ fn state_map_iter_raw_user_and_kernel() {
         .unwrap_infallible();
 
     let user: Vec<_> = user_map
-        .iter_raw(checkpoint.storage())
+        .iter_raw(&storage)
         .unwrap()
         .unwrap()
         .map(Result::unwrap)
@@ -310,6 +310,8 @@ fn state_map_iter_raw_rejects_non_canonical_keys() {
 /// several accepted encodings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, borsh::BorshSerialize)]
 struct LaxBool(bool);
+
+impl selendra_interface::common::ConsensusType for LaxBool {}
 
 impl borsh::BorshDeserialize for LaxBool {
     fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {

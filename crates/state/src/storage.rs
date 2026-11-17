@@ -4,6 +4,7 @@
 use core::fmt;
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use selendra_interface::common::ConsensusType;
 use selendra_interface::reexports::digest::Digest;
 use selendra_interface::reexports::digest::consts::U32;
 use serde::de::DeserializeOwned;
@@ -216,8 +217,13 @@ impl StateUpdate for () {
 }
 
 /// A trait that represents the root hash of a state tree.
+///
+/// A root is committed to by every proof (the public data of a state transition) and stored by
+/// modules (e.g. per-slot roots), so it is a [`ConsensusType`]: generic code can store
+/// `<S as Storage>::Root` with [`BorshCodec`](crate::BorshCodec).
 pub trait StateRoot:
-    Serialize
+    ConsensusType
+    + Serialize
     + DeserializeOwned
     + fmt::Debug
     + fmt::Display
