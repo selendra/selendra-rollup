@@ -498,11 +498,55 @@ Account addresses: an ed25519 key's native account (and a multisig credential's)
 account is its Ethereum address (`MultiAddress::Vm`). There is no `From<CredentialId>` for
 `Address` or `MultiAddress`: a credential does not say which kind of key produced it.
 
+## Mock adapters
+
+`selendra-mock-da` and `selendra-mock-zkvm` (tests and local chains only: the mock DA verifier
+accepts every claim, and a mock proof is a claim its verifier believes). Their types are still
+held to the rules above, because modules store them (`DaSpec::SlotHash`/`Address`, the code
+commitment) and the guest decodes them. Every public borsh type is a consensus type
+(`MockHash`, `MockAddress`, `MockDaSpec`, `MockCodeCommitment`, `MockProof`).
+
+| Type | borsh | Text and JSON | Binary serde (postcard) |
+|---|---|---|---|
+| `MockHash` (block hash, blob hash, transaction id) | the 32 bytes | `0x` + 64 lowercase hex digits | a sequence of 32 bytes |
+| `MockAddress` (`MockDaSpec::Address`) | the 32 bytes | `0x` + 64 lowercase hex digits (schema `^0x[a-f0-9]{64}$`) | a sequence of 32 bytes |
+| `MockCodeCommitment` (= its `CodeCommitmentHash`; upstream: 8 bytes, zero-padded) | the 32 bytes | JSON only (no `Display`/`FromStr`): `0x` + 64 lowercase hex digits | a sequence of 32 bytes |
+| `MockProof` | `is_valid` (`0`/`1`) ‖ `pub_data` (`u32` LE length, bytes) ‖ `code_commitment` (32 bytes) | none | none |
+| `MockDaSpec` | nothing (a unit struct) | none | none |
+| `MockBlockHeader` (serde only) | none | an object with exactly `height`, `prev_hash`, `hash`, `time` (milliseconds); no array form | the fields in order |
+| `MockBlob` (serde only: never stored or signed) | none | an object with exactly `address`, `hash`, `blob`; `blob` an object with exactly `inner` (the bytes not verified yet) and `accumulator` (the verified bytes), each an array of byte values; no array forms, no string form of the bytes | the fields in order (`inner` and `accumulator` each a length, then the bytes) |
+| `MockBlock` (native, serde only) | none | an object with exactly `header`, `batch_blobs`, `proof_blobs`; no array form | the fields in order |
+
+- Text and JSON accept only the form they print (no missing `0x`, no uppercase; upstream
+  accepted both for addresses and printed no prefix in JSON).
+- A `MockProof` is decoded with `borsh::from_slice` by every verifier entry point
+  (`verify_with_proof`, `verify_with_pub_values`, `extract_public_data`), and so is its public
+  data: trailing bytes are rejected and malformed input is an error, never a panic (upstream:
+  bincode, and the host `expect`ed inner proofs to decode). `verify_with_pub_values` takes the
+  whole encoded `MockProof` (the mock has no separate proof channel).
+- The mock guest's hint is the postcard encoding of one value (`encode_hint`), read with
+  `postcard::take_from_bytes` and rejected unless every byte is consumed (upstream:
+  `bincode::deserialize`, which ignored trailing bytes). postcard accepts over-long varints, so
+  a hint has one accepted value, not one accepted encoding: hints are prover-internal, and the
+  proof's public output is what counts. `try_read_from_host` returns the error;
+  `ZkvmGuest::read_from_host` panics on it (a guest cannot continue without its hint: no proof).
+- The guest's public output is the concatenation of the borsh encodings of every committed
+  item, like SP1's `commit_slice` (upstream kept only the last commit).
+- `MockBlockHeader::new(height, time)` derives the hashes from the height: `height` (parent)
+  and `height + 1` (block), each a big-endian `u128` in the first 16 bytes, then zeros (upstream
+  added 1 to a `u64` and overflowed at `u64::MAX`). `MockBlob::new_with_hash` hashes the data
+  as `SHA-256(SHA-256(data))`.
+
 ## Checking
 
-- `cargo test` — unit tests, including known-answer vectors and rejection tests.
+- `make test` (`cargo test --workspace --all-features`) — unit tests, including known-answer
+  vectors and rejection tests; `make guest` runs the guest configuration's. Not a bare
+  `cargo test`: building the workspace without features trips the `__if_native!` guards
+  (`selendra-interface`'s self dev-dependency turns on its `native`, the other crates' `native`
+  stays off) and leaves out the `arbitrary` strategies the tests use. Test one crate with
+  `cargo test -p <crate>` and the features `make test`/`make guest` give it.
 - `make doctest-codes` — the doctests on nightly rustdoc, which (unlike stable) checks the
   error code each `compile_fail` doctest pins, so a type-level rule (`ConsensusType`, sealed
   traits, private constructors) is proven by the error it is meant to cause.
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

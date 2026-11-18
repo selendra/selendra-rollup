@@ -1850,9 +1850,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2785,6 +2785,40 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "selendra-mock-da"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "borsh",
+ "postcard",
+ "proptest",
+ "proptest-derive",
+ "schemars 1.2.3",
+ "selendra-interface",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "test-strategy",
+]
+
+[[package]]
+name = "selendra-mock-zkvm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "borsh",
+ "postcard",
+ "proptest",
+ "selendra-interface",
+ "selendra-primitives",
+ "serde",
+ "serde_json",
+ "test-strategy",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

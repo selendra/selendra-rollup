@@ -2186,6 +2186,8 @@ dependencies = [
  "nomt-core",
  "postcard",
  "selendra-interface",
+ "selendra-mock-da",
+ "selendra-mock-zkvm",
  "selendra-primitives",
  "selendra-state",
  "serde",
@@ -2207,6 +2209,31 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_with",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "selendra-mock-da"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arbitrary",
+ "borsh",
+ "schemars 1.2.3",
+ "selendra-interface",
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "selendra-mock-zkvm"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "postcard",
+ "selendra-interface",
+ "selendra-primitives",
+ "serde",
  "thiserror 2.0.21",
 ]
 

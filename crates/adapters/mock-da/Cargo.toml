@@ -1,0 +1,40 @@
+[package]
+name = "selendra-mock-da"
+description = "Mock DA layer for tests and local chains: the DaSpec types (hash, address, header, blob) and a verifier that accepts every claim. The DA services are Phase 9."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+# Not optional: `BasicAddress` requires `arbitrary::Arbitrary` whenever `selendra-interface/arbitrary`
+# is on, which feature unification can do without this crate's `arbitrary` feature.
+arbitrary = { workspace = true }
+borsh = { workspace = true }
+# Proptest should be a dev-dependency, but those can't be optional
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
+schemars = { workspace = true }
+selendra-interface = { workspace = true }
+serde = { workspace = true }
+# `MockBlob::new_with_hash`: the exact version SP1's guest patches.
+sha2 = { workspace = true }
+
+# No self dev-dependency: the tests also run in the guest configuration (`make guest`).
+[dev-dependencies]
+postcard = { workspace = true }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+test-strategy = { workspace = true }
+
+[features]
+default = []
+# Node-only code (never in the zk guest): `MockBlock` (`SlotData`) and `MockBlob::advance`.
+native = ["selendra-interface/native"]
+# proptest strategies (and `arbitrary::Arbitrary` beyond `MockAddress`) for the mock types.
+arbitrary = ["dep:proptest", "dep:proptest-derive", "selendra-interface/arbitrary"]
+
+[lints]
+workspace = true

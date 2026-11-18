@@ -14,6 +14,8 @@ libfuzzer-sys = "0.4"
 nomt-core = { version = "=1.0.5", default-features = false }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 selendra-interface = { path = "../crates/interface" }
+selendra-mock-da = { path = "../crates/adapters/mock-da" }
+selendra-mock-zkvm = { path = "../crates/adapters/mock-zkvm" }
 selendra-primitives = { path = "../crates/primitives" }
 selendra-state = { path = "../crates/state" }
 serde = "1"
@@ -34,6 +36,13 @@ bench = false
 [[bin]]
 name = "keys"
 path = "fuzz_targets/keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mock_adapters"
+path = "fuzz_targets/mock_adapters.rs"
 test = false
 doc = false
 bench = false

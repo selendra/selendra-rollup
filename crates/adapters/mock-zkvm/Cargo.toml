@@ -1,0 +1,33 @@
+[package]
+name = "selendra-mock-zkvm"
+description = "Mock zkVM for tests and local chains: proofs that are claims (MockProof), their verifier, a guest reading postcard hints, and (natively) a host. Real proving is Phase 9 (SP1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+borsh = { workspace = true }
+# Guest hints (host → guest), decoded with a check that every byte is consumed.
+postcard = { workspace = true }
+selendra-interface = { workspace = true }
+# `Ed25519CryptoSpec`, the verifier's `CryptoSpec`.
+selendra-primitives = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+# No self dev-dependency: the tests also run in the guest configuration (`make guest`).
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+test-strategy = { workspace = true }
+
+[features]
+default = []
+# Node-only code (never in the zk guest): the hosts (`MockZkvmHost`, `MockOuterZkvmHost`).
+native = ["dep:anyhow", "selendra-interface/native", "selendra-primitives/native"]
+
+[lints]
+workspace = true
