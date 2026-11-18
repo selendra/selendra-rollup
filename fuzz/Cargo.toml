@@ -16,6 +16,7 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 selendra-interface = { path = "../crates/interface" }
 selendra-mock-da = { path = "../crates/adapters/mock-da" }
 selendra-mock-zkvm = { path = "../crates/adapters/mock-zkvm" }
+selendra-modules-api = { path = "../crates/modules-api", features = ["test-utils"] }
 selendra-primitives = { path = "../crates/primitives" }
 selendra-state = { path = "../crates/state" }
 serde = "1"
@@ -43,6 +44,13 @@ bench = false
 [[bin]]
 name = "mock_adapters"
 path = "fuzz_targets/mock_adapters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "modules_api_types"
+path = "fuzz_targets/modules_api_types.rs"
 test = false
 doc = false
 bench = false

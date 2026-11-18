@@ -862,6 +862,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive-ex"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bba95f299f6b9cd47f68a847eca2ae9060a2713af532dc35c342065544845407"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "structmeta",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "derive_arbitrary"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2188,6 +2200,7 @@ dependencies = [
  "selendra-interface",
  "selendra-mock-da",
  "selendra-mock-zkvm",
+ "selendra-modules-api",
  "selendra-primitives",
  "selendra-state",
  "serde",
@@ -2238,6 +2251,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "selendra-modules-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "borsh",
+ "schemars 1.2.3",
+ "selendra-interface",
+ "selendra-mock-da",
+ "selendra-mock-zkvm",
+ "selendra-primitives",
+ "selendra-state",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "selendra-primitives"
 version = "0.1.0"
 dependencies = [
@@ -2264,9 +2294,11 @@ dependencies = [
  "anyhow",
  "borsh",
  "nomt-core",
+ "proptest",
  "selendra-interface",
  "serde",
  "sha2 0.10.9",
+ "test-strategy",
  "thiserror 2.0.21",
 ]
 
@@ -2524,6 +2556,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "structmeta"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e1575d8d40908d70f6fd05537266b90ae71b15dbbe7a8b7dffa2b759306d329"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "structmeta-derive",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "structmeta-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "152a0b65a590ff6c3da95cabe2353ee04e6167c896b28e3b14478c2636c922fc"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2573,6 +2628,19 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "test-strategy"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f7fd1eb9efb36942b85a290c4201d317980fe09bc88d34dd48aaaae03075c6a"
+dependencies = [
+ "derive-ex",
+ "proc-macro2",
+ "quote",
+ "structmeta",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "thiserror"

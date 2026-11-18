@@ -84,7 +84,8 @@ for `Vec`, slices, arrays, `Option`, `Box`, `BTreeMap`, `BTreeSet` and tuples (u
 consensus types; for `PhantomData<T>` with any `T` (it stores nothing); and for the consensus
 types of the Selendra crates (heights and slot numbers, `HexString`, `CredentialId`,
 `SafeVec`, `SizedSafeString`, `RawTx`, `FullyBakedTx`, events, proof public data, `Time`,
-addresses, keys, signatures, the state roots `StorageRoot` and `TestRoot`, …). Every
+addresses, keys, signatures, the state roots `StorageRoot` and `TestRoot`, amounts, gas,
+module ids, …; "Module system types"). Every
 `StateRoot` is one (a supertrait), so generic code can store `<S as Storage>::Root` and put it
 in proof public data. Because containers implement it only when their contents do,
 the check sees through type aliases, nested structs and generic parameters, which a check of
@@ -537,6 +538,48 @@ commitment) and the guest decodes them. Every public borsh type is a consensus t
   added 1 to a `u64` and overflowed at `u64::MAX`). `MockBlob::new_with_hash` hashes the data
   as `SHA-256(SHA-256(data))`.
 
+## Module system types
+
+`selendra-modules-api` (Phase 5). Every public borsh type is a consensus type (`Amount`,
+`GasUnit<N>`, `GasPrice<N>`, `BlockGasInfo<G>`, `ModuleId` and every `hash32_id!` type,
+`OperatingMode`, `SequencerType`, `PriorityFeeBips`, `NotInstantiable`, `SelendraSpec`), and a
+spec's `Gas` and `Address` must be (trait bounds).
+
+| Type | borsh | JSON (and other human-readable formats) | Binary serde (postcard) |
+|---|---|---|---|
+| `Amount` (token base units) | `u128` LE (16 bytes) | a decimal **string**: digits only, no sign, no leading zeros (`"0"` itself excepted), at most `u128::MAX`; a JSON number is rejected. `FromStr`/`Display` the same. Schema: `^(0\|[1-9][0-9]*)$`, `maxLength` 39 | `u128` |
+| `GasUnit<N>` (gas; `Spec::Gas` = `GasUnit<2>`) | the `N` values, `u64` LE each, no length prefix | an array of exactly `N` numbers (schema `GasUnit{N}`) | as `[u64; N]` |
+| `GasPrice<N>` | the `N` amounts, `u128` LE each, no length prefix | an array of exactly `N` amount strings (schema `GasPrice{N}`, items `Amount`; upstream's schema said numbers) | as `[Amount; N]` |
+| `BlockGasInfo<G>` | `gas_limit`, `gas_used`, `base_fee_per_gas` (64 bytes for `GasUnit<2>`) | an object with exactly `gas_limit`, `gas_used`, `base_fee_per_gas`; no unknown fields, no array form | the fields in order |
+| `ModuleId` and every `hash32_id!` id | the 32 bytes | bech32m `<prefix>1…` (`module_1…` for `ModuleId`): lowercase only, the canonical encoding only (no extra padding symbol, zero padding bits); `FromStr`/`Display` the same. Schema named after the type, pattern `^<prefix>1[02-9ac-hj-np-z]{58}$` | the 32 bytes |
+| `OperatingMode` | one byte, explicit tags: `1` = `Zk`, `2` = `Operator` (`0` never assigned) | `"zk"` / `"operator"` | the variant index |
+| `SequencerType` | one byte: `0` = `Preferred`, `1` = `NonPreferred` | `"Preferred"` / `"NonPreferred"` | the variant index |
+| `PriorityFeeBips` (basis points: `100` = 1%) | `u64` LE | a number | `u64` |
+| `NotInstantiable` (call message of a module without calls) | never decodes (no values) | never decodes; schema `null` | never decodes |
+| `SelendraSpec` (a marker) | no bytes | `null` | nothing |
+
+- **`ModuleId`** = `SHA-256("SELENDRA/module-id/v1" ‖ name)` with the state hasher, from the
+  module's stable name (`^[a-z][a-z0-9_]{0,31}$`, checked by the module derive), not from its
+  Rust path. Known answer: `bank` → `module_1hudzpucnkw7pzx8eye8am5g00y7xtduwfr5dcuepvnkhwrkwa07shpzs2t`.
+- **`hash32_id!`** prefixes are 1 to 20 characters of `a-z`, `0-9`, `_` (checked at compile
+  time); 32 bytes are 52 data symbols, the last holding 4 padding bits, which must be zero
+  (upstream accepted any: 16 strings per id).
+- **Gas arithmetic** is checked per dimension; an overflow is an error or `None`, never a wrap,
+  a saturation or a panic. A gas value in tokens is `Σ gas[i] · price[i]` (`checked_value`).
+- **Gas meters** change only through atomic charges: a refused charge changes nothing (upstream's
+  slot meter reduced the preferred sequencer's budget before checking the slot's), and their
+  fields are private. A transaction meter keeps `remaining + used == initial` and the value of
+  the gas used computable at its price. The slot meter gives the preferred sequencer
+  `⌊limit / 10⌋ · 9` of each dimension.
+- **Priority fee:** `apply(quantity) = ⌊quantity · bips / 10_000⌋`, exact for every `u128`
+  quantity (upstream dropped a remainder above `2^64`), an error if it does not fit;
+  `from_percentage` is checked.
+- **Gas schedule** (`Spec::GAS_SCHEDULE`): per-operation costs only (state access as in "Metered
+  state access", encoding per byte, public-key decode, signature verification fixed and per
+  byte per scheme, events). Block and transaction gas limits and the base fee are runtime values
+  (Phase 6 `fee-params`), not constants. `SelendraSpec`'s values are placeholders until Phase 6
+  calibrates them.
+
 ## Checking
 
 - `make test` (`cargo test --workspace --all-features`) — unit tests, including known-answer
@@ -548,5 +591,5 @@ commitment) and the guest decodes them. Every public borsh type is a consensus t
 - `make doctest-codes` — the doctests on nightly rustdoc, which (unlike stable) checks the
   error code each `compile_fail` doctest pins, so a type-level rule (`ConsensusType`, sealed
   traits, private constructors) is proven by the error it is meant to cause.
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `modules_api_types`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

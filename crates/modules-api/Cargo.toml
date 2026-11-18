@@ -1,0 +1,61 @@
+[package]
+name = "selendra-modules-api"
+description = "Selendra module system API: gas types and meters, the Spec trait and SelendraSpec, token amounts, 32-byte bech32m ids (ModuleId), module errors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+arbitrary = { workspace = true, optional = true }
+borsh = { workspace = true }
+# Proptest should be a dev-dependency, but those can't be optional
+proptest = { workspace = true, optional = true }
+proptest-derive = { workspace = true, optional = true }
+schemars = { workspace = true }
+selendra-interface = { workspace = true }
+selendra-mock-da = { workspace = true, optional = true }
+selendra-mock-zkvm = { workspace = true, optional = true }
+selendra-primitives = { workspace = true }
+selendra-state = { workspace = true }
+serde = { workspace = true }
+# `ErrorDetail`'s JSON objects (`ErrorContext`, `err_detail!`).
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# The self dev-dependency turns on `test-utils` only, never `native`: the tests and doctests also
+# build and run in the guest configuration (`make guest`).
+[dev-dependencies]
+postcard = { workspace = true }
+proptest = { workspace = true }
+selendra-modules-api = { path = ".", features = ["test-utils"] }
+# Another hasher: a spec whose storage hashes with it does not compile (a doctest), though
+# that storage is a `Storage` (a unit test).
+sha2 = { workspace = true }
+test-strategy = { workspace = true }
+
+[features]
+default = []
+# Node-only code (never in the zk guest): `PrivateKeyExt` and the node halves of the crates below.
+native = [
+    "selendra-interface/native",
+    "selendra-primitives/native",
+    "selendra-state/native",
+    "selendra-mock-da?/native",
+    "selendra-mock-zkvm?/native",
+]
+# `arbitrary::Arbitrary` and proptest strategies for this crate's types.
+arbitrary = [
+    "dep:arbitrary",
+    "dep:proptest",
+    "dep:proptest-derive",
+    "selendra-interface/arbitrary",
+]
+# Test support for this crate and the crates built on it: `test_utils` (spec aliases over the
+# mock DA and zkVM and `selendra-state`'s in-memory `TestStorage`). Never in a node or guest build.
+test-utils = ["selendra-state/test-utils", "dep:selendra-mock-da", "dep:selendra-mock-zkvm"]
+
+[lints]
+workspace = true

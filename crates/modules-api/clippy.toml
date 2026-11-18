@@ -1,0 +1,14 @@
+# Clippy reads only the nearest clippy.toml: this repeats the workspace settings
+# (`/clippy.toml`) and adds the module system's own rules.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+
+# State transition code: iteration order must not depend on a per-process hash seed (native
+# nodes and the zk guest must agree), and hash collections are not consensus types (D20 of the
+# Phase 5 plan; Phase 8's determinism item).
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order depends on a per-process seed: use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order depends on a per-process seed: use BTreeSet" },
+]
