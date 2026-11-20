@@ -3,8 +3,13 @@
 //!
 //! So far:
 //! - [`gas`]: multi-dimensional gas ([`GasUnit`], [`GasPrice`]), the meters ([`BasicGasMeter`]
-//!   for one transaction, [`SlotGasMeter`] for a block, [`UnlimitedGasMeter`]) and a block's gas
-//!   record ([`BlockGasInfo`]);
+//!   for one transaction, [`SlotGasMeter`] for a block, [`UnlimitedGasMeter`]), a block's gas
+//!   record ([`BlockGasInfo`]), the gas meter module code charges ([`GasMeter`]) and the
+//!   metered utilities ([`MeteredHasher`], [`MeteredReader`], [`MeteredBorshDeserialize`]);
+//! - [`state`]: the state module code runs on: the transaction accessors ([`WorkingSet`],
+//!   [`PreExecWorkingSet`], [`RevertableTxState`], [`GenesisStateAccessor`]), the block hooks'
+//!   [`BlockState`], the traits module code is written against ([`TxState`], [`GenesisState`],
+//!   [`StateAccessor`]) and events ([`EventContainer`], [`TypeErasedEvent`]);
 //! - [`module`]: the [`Spec`] trait every module is generic over, the chain's [`SelendraSpec`],
 //!   its per-operation [`GasSchedule`], and how an account is derived from the key that signs
 //!   ([`Credential`], [`AccountAddress`]);
@@ -18,10 +23,13 @@
 //! `docs/serialization.md`, "Module system types".
 //!
 //! # Features
-//! - `native`: node-only code, never compiled into the zk guest (`PrivateKeyExt`).
+//! - `native`: node-only code, never compiled into the zk guest (`PrivateKeyExt`), and it keeps
+//!   the events module code emits (without it they are charged the same gas, then dropped: the
+//!   zk guest keeps none, so a build that reads events needs it).
 //! - `arbitrary`: `arbitrary::Arbitrary` and proptest strategies for this crate's types.
 //! - `test-utils`: `test_utils`, spec aliases over the mock DA, the mock zkVM and
-//!   `selendra-state`'s in-memory `TestStorage`. Never in a node or guest build.
+//!   `selendra-state`'s in-memory `TestStorage`, a spec whose gas costs are all distinct, and a
+//!   mock kernel. Never in a node or guest build.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -35,6 +43,7 @@ mod consensus_types;
 pub mod gas;
 pub mod module;
 pub mod runtime;
+pub mod state;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 pub mod transaction;
@@ -57,13 +66,27 @@ pub use common::{
     SignatureExt, to_json_object,
 };
 pub use gas::{
-    BasicGasMeter, BlockGasInfo, Fraction, GAS_DIMENSIONS, Gas, GasArray, GasInfo,
-    GasMeteringError, GasPrice, GasUnit, PREFERRED_DATA_FRACTION, SlotGasMeter, UnlimitedGasMeter,
+    BasicGasMeter, BlockGasInfo, Fraction, GAS_DIMENSIONS, Gas, GasArray, GasInfo, GasMeter,
+    GasMeteringError, GasPrice, GasUnit, ImpossibleToRefundGasDetails, MeteredBorshDeserialize,
+    MeteredBorshDeserializeError, MeteredHasher, MeteredReader, OutOfFundsDetails, OutOfGasDetails,
+    PREFERRED_DATA_FRACTION, SlotGasMeter, SlotOutOfGasDetails, TxMeter, UnlimitedGasMeter,
 };
 pub use module::{
     AccountAddress, Credential, CryptoSpecExt, GasSchedule, SchemeCosts, SelendraSpec, Spec,
 };
 pub use runtime::OperatingMode;
+// The metered state access the accessors are built on, for module code (`selendra-state`).
+pub use selendra_state::metered::{
+    Metered, MeteredRef, MeteredView, PhaseOutcome, RevertReason, ScopeEnd, StateAccessError,
+    TxRights,
+};
+pub use selendra_state::{StateReader, StateReaderAndWriter, StateWriter, VersionReader};
+pub use state::{
+    BlockState, EventContainer, FinalizedGenesis, FinalizedPreExec, FinalizedWorkingSet,
+    GenesisState, GenesisStateAccessor, InfallibleKernelStateAccessor, InfallibleStateAccessor,
+    NotAtGenesis, PreExecWorkingSet, PrivilegedKernelAccessor, RevertableTxState, SpecCheckpoint,
+    StateAccessor, TxOutcome, TxState, TxStateError, TypeErasedEvent, WorkingSet,
+};
 pub use transaction::{PriorityFeeApplyOverflowError, PriorityFeeBips};
 
 /// What the macros of this crate (and the module system's derives) expand to. Not public API.

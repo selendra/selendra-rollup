@@ -2828,6 +2828,7 @@ dependencies = [
  "anyhow",
  "arbitrary",
  "borsh",
+ "digest 0.10.7",
  "postcard",
  "proptest",
  "proptest-derive",

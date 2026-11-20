@@ -2,7 +2,7 @@
 
 use selendra_state::metered::StateGasMeter;
 
-use crate::{Amount, Gas, GasArray, GasMeteringError, Spec};
+use crate::{Amount, Gas, GasArray, GasMeteringError, OutOfFundsDetails, OutOfGasDetails, Spec};
 
 /// The gas used by a meter and its value at the meter's price.
 ///
@@ -143,28 +143,25 @@ impl<S: Spec> BasicGasMeter<S> {
                             .to_string(),
                     )
                 })?;
-                Some(
-                    funds
-                        .checked_sub(value)
-                        .ok_or(GasMeteringError::OutOfFunds {
-                            amount_to_charge: value,
-                            remaining_funds: funds,
-                            gas_price: self.gas_price,
-                        })?,
-                )
+                Some(funds.checked_sub(value).ok_or_else(|| {
+                    GasMeteringError::OutOfFunds(Box::new(OutOfFundsDetails {
+                        amount_to_charge: value,
+                        remaining_funds: funds,
+                        gas_price: self.gas_price,
+                    }))
+                })?)
             }
             None => None,
         };
 
-        let remaining_gas =
-            self.remaining_gas
-                .checked_sub(amount)
-                .ok_or(GasMeteringError::OutOfGas {
-                    gas_to_charge: amount,
-                    gas_price: self.gas_price,
-                    initial_gas: self.initial_gas,
-                    remaining_gas: self.remaining_gas,
-                })?;
+        let remaining_gas = self.remaining_gas.checked_sub(amount).ok_or_else(|| {
+            GasMeteringError::OutOfGas(Box::new(OutOfGasDetails {
+                gas_to_charge: amount,
+                gas_price: self.gas_price,
+                initial_gas: self.initial_gas,
+                remaining_gas: self.remaining_gas,
+            }))
+        })?;
 
         // The value of all the gas used must stay computable, so it can always be converted to
         // tokens after execution. (`gas_used + amount <= initial_gas` here, so the sum cannot
@@ -277,7 +274,7 @@ mod tests {
         assert_eq!(gas_meter.remaining_funds(), Some(Amount::ZERO));
         assert!(matches!(
             gas_meter.charge_gas(GasUnit::from([1; 2])),
-            Err(GasMeteringError::OutOfFunds { .. })
+            Err(GasMeteringError::OutOfFunds(_))
         ));
     }
 
@@ -289,7 +286,7 @@ mod tests {
         assert_gas_used_equals(&gas_meter, remaining_gas);
         assert!(matches!(
             gas_meter.charge_gas(GasUnit::from([1; 2])),
-            Err(GasMeteringError::OutOfGas { .. })
+            Err(GasMeteringError::OutOfGas(_))
         ));
     }
 
@@ -353,7 +350,7 @@ mod tests {
         // 10 · 100 = 1000 > 950 left.
         assert!(matches!(
             gas_meter.charge_linear_gas(GasUnit::from([10; 2]), 100),
-            Err(GasMeteringError::OutOfGas { .. })
+            Err(GasMeteringError::OutOfGas(_))
         ));
         assert!(matches!(
             gas_meter.charge_linear_gas(GasUnit::MAX, 2),

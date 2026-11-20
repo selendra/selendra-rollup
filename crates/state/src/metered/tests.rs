@@ -476,6 +476,46 @@ fn gas_overflow_poisons_without_panicking() {
     }
 }
 
+/// `charge_linear(base, per_unit, units)` charges `base + per_unit·units` as one sum; more than
+/// `u32::MAX` units or an overflow is `GasOverflow` (nothing charged, the phase poisoned), never
+/// a panic or a wrap.
+#[test]
+fn charge_linear_is_one_checked_sum() {
+    assert_eq!(gas_of(|state| state.charge_linear(7, 3, 5)), (22, Ok(())));
+    assert_eq!(gas_of(|state| state.charge_linear(7, 3, 0)), (7, Ok(())));
+    assert_eq!(
+        gas_of(|state| state.charge_linear(0, 1, u64::from(u32::MAX))),
+        (u64::from(u32::MAX), Ok(()))
+    );
+    let overflows: [(u64, u64, u64); 3] = [
+        (0, 1, u64::from(u32::MAX) + 1),
+        (0, u64::MAX / 2 + 1, 2),
+        (1, u64::MAX, 1),
+    ];
+    for (base, per_unit, units) in overflows {
+        let mut tx: Tx = new_tx(storage(), u64::MAX);
+        assert_eq!(
+            tx.metered().charge_linear(base, per_unit, units),
+            Err(Error::GasOverflow {
+                op: StateOp::Charge
+            })
+        );
+        assert_eq!(tx.metered_view().meter().used, 0);
+        assert_eq!(tx.metered().charge(1), Err(Error::Poisoned));
+    }
+    // A refused sum charges nothing and poisons.
+    let mut tx: Tx = new_tx(storage(), 21);
+    assert!(matches!(
+        tx.metered().charge_linear(7, 3, 5),
+        Err(Error::OutOfGas {
+            op: StateOp::Charge,
+            ..
+        })
+    ));
+    assert_eq!(tx.metered_view().meter().used, 0);
+    assert_eq!(tx.metered().charge_linear(0, 0, 0), Err(Error::Poisoned));
+}
+
 #[test]
 fn value_too_large_poisons_before_charging() {
     let key = SlotKey::singleton(&Prefix::new(7, 0));

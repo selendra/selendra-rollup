@@ -230,7 +230,8 @@ checked: an overflow is a `GasOverflow` failure, never a wrap or a panic.
 | `set` (User, Kernel) | `access + hash_update + hash_per_byte·key_len + write + write_per_byte·len + hash_update + hash_per_byte·len` | – |
 | `delete` (User, Kernel) | `set` with `len = 0` | – |
 | `set`/`delete` (Accessory) | `accessory_write + accessory_write_per_byte·(key_len + len)` (`len = 0` for a delete) | – |
-| open a nested scope (`open_scope`) | `scope_open`, before the scope is pushed | – |
+| open a nested scope (`open_scope`; `to_revertable`) | `scope_open`, before the scope is pushed | – |
+| emit an event (`EventContainer::add_event`) | `event_base + event_per_byte·(key_len + borsh_len)`, before the event is kept | – |
 
 - A read takes `size` from the transaction's journal, or from the checkpoint's size query
   (in the guest only the value's leaf comes from the witness); an absent value gets no second
@@ -246,8 +247,9 @@ checked: an overflow is a `GasOverflow` failure, never a wrap or a panic.
   transition function, not a module).
 - **Value size bound:** a metered write of more than `MAX_STATE_VALUE_SIZE` = 1 MiB
   (`1 << 20` bytes, checked on the value's length before any charge) fails with
-  `ValueTooLarge`. Unmetered writes (kernel, genesis, block hooks) are only checked in debug
-  builds until Phase 8.
+  `ValueTooLarge`. Genesis writes are metered (`GenesisStateAccessor`, below), so the bound
+  applies to them. Unmetered writes (kernel, block hooks) are only checked in debug builds
+  until Phase 8.
 
 **Failures and reverts.** A metered phase (`MeteredTx`: pre-execution, or the call with its
 hooks) runs in a base scope of the transaction's journal (`TxScratchpad`) over the block's
@@ -275,6 +277,48 @@ checkpoint.
 - `TxScratchpad::commit` applies the journal to the checkpoint in key order (namespace, then
   key); `revert` drops it, accessory writes included. Reads stay recorded in the checkpoint
   either way, so they are verified against the state root.
+
+**Events.** `key_len` is the event key's length in bytes, `borsh_len` the length of the
+event's borsh encoding (`borsh::object_length`, computed the same way natively and in the
+guest). An encoding that fails cannot be priced and is a `GasOverflow` failure (borsh encoders
+must be infallible). Events are kept only natively (the guest charges and drops them), in the
+scope they were emitted in: a committed nested scope hands its events to its parent, a reverted,
+dropped or leaked one drops them, and a phase's events are returned only if it is committed.
+Events reach the state transition function only through the module system's accessors, which
+all charge: `EventContainer` is sealed (no other crate implements it, so none writes its own
+`TxState`), and a committed nested scope's charged events go only to the accessor it was opened
+on (they cannot be named or built outside the crate). Upstream's events were free.
+
+**Accessors** (`selendra-modules-api`, `state`). Every transaction accessor is a metered
+phase or a scope of one, charging the formulas above through `selendra-state`'s blanket impls:
+
+| Accessor | Phase | Rights | Meter |
+|---|---|---|---|
+| `PreExecWorkingSet` (authentication, gas reservation) | its own | `PreExecRights`: User R/W | the caller's `BasicGasMeter` |
+| `WorkingSet` (the call and its hooks; a `TxState`) | its own | `TxRights`: User/Kernel R/W, Accessory W | the caller's `BasicGasMeter` |
+| `RevertableTxState` (`to_revertable`; a `TxState`) | its parent's, a nested scope | its parent's | its parent's |
+| `GenesisStateAccessor` (a `GenesisState`; true slot = genesis) | its own, over the genesis checkpoint | `TxRights` | `BasicGasMeter` with the most gas at a zero price (genesis is recorded, not paid) |
+| `BlockState` (block hooks) | none: unmetered, infallible, on the block's checkpoint | User/Kernel R/W, Accessory W | – |
+
+`WorkingSet::finalize(result)` / `PreExecWorkingSet::finalize(result)` return the scratchpad,
+the meter and the outcome (`TxOutcome`: `Committed`, or `Reverted(Poisoned(first failure) |
+Module(error))`); the state transition function (Phase 8) settles the gas used on the returned
+scratchpad whatever the outcome. Module code charges other work through the accessor's
+`GasMeter` (one blanket impl over every metered accessor: a refused charge poisons the phase
+like a refused access).
+
+**Metered utilities** (`selendra-modules-api`, `gas`), charged with the spec's
+`GAS_SCHEDULE`, all through the accessor's phase (a refused charge poisons it). `MeteredHasher`
+and `metered_from_slice` charge before the work; `MeteredReader` charges each call right after
+its inner read, for the bytes that read delivered (so it never charges for bytes it did not
+deliver; when the charge is refused, the bytes are already in the caller's buffer, but the
+phase is poisoned, so they cannot lead to a kept write):
+
+| Utility | Charge |
+|---|---|
+| `MeteredHasher` (SHA-256, the state hasher) | `hash_per_byte·len` per `update`, `hash_update` for `finalize`: hashing `n` bytes costs `hash_update + hash_per_byte·n` however it is split, like hashing a state value (upstream: a fixed cost per update, the finalization free) |
+| `MeteredBorshDeserialize::metered_from_slice` | `decode_per_byte·len` for the whole input, then `borsh::from_slice` (trailing bytes rejected, after being charged). Upstream charged per read call while decoding and left trailing bytes to the caller |
+| `MeteredReader` (`io::Read`) | `per_read_bias + per_byte·n` per call that delivers `n > 0` bytes (`new`: `decode_per_byte`, no bias). `read_exact` charges the bytes it consumed also when the input ends or the inner reader fails, and a refused charge is then the error (upstream discarded it: the bytes were free) |
 
 ## Witness hints and storage proofs
 
@@ -318,8 +362,9 @@ consumes them in the same order.
   scratchpad (and the `MeteredTx` phases that own it) takes the checkpoint by value and gives
   it back only from `commit`/`revert`, with no way to reach it in between, so refreshing
   during a transaction does not compile (E0382, E0616; doctests on `refresh_versions`). It
-  does not cover writes made on the checkpoint directly (genesis, kernel, block hooks) or a
-  committed scratchpad's writes: a caller that may still drop those with
+  does not cover writes made on the checkpoint directly (kernel, block hooks) or a committed
+  scratchpad's writes (a transaction's, or genesis's: `GenesisStateAccessor` writes through a
+  scratchpad): a caller that may still drop those with
   `discard_revertable_storage_cache` (a sequencer dropping a transaction) must decide before
   refreshing.
 

@@ -253,8 +253,8 @@ impl<St: Storage> StateCheckpoint<St> {
     /// ```
     ///
     /// What this does **not** cover: writes made on the checkpoint itself, outside a
-    /// scratchpad (its own [`StateWriter`] impls: genesis, the kernel, block hooks), and the
-    /// writes of a committed scratchpad, are in the revertable part this commits. A caller that
+    /// scratchpad (its own [`StateWriter`] impls: the kernel, block hooks), and the writes of a
+    /// committed scratchpad (a transaction's, or genesis's), are in the revertable part this commits. A caller that
     /// may still drop them with
     /// [`discard_revertable_storage_cache`](Self::discard_revertable_storage_cache) (upstream's
     /// sequencer, for a transaction it drops from a batch) must not refresh before deciding:

@@ -1,5 +1,12 @@
 //! Test support for this crate and the crates built on it (`test-utils` feature; never in a
-//! node or guest build): specs over the mock DA layer and zkVM.
+//! node or guest build): specs over the mock DA layer and zkVM (and [`DistinctCostSpec`], whose
+//! gas costs are all distinct), and a mock kernel ([`MockKernel`]).
+
+mod kernel;
+mod spec;
+
+pub use kernel::MockKernel;
+pub use spec::{DISTINCT_GAS_SCHEDULE, DistinctCostSpec};
 
 pub use selendra_mock_da::{MockAddress, MockDaSpec};
 pub use selendra_mock_zkvm::MockZkvm;

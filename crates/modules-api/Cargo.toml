@@ -1,6 +1,6 @@
 [package]
 name = "selendra-modules-api"
-description = "Selendra module system API: gas types and meters, the Spec trait and SelendraSpec, token amounts, 32-byte bech32m ids (ModuleId), module errors."
+description = "Selendra module system API: gas types and meters, metered utilities, the Spec trait and SelendraSpec, the state accessors (TxState, WorkingSet, BlockState) and events, token amounts, 32-byte bech32m ids (ModuleId), module errors."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,8 @@ publish.workspace = true
 anyhow = { workspace = true }
 arbitrary = { workspace = true, optional = true }
 borsh = { workspace = true }
+# `MeteredHasher` (the state hasher's `Digest` impl).
+digest = { workspace = true }
 # Proptest should be a dev-dependency, but those can't be optional
 proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
@@ -38,7 +40,8 @@ test-strategy = { workspace = true }
 
 [features]
 default = []
-# Node-only code (never in the zk guest): `PrivateKeyExt` and the node halves of the crates below.
+# Node-only code (never in the zk guest): `PrivateKeyExt`, keeping emitted events (without it they
+# are charged, then dropped), and the node halves of the crates below.
 native = [
     "selendra-interface/native",
     "selendra-primitives/native",
@@ -54,7 +57,8 @@ arbitrary = [
     "selendra-interface/arbitrary",
 ]
 # Test support for this crate and the crates built on it: `test_utils` (spec aliases over the
-# mock DA and zkVM and `selendra-state`'s in-memory `TestStorage`). Never in a node or guest build.
+# mock DA and zkVM and `selendra-state`'s in-memory `TestStorage`, a spec whose gas costs are all
+# distinct, and a mock kernel). Never in a node or guest build.
 test-utils = ["selendra-state/test-utils", "dep:selendra-mock-da", "dep:selendra-mock-zkvm"]
 
 [lints]

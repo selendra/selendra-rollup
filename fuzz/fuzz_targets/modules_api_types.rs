@@ -9,14 +9,19 @@
 //! against an independent oracle.
 #![no_main]
 
+use std::io::Read;
 use std::str::FromStr;
 
 use libfuzzer_sys::fuzz_target;
-use selendra_modules_api::test_utils::{MockAddress, TestSpec};
+use selendra_modules_api::test_utils::{DistinctCostSpec, MockAddress, TestSpec, TestStorage};
 use selendra_modules_api::{
-    Amount, BasicGasMeter, BlockGasInfo, Gas, GasArray, GasPrice, GasUnit, ModuleId,
-    NotInstantiable, OperatingMode, PriorityFeeBips, SequencerType, SlotGasMeter,
+    Amount, BasicGasMeter, BlockGasInfo, Gas, GasArray, GasMeter, GasPrice, GasUnit,
+    MeteredBorshDeserialize, MeteredBorshDeserializeError, MeteredHasher, MeteredReader,
+    ModuleId, NotInstantiable, OperatingMode, PriorityFeeBips, SequencerType, SlotGasMeter,
+    WorkingSet,
 };
+use selendra_state::{StateCheckpoint, TxScratchpad};
+use sha2::Digest;
 
 selendra_modules_api::hash32_id! {
     /// A second id type, with another prefix.
@@ -445,8 +450,114 @@ fn block_gas_info_json(data: &[u8]) {
     }
 }
 
+/// `DistinctCostSpec`'s `decode_per_byte`, `hash_update` and `hash_per_byte`. Every cost of its
+/// schedule is distinct (and distinct per dimension), so a utility that charged another cost
+/// would use another amount of gas.
+const DECODE_PER_BYTE: [u64; 2] = [47, 53];
+const HASH_UPDATE: [u64; 2] = [5, 7];
+const HASH_PER_BYTE: [u64; 2] = [11, 13];
+
+/// A working set over an empty test storage with `budget` gas.
+fn working_set(budget: [u64; 2]) -> WorkingSet<DistinctCostSpec> {
+    let scratchpad = TxScratchpad::new(StateCheckpoint::new(TestStorage::default()));
+    let meter = BasicGasMeter::new_with_gas(GasUnit::from(budget), GasPrice::ZEROED);
+    WorkingSet::new(scratchpad, meter)
+}
+
+fn gas_used(ws: &WorkingSet<DistinctCostSpec>) -> [u64; 2] {
+    ws.gas_info().gas_used.dimensions()
+}
+
+/// `base + per_unit·n`, per dimension.
+fn linear(base: [u64; 2], per_unit: [u64; 2], n: u64) -> [u64; 2] {
+    [0, 1].map(|d| base[d] + per_unit[d] * n)
+}
+
+/// Whether `gas` fits in `budget` in every dimension.
+fn fits(gas: [u64; 2], budget: [u64; 2]) -> bool {
+    gas[0] <= budget[0] && gas[1] <= budget[1]
+}
+
+/// A metered decode of `data` as a `T` with `budget` gas: it costs `decode_per_byte·len`,
+/// charged before decoding; the result is `borsh::from_slice`'s.
+fn metered_decode<T>(data: &[u8], budget: [u64; 2])
+where
+    T: borsh::BorshDeserialize + PartialEq + std::fmt::Debug,
+{
+    let cost = linear([0; 2], DECODE_PER_BYTE, data.len() as u64);
+    let mut ws = working_set(budget);
+    match T::metered_from_slice(data, &mut ws) {
+        Ok(value) => {
+            assert!(fits(cost, budget));
+            assert_eq!(borsh::from_slice::<T>(data).ok(), Some(value));
+            assert_eq!(gas_used(&ws), cost);
+        }
+        Err(MeteredBorshDeserializeError::Decode(_)) => {
+            assert!(fits(cost, budget));
+            assert!(borsh::from_slice::<T>(data).is_err());
+            assert_eq!(gas_used(&ws), cost);
+        }
+        Err(MeteredBorshDeserializeError::Gas(_)) => {
+            assert!(!fits(cost, budget));
+            assert_eq!(gas_used(&ws), [0; 2]);
+        }
+    }
+}
+
+/// The metered utilities against the unmetered operations, on `DistinctCostSpec`, with a budget
+/// from the fuzz bytes (sometimes short, possibly in one dimension only).
+fn metered(data: &[u8]) {
+    let bytes = |i: usize| u64::from(data.get(i).copied().unwrap_or(0)) * 2;
+    let budget = [
+        bytes(0) * DECODE_PER_BYTE[0],
+        bytes(1) * DECODE_PER_BYTE[1],
+    ];
+    let len = data.len() as u64;
+    metered_decode::<Amount>(data, budget);
+    metered_decode::<ModuleId>(data, budget);
+    metered_decode::<GasUnit<2>>(data, budget);
+    metered_decode::<BlockGasInfo<GasUnit<2>>>(data, budget);
+    metered_decode::<OperatingMode>(data, budget);
+    metered_decode::<Vec<u16>>(data, budget);
+    metered_decode::<Option<String>>(data, budget);
+
+    // A reader delivers the bytes it is charged for (`decode_per_byte` per byte, no per-call
+    // cost); a refused charge stops it.
+    let mut ws = working_set(budget);
+    let mut reader = MeteredReader::new(data, &mut ws);
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 7];
+    let result = loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break Ok(()),
+            Ok(n) => out.extend_from_slice(&chunk[..n]),
+            Err(err) => break Err(err),
+        }
+    };
+    assert_eq!(
+        gas_used(&ws),
+        linear([0; 2], DECODE_PER_BYTE, out.len() as u64)
+    );
+    assert!(data.starts_with(&out));
+    assert_eq!(
+        result.is_ok(),
+        fits(linear([0; 2], DECODE_PER_BYTE, len), budget)
+    );
+
+    // Hashing costs `hash_update + hash_per_byte·len` and gives SHA-256.
+    let cost = linear(HASH_UPDATE, HASH_PER_BYTE, len);
+    let mut ws = working_set([u64::MAX; 2]);
+    let hash = MeteredHasher::digest(data, &mut ws).unwrap();
+    assert_eq!(hash, <[u8; 32]>::from(sha2::Sha256::digest(data)));
+    assert_eq!(gas_used(&ws), cost);
+    let mut ws = working_set(budget);
+    let hash = MeteredHasher::digest(data, &mut ws);
+    assert_eq!(hash.is_ok(), fits(cost, budget));
+}
+
 fuzz_target!(|data: &[u8]| {
     binary(data);
+    metered(data);
     arithmetic(data);
     meters(data);
     id_strings(data);

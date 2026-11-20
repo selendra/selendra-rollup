@@ -2,7 +2,7 @@
 
 use selendra_interface::da::DaSpec;
 
-use crate::{GasArray, GasMeteringError, PREFERRED_DATA_FRACTION, Spec};
+use crate::{GasArray, GasMeteringError, PREFERRED_DATA_FRACTION, SlotOutOfGasDetails, Spec};
 
 /// The gas of one slot, shared by its batches and proofs.
 ///
@@ -101,13 +101,13 @@ impl<S: Spec> SlotGasMeter<S> {
     }
 
     fn gas_error(&self, gas_to_charge: S::Gas, is_preferred: bool) -> GasMeteringError<S::Gas> {
-        GasMeteringError::SlotOutOfGas {
+        GasMeteringError::SlotOutOfGas(Box::new(SlotOutOfGasDetails {
             initial_slot_gas: self.initial_slot_gas,
             gas_to_charge,
             remaining_preferred_slot_gas: self.remaining_preferred_slot_gas,
             remaining_total_slot_gas: self.remaining_total_slot_gas,
             is_preferred,
-        }
+        }))
     }
 }
 
@@ -211,10 +211,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            GasMeteringError::SlotOutOfGas {
-                is_preferred: false,
-                ..
-            }
+            GasMeteringError::SlotOutOfGas(details) if !details.is_preferred
         ));
         assert_eq!(
             meter.remaining_preferred_slot_gas(),
@@ -229,10 +226,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            GasMeteringError::SlotOutOfGas {
-                is_preferred: true,
-                ..
-            }
+            GasMeteringError::SlotOutOfGas(details) if details.is_preferred
         ));
         assert_eq!(
             meter.remaining_preferred_slot_gas(),

@@ -2256,6 +2256,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "borsh",
+ "digest 0.10.7",
  "schemars 1.2.3",
  "selendra-interface",
  "selendra-mock-da",

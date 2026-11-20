@@ -29,8 +29,9 @@ use std::fmt::Debug;
 /// The largest value a metered write accepts, in bytes (1 MiB). A larger one fails with
 /// `ValueTooLarge` (checked on the value's length, before any gas is charged).
 ///
-/// Unmetered writes (the kernel, genesis, block hooks: Phase 8) are only `debug_assert!`ed
-/// against it so far: a release-mode panic on a user-sized value would halt the chain.
+/// Unmetered writes (the kernel, block hooks: Phase 8) are only `debug_assert!`ed against it so
+/// far: a release-mode panic on a user-sized value would halt the chain. (Genesis writes are
+/// metered: `selendra-modules-api`'s `GenesisStateAccessor`.)
 pub const MAX_STATE_VALUE_SIZE: usize = 1 << 20;
 
 /// A gas amount the metered accessors can compute with: checked addition and scaling by a

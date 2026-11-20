@@ -3,7 +3,7 @@
 
 use std::marker::PhantomData;
 
-use super::costs::{MAX_STATE_VALUE_SIZE, StateAccessCosts, StateGasMeter};
+use super::costs::{MAX_STATE_VALUE_SIZE, StateAccessCosts, StateGas, StateGasMeter};
 use super::error::{StateAccessError, StateOp};
 use super::journal::Level;
 use super::rights::AccessRights;
@@ -239,7 +239,8 @@ impl<St: Storage, M: StateGasMeter, R: AccessRights> MeteredTx<St, M, R> {
 /// Access to a metered phase, lent by an accessor ([`Metered::metered`](super::Metered::metered))
 /// at its scope: the phase's base scope, or a nested scope ([`scoped`](Self::scoped)).
 ///
-/// Its public operations are [`charge`](Self::charge), the scope operations
+/// Its public operations are the charges ([`charge`](Self::charge),
+/// [`charge_linear`](Self::charge_linear)), the scope operations
 /// ([`open_scope`](Self::open_scope), [`close_scope`](Self::close_scope),
 /// [`scoped`](Self::scoped)) and [`view`](Self::view). The raw reads and writes are
 /// crate-private: only the blanket [`StateReader`](crate::StateReader)/
@@ -270,6 +271,23 @@ impl<'a, St: Storage, M: StateGasMeter, R: AccessRights> MeteredRef<'a, St, M, R
     pub fn charge(&mut self, gas: M::Gas) -> Result<(), Error<M>> {
         self.tx.enter(self.level)?;
         self.tx.charge(|| StateOp::Charge, Some(gas))
+    }
+
+    /// Charges `base + per_unit·units` (e.g. a fixed cost plus a per-byte cost times a length),
+    /// computed with checked arithmetic and charged as one sum. More than `u32::MAX` units, or
+    /// an overflow, is [`StateAccessError::GasOverflow`]; any failure poisons the phase.
+    pub fn charge_linear(
+        &mut self,
+        base: M::Gas,
+        per_unit: M::Gas,
+        units: u64,
+    ) -> Result<(), Error<M>> {
+        self.tx.enter(self.level)?;
+        let gas = u32::try_from(units)
+            .ok()
+            .and_then(|units| per_unit.checked_scale(units))
+            .and_then(|scaled| base.checked_add(scaled));
+        self.tx.charge(|| StateOp::Charge, gas)
     }
 
     /// Read-only information on the phase.
