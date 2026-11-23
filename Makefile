@@ -18,8 +18,9 @@ tree_lacks = tree="$$(cargo tree $(1))" && ! printf '%s\n' "$$tree" | grep -E '$
 # `selendra-state` and the mock adapters have no self dev-dependency turning `native` on, and
 # `selendra-modules-api`'s turns on only `test-utils`, so their tests (witness replay,
 # checkpoint, cache, the known-answer vectors of the state hasher; the mock types, proofs and
-# hints; gas, specs, ids) also build and run in the guest configuration. One line per crate: a
-# shared invocation would unify dev-dependency features across the crates. State is
+# hints; gas, specs, ids; the derives' state layouts and module ids) also build and run in the
+# guest configuration (`selendra-macros`, proc macros, runs on the host only). One line per
+# crate: a shared invocation would unify dev-dependency features across the crates. State is
 # hashed with SHA-256 only (`StateHasher`): fail if another hash crate reaches the state crate
 # (on any target), or if nomt-core's built-in hashers get enabled anywhere (under any workspace
 # feature, on any target).
@@ -45,6 +46,8 @@ test:
 # Every feature except the node's storage stack (RocksDB and NOMT are not built for 32-bit
 # targets): the `rockbound` and `selendra-db` crates and `selendra-state/rockbound` are left out.
 # `selendra-interface/native` makes each crate's `native` mandatory (its `__if_native!` guard).
+# Cargo builds proc-macro crates for the host, so `selendra-macros`' tests build and run on the
+# host here; what its derives generate is tested 32-bit by `selendra-modules-api`'s tests.
 TEST32_FEATURES := selendra-interface/native,selendra-interface/arbitrary,selendra-primitives/native,selendra-state/native,selendra-state/arbitrary,selendra-mock-da/native,selendra-mock-zkvm/native,selendra-modules-api/native,selendra-modules-api/arbitrary
 test32:
 	rustup target add i686-unknown-linux-musl

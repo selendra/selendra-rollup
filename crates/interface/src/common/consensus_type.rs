@@ -18,9 +18,9 @@ use std::marker::PhantomData;
 /// The trait is implemented for the primitive and collection types that are allowed, and for
 /// every consensus type of the Selendra crates. Containers implement it only when their
 /// contents do, so the check is transitive: it sees through type aliases, nested structs and
-/// generic parameters. Module crates derive it (`#[derive(ConsensusType)]`); a hand-written
-/// impl outside the Selendra crates is a review flag. Types not listed here (e.g. a foreign
-/// crate's types) need a newtype.
+/// generic parameters. Module crates derive it (`#[derive(ConsensusType)]`, from
+/// `selendra-modules-api`); a hand-written impl outside the Selendra crates is a review flag.
+/// Types not listed here (e.g. a foreign crate's types) need a newtype.
 ///
 /// The one exception to the `usize` rule: a hand-written impl in the Selendra crates for a type
 /// whose own `BorshDeserialize` rejects every `usize` value above `u32::MAX` on every target,

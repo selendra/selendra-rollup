@@ -90,9 +90,18 @@ module ids, …; "Module system types"). Every
 in proof public data. Because containers implement it only when their contents do,
 the check sees through type aliases, nested structs and generic parameters, which a check of
 field syntax cannot. The `DaSpec` slot hash and address and the zkVM code commitment must be
-consensus types (trait bounds). Module crates derive it (`#[derive(ConsensusType)]`, from
-Phase 5's macros); a hand-written impl outside the Selendra crates is a review flag. Foreign
-types get a newtype.
+consensus types (trait bounds). Module crates derive it (`#[derive(ConsensusType)]`,
+re-exported by `selendra-modules-api`); a hand-written impl outside the Selendra crates is a
+review flag. Foreign types get a newtype.
+
+The derive (structs and enums; unions are rejected) bounds the impl by the field types, not
+by the type's generic parameters: `Wrapper<T>` is a consensus type exactly when its fields
+are, so `Wrapper<usize>` is not, and a `PhantomData<S>` field bounds nothing. A field type
+without generic parameters is checked where the type is defined (E0277 there, e.g. a `usize`
+field or a field of an alias to `f64`); a field type with generic parameters is checked where
+the type is used with concrete ones (as a state value, call message, event, …). Recursive
+types (`Option<Box<Self>>`, `Vec<Tree<T>>`) are supported; two generic types holding each
+other are not (the trait solver loops, E0275, where they are used).
 
 `selendra-state`'s `BorshCodec` encodes and decodes consensus types only, so every key and
 value stored with it, in any module and with or without a derive, is one: `StateValue<usize>`
@@ -653,8 +662,9 @@ type (a module nested in another as a dependency has the same ones):
   calls and events in JSON, the first half of its event keys, and the source of its
   `ModuleId`.
 
-Upstream numbered a module three ways (state prefixes from its Rust path, call tags from its
-position in the runtime, a discriminant from `constants.toml`).
+Upstream named a module three ways: its `prefix()` (REST names) and id from its Rust path,
+the module byte of its state prefixes from a `constants.toml` discriminant, its call tags from
+its position in the runtime.
 
 **Module discriminants.**
 
@@ -667,11 +677,33 @@ position in the runtime, a discriminant from `constants.toml`).
 
 Only `0` is enforced: nothing can tell a test module from a production one.
 
-- **State items:** `ModuleInfo::STATE_LAYOUT` lists each item's id (the second prefix byte)
-  and field name; each module pins it with a known-answer test, so renumbering, renaming or
-  dropping an item fails a test.
+**`#[derive(ModuleInfo)]`** (`selendra-modules-api` re-exports it; it also implements
+`Default`, the module's constructor) reads the identity from
+`#[module_info(discriminant = N, name = "…")]` (an integer literal in 1..=255 and a valid
+name, each exactly once) and one attribute per field: `#[id]` (exactly one field: the
+`ModuleId`, `ModuleId::from_name(NAME)`), `#[state(item = N)]` (optionally
+`codec = path`: the codec is `path()` instead of `Default::default()`), `#[module]` (a
+dependency, with the same spec) or `#[phantom]`. The first generic parameter is the spec.
+Anything else (a missing or repeated attribute or key, an unknown key, discriminant 0, an
+invalid name, an item id outside 0..=255 or used twice, an enum or tuple struct) is a compile
+error spanned at the input. A hand-written `ModuleInfo` gets none of these per-module checks:
+it must itself keep a valid name, unique item ids, a `STATE_LAYOUT` that lists the prefixes it
+builds and an id that is `ModuleId::from_name(NAME)`. The checks between modules (unique
+discriminants and names, dependencies: genesis rejects them) apply to it as to a derived module.
+Discriminant `0` on a hand-written impl is rejected only once the runtime derive exists (its
+compile-time layout check).
+
+- **State items:** each `#[state(item = N)]` field is stored under the prefix
+  `(DISCRIMINANT, N)`. Ids are explicit: reordering fields, renaming or moving the struct
+  changes no prefix, and a removed (or `#[cfg]`'d-out) field leaves its id unused instead of
+  renumbering every later item (upstream numbered items by position, with two different
+  limits). `ModuleInfo::STATE_LAYOUT` lists each item's id (the second prefix byte) and field
+  name (without `r#`), in item-id order; each module pins it with a known-answer test, so
+  renumbering, renaming or dropping an item fails a test.
 - **Dependencies:** `ModuleInfo::DEPENDENCIES` lists the `(DISCRIMINANT, NAME)` of the modules
-  a module holds; each must be a module of the runtime with exactly that pair. The runtime's
+  a module holds (its `#[module]` fields, in field order); each must be a module of the runtime
+  with exactly that pair. A held module keeps its own discriminant, so it reads and writes the
+  same prefixes as the runtime's instance of that module. The runtime's
   genesis runs each module after its dependencies (`sort_values_by_modules_dependencies`:
   duplicates, a missing or mismatched dependency and cycles are errors; the order is
   deterministic, no hash collections).
@@ -687,6 +719,9 @@ Only `0` is enforced: nothing can tell a test module from a production one.
   which the runtime maps it to its event type (upstream: by `TypeId`). The key's length is
   charged with the event, and a key (derived or custom, `emit_event_with_custom_key`) of more
   than `MAX_EVENT_KEY_LEN` = 256 bytes reverts the call ("Metered state access").
+  `#[derive(ModuleEvent)]` (enums only; the name is the variant's, without `r#`) rejects an
+  event name of more than `MAX_EVENT_NAME_LEN` = 256 − 32 − 1 = 223 bytes at compile time:
+  module names are at most `MAX_MODULE_NAME_LEN` = 32 bytes, so a derived key always fits.
 
 ## Checking
 
@@ -699,5 +734,9 @@ Only `0` is enforced: nothing can tell a test module from a production one.
 - `make doctest-codes` — the doctests on nightly rustdoc, which (unlike stable) checks the
   error code each `compile_fail` doctest pins, so a type-level rule (`ConsensusType`, sealed
   traits, private constructors) is proven by the error it is meant to cause.
+- The derives: their compile errors by exact-message unit tests in `selendra-macros` (a
+  derive's error has no error code, so no `compile_fail` doctest can pin it); what they
+  generate by `selendra-modules-api`'s integration tests (`tests/derives/`: layouts, ids,
+  dependencies, event names, consensus types), in the guest configuration too.
 - `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `modules_api_types`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

@@ -7,13 +7,20 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use super::ModuleMessage;
-use crate::{NotInstantiable, TypeErasedEvent};
+use super::{MAX_MODULE_NAME_LEN, ModuleMessage};
+use crate::{MAX_EVENT_KEY_LEN, NotInstantiable, TypeErasedEvent};
+
+/// The longest event name [`#[derive(ModuleEvent)]`](macro@crate::ModuleEvent) accepts, in
+/// bytes (223): what is left of an event key ([`MAX_EVENT_KEY_LEN`]) after the longest module
+/// name ([`MAX_MODULE_NAME_LEN`]) and the `/`, so a derived key `"{NAME}/{event_name}"` always
+/// fits. (A longer key fails at run time: the emitting call is reverted.)
+pub const MAX_EVENT_NAME_LEN: usize = MAX_EVENT_KEY_LEN - MAX_MODULE_NAME_LEN - 1;
 
 /// A module's event type ([`Module::Event`](crate::Module::Event)): each event's name, the
 /// second half of its key (`"{module NAME}/{event_name}"`, see
-/// [`EventEmitter`](crate::EventEmitter)). Derived by `#[derive(ModuleEvent)]` (the variant's
-/// name) or written by hand.
+/// [`EventEmitter`](crate::EventEmitter)). Derived by
+/// [`#[derive(ModuleEvent)]`](macro@crate::ModuleEvent) (the variant's name, at most
+/// [`MAX_EVENT_NAME_LEN`] bytes) or written by hand.
 ///
 /// The name comes from this method, never from the event's `Debug` output (upstream parsed the
 /// key out of it, P5-32).

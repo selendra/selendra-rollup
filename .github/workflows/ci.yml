@@ -39,8 +39,9 @@ jobs:
 
   # The zk guest builds without `native`: lint that configuration, and make sure no OS
   # randomness (`getrandom`) reaches it. `--all-targets` and tests for `selendra-state`, the
-  # mocks and `selendra-modules-api` (the other crates' tests turn `native` on through a self
-  # dev-dependency; modules-api's turns on only `test-utils`).
+  # mocks and `selendra-modules-api`, the derives' integration tests included (the other crates'
+  # tests turn `native` on through a self dev-dependency; modules-api's turns on only
+  # `test-utils`). `selendra-macros` is a host-only proc-macro crate.
   guest:
     runs-on: ubuntu-24.04
     if: hashFiles('crates/**/Cargo.toml') != ''
@@ -62,7 +63,8 @@ jobs:
       - run: cargo test --workspace --all-features --locked
 
   # The SP1 guest is 32-bit (`usize` = 32 bits): run the tests with a 32-bit `usize` too
-  # (without the RocksDB/NOMT storage stack, see the Makefile).
+  # (without the RocksDB/NOMT storage stack, see the Makefile; the proc-macro crate's own tests
+  # run on the host).
   test-32bit:
     runs-on: ubuntu-24.04
     if: hashFiles('crates/**/Cargo.toml') != ''

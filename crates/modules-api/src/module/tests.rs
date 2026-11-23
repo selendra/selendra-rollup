@@ -758,6 +758,74 @@ fn module_info_identity_and_layout() {
     assert_eq!(hooked.counter.count, Counter::<S>::default().count);
 }
 
+/// `Counter`'s and `Hooked`'s identity and layout, derived.
+#[derive(Debug, Clone, ModuleInfo)]
+#[module_info(discriminant = 224, name = "counter")]
+struct DerivedCounter<S: Spec> {
+    #[id]
+    id: ModuleId,
+    #[state(item = 0)]
+    count: StateValue<u64>,
+    #[state(item = 1)]
+    pre_dispatched: StateValue<u64>,
+    #[phantom]
+    spec: PhantomData<fn() -> S>,
+}
+
+#[derive(Debug, Clone, ModuleInfo)]
+#[module_info(discriminant = 225, name = "hooked")]
+struct DerivedHooked<S: Spec> {
+    #[id]
+    id: ModuleId,
+    #[module]
+    counter: Counter<S>,
+    #[state(item = 0)]
+    begun: StateValue<u64>,
+    #[state(item = 1)]
+    ended: StateValue<u64>,
+    #[state(item = 2)]
+    last_version: StateValue<u32>,
+    #[state(item = 3)]
+    last_sender: StateValue<S::Address>,
+    #[state(item = 4)]
+    finalized: AccessoryStateValue<u64>,
+    #[state(item = 5)]
+    genesis_saw: StateValue<u64>,
+}
+
+/// What `#[derive(ModuleInfo)]` generates is what the hand-written test modules implement (the
+/// way a module was written before the derive): the constants, the id and every prefix.
+#[test]
+fn derive_matches_hand_written_module_info() {
+    type DC = DerivedCounter<S>;
+    type HC = Counter<S>;
+    assert_eq!(DC::DISCRIMINANT, HC::DISCRIMINANT);
+    assert_eq!(DC::NAME, HC::NAME);
+    assert_eq!(DC::DEPENDENCIES, HC::DEPENDENCIES);
+    assert_eq!(DC::STATE_LAYOUT, HC::STATE_LAYOUT);
+    let (derived, hand) = (DC::default(), HC::default());
+    assert_eq!(derived.id(), hand.id());
+    assert_eq!(derived.count, hand.count);
+    assert_eq!(derived.pre_dispatched, hand.pre_dispatched);
+
+    type DH = DerivedHooked<S>;
+    type HH = Hooked<S>;
+    assert_eq!(DH::DISCRIMINANT, HH::DISCRIMINANT);
+    assert_eq!(DH::NAME, HH::NAME);
+    assert_eq!(DH::DEPENDENCIES, HH::DEPENDENCIES);
+    assert_eq!(DH::STATE_LAYOUT, HH::STATE_LAYOUT);
+    let (derived, hand) = (DH::default(), HH::default());
+    assert_eq!(derived.id(), hand.id());
+    assert_eq!(derived.dependencies(), hand.dependencies());
+    assert_eq!(derived.counter.count, hand.counter.count);
+    assert_eq!(derived.begun, hand.begun);
+    assert_eq!(derived.ended, hand.ended);
+    assert_eq!(derived.last_version, hand.last_version);
+    assert_eq!(derived.last_sender, hand.last_sender);
+    assert_eq!(derived.finalized, hand.finalized);
+    assert_eq!(derived.genesis_saw, hand.genesis_saw);
+}
+
 // -------------------------------------------------------------------------------------------
 // Genesis
 

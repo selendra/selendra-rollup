@@ -23,13 +23,17 @@ pub use call::CallMessage;
 pub use context::Context;
 pub use credential::{AccountAddress, Credential};
 pub use dispatch::{DispatchCall, EncodeCall, ModuleMessage};
-pub use event::{ModuleEvent, RuntimeEventProcessor};
+pub use event::{MAX_EVENT_NAME_LEN, ModuleEvent, RuntimeEventProcessor};
 pub use gas_schedule::{GasSchedule, SELENDRA_GAS_SCHEDULE, SchemeCosts};
 pub use spec::{CryptoSpecExt, SelendraSpec, Spec};
 
 use crate::state::{EventContainer, TxStateError};
 use crate::transaction::AuthenticatedTransactionData;
 use crate::{BlockState, GenesisState, ModuleError, ModuleId, TxState};
+
+/// The longest module name ([`ModuleInfo::NAME`]), in bytes: names are
+/// `^[a-z][a-z0-9_]{0,31}$`.
+pub const MAX_MODULE_NAME_LEN: usize = 32;
 
 /// One state item of a module (a `#[state]` field): its item id and its field name. Its state
 /// lives under the prefix `(module discriminant, item)` ([`StateItem::prefix`]).
@@ -67,7 +71,8 @@ impl StateItem {
 
 /// A module's identity and state layout: what the runtime, its derives and the state
 /// transition function need to know about a module without running it. Derived by
-/// `#[derive(ModuleInfo)]` (with `#[module_info(discriminant = …, name = "…")]`).
+/// [`#[derive(ModuleInfo)]`](macro@crate::ModuleInfo) (with
+/// `#[module_info(discriminant = …, name = "…")]`), which checks the rules below.
 ///
 /// - [`DISCRIMINANT`](Self::DISCRIMINANT) numbers the module, once for everything: the first
 ///   byte of every state prefix of the module, and the tag of its calls and events in the
@@ -85,14 +90,21 @@ impl StateItem {
 ///   module with another discriminant would write under another module's prefixes).
 /// - [`STATE_LAYOUT`](Self::STATE_LAYOUT) lists the module's state items.
 ///
-/// The derive checks these rules, the runtime derive checks the runtime's modules together. A
-/// hand-written impl must keep them, and its [`id`](Self::id) must be
-/// `ModuleId::from_name(Self::NAME)`.
+/// The derive enforces the rules of one module at compile time: a discriminant other than `0`,
+/// a valid name, unique item ids, a [`STATE_LAYOUT`](Self::STATE_LAYOUT) that lists the
+/// prefixes its constructor builds, and an [`id`](Self::id) that is
+/// `ModuleId::from_name(Self::NAME)`. Nothing checks the name, the item ids, the layout or the
+/// id of a hand-written impl: it must keep them itself. The rules between modules apply to
+/// derived and hand-written modules alike: genesis
+/// ([`sort_values_by_modules_dependencies`](crate::sort_values_by_modules_dependencies))
+/// rejects a repeated discriminant or name and a dependency that is not one of the modules
+/// with that discriminant and name. Discriminant `0` on a hand-written impl is not rejected
+/// yet: the runtime derive, which checks the runtime's modules together at compile time, will.
 ///
-/// Upstream's `ModuleInfo` numbered a module three ways (the state prefix from its Rust path,
-/// the call tag from its position in the runtime, the discriminant from `constants.toml`;
-/// P5-25), derived its id from its Rust path (P5-27), and had `is_safe_for_sequencer`, which
-/// comes back with the sequencer (Phase 11).
+/// Upstream's `ModuleInfo` named a module three ways (its `prefix()` from its Rust path, the
+/// module byte of its state prefixes from a `constants.toml` discriminant, its call tag from
+/// its position in the runtime; P5-25), derived its id from its Rust path (P5-27), and had
+/// `is_safe_for_sequencer`, which comes back with the sequencer (Phase 11).
 pub trait ModuleInfo {
     /// The spec the module runs with.
     type Spec: Spec;
@@ -101,13 +113,14 @@ pub trait ModuleInfo {
     /// events. Never `0`.
     const DISCRIMINANT: u8;
 
-    /// The module's stable name, `^[a-z][a-z0-9_]{0,31}$`.
+    /// The module's stable name, `^[a-z][a-z0-9_]{0,31}$` (at most [`MAX_MODULE_NAME_LEN`]
+    /// bytes).
     const NAME: &'static str;
 
     /// The `(DISCRIMINANT, NAME)` of each module this one depends on.
     const DEPENDENCIES: &'static [(u8, &'static str)];
 
-    /// The module's state items.
+    /// The module's state items (derived: in item-id order).
     const STATE_LAYOUT: &'static [StateItem];
 
     /// The module's id: `ModuleId::from_name(Self::NAME)`.

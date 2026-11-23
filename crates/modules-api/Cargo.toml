@@ -1,6 +1,6 @@
 [package]
 name = "selendra-modules-api"
-description = "Selendra module system API: the module traits (Module, ModuleInfo, DispatchCall, hooks) and Context, gas types and meters, metered utilities, the Spec trait and SelendraSpec, the state accessors (TxState, WorkingSet, BlockState) and events, transaction details, token amounts, 32-byte bech32m ids (ModuleId), module errors."
+description = "Selendra module system API: the module traits (Module, ModuleInfo, DispatchCall, hooks) and their derives (ModuleInfo, ModuleEvent, ConsensusType), Context, gas types and meters, metered utilities, the Spec trait and SelendraSpec, the state accessors (TxState, WorkingSet, BlockState) and events, transaction details, token amounts, 32-byte bech32m ids (ModuleId), module errors."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,9 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 schemars = { workspace = true }
 selendra-interface = { workspace = true }
+# The derives (`ModuleInfo`, `ModuleEvent`, `ConsensusType`), re-exported: a proc-macro crate, built
+# for the host only.
+selendra-macros = { workspace = true }
 selendra-mock-da = { workspace = true, optional = true }
 selendra-mock-zkvm = { workspace = true, optional = true }
 selendra-primitives = { workspace = true }

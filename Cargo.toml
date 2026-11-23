@@ -7,6 +7,7 @@ members = [
     "crates/adapters/mock-zkvm",
     "crates/db",
     "crates/interface",
+    "crates/macros",
     "crates/modules-api",
     "crates/primitives",
     "crates/rockbound",
@@ -46,6 +47,7 @@ mem_forget = "deny"
 # Add `selendra-<name> = { path = "crates/<name>", default-features = false }` with each new crate.
 selendra-db = { path = "crates/db", default-features = false }
 selendra-interface = { path = "crates/interface", default-features = false }
+selendra-macros = { path = "crates/macros", default-features = false }
 selendra-mock-da = { path = "crates/adapters/mock-da", default-features = false }
 selendra-mock-zkvm = { path = "crates/adapters/mock-zkvm", default-features = false }
 selendra-modules-api = { path = "crates/modules-api", default-features = false }
@@ -89,9 +91,13 @@ nomt = { version = "=1.0.5", default-features = false, features = ["borsh"] }
 nomt-core = { version = "=1.0.5", default-features = false, features = ["borsh"] }
 parking_lot = "0.12.5"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+# `proc-macro2`, `quote` and `syn`: `selendra-macros` only. Not pinned: what the derives generate
+# is pinned by behavioural known-answer tests (`selendra-modules-api`), not by these versions.
+proc-macro2 = "1.0.107"
 proptest = { version = "1.5", default-features = false, features = ["std", "alloc"] }
 proptest-derive = "0.9"
 quick_cache = "0.7"
+quote = "1.0.47"
 rand_core = { version = "0.6", features = ["getrandom"] } # ed25519-consensus 2.1 uses rand_core 0.6
 # Node-only (rockbound). Builds RocksDB from source: needs a C++ toolchain and libclang (bindgen).
 # Only LZ4 compression (rockbound's default). `bindgen-runtime`: the build script loads libclang
@@ -104,6 +110,8 @@ serde_with = { version = "3", default-features = false, features = ["alloc", "ba
 sha2 = { version = "=0.10.9", default-features = false } # zkVM-patched (SP1), see digest
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 stats_alloc = "0.1.10" # tests only: counts allocations
+# No `full` or `visit`: the derives parse derive input and their attributes only.
+syn = { version = "3.0.10", default-features = false, features = ["derive", "parsing", "printing", "proc-macro", "clone-impls"] }
 tempfile = "3.27"
 test-strategy = "0.4.0"
 thiserror = "2"

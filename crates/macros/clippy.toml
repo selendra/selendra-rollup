@@ -1,0 +1,15 @@
+# Clippy reads only the nearest clippy.toml: this repeats the workspace settings
+# (`/clippy.toml`) and adds the derives' own rules.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+
+# What a derive generates must not depend on a per-process hash seed: the native node and the
+# zk guest are built separately, and the order of generated items (state layout, checks) is
+# pinned by known-answer tests.
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order depends on a per-process seed: use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order depends on a per-process seed: use BTreeSet" },
+    { path = "std::hash::RandomState", reason = "a per-process hash seed: derive output must be deterministic" },
+]

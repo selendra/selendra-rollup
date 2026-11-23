@@ -17,6 +17,9 @@
 //!   trait every module is generic over, the chain's [`SelendraSpec`], its per-operation
 //!   [`GasSchedule`], and how an account is derived from the key that signs ([`Credential`],
 //!   [`AccountAddress`]);
+//! - the derives: [`ModuleInfo`](macro@ModuleInfo) (a module's identity and state layout),
+//!   [`ModuleEvent`](macro@ModuleEvent) (its events' names) and
+//!   [`ConsensusType`](macro@ConsensusType) (a type allowed in consensus data);
 //! - [`hooks`]: a runtime's hooks ([`TxHooks`], [`BlockHooks`], [`FinalizeHook`]);
 //! - [`sort_values_by_modules_dependencies`]: the order of the modules' genesis (dependencies
 //!   first, [`ModuleDescriptor`]);
@@ -27,8 +30,8 @@
 //!   [`AuthenticatedTransactionData`], [`PriorityFeeBips`]).
 //!
 //! Every type that is stored or signed is a consensus type
-//! ([`ConsensusType`](selendra_interface::common::ConsensusType)); encodings are in
-//! `docs/serialization.md`, "Module system types".
+//! ([`ConsensusType`](trait@ConsensusType)); encodings are in `docs/serialization.md`, "Module
+//! system types".
 //!
 //! # Features
 //! - `native`: node-only code, never compiled into the zk guest (`PrivateKeyExt`), and it keeps
@@ -42,13 +45,14 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-// The module system's derives (Phase 5's `selendra-macros`) name this crate by its path; this
-// lets them be used inside it too.
+// The module system's derives (`selendra-macros`) name this crate by its path; this lets them be
+// used inside it too.
 extern crate self as selendra_modules_api;
 
 pub mod common;
 mod consensus_types;
 mod dependencies;
+mod derives;
 pub mod gas;
 pub mod hooks;
 pub mod module;
@@ -78,6 +82,8 @@ pub use common::{
 pub use dependencies::{
     DependencyError, ModuleDescriptor, ModuleKey, sort_values_by_modules_dependencies,
 };
+// The derives share their traits' names (another namespace: one `use` brings both).
+pub use derives::{ConsensusType, ModuleEvent, ModuleInfo};
 pub use gas::{
     BasicGasMeter, BlockGasInfo, Fraction, GAS_DIMENSIONS, Gas, GasArray, GasInfo, GasMeter,
     GasMeteringError, GasPrice, GasUnit, ImpossibleToRefundGasDetails, MeteredBorshDeserialize,
@@ -87,10 +93,14 @@ pub use gas::{
 pub use hooks::{BlockHooks, FinalizeHook, TxHooks};
 pub use module::{
     AccountAddress, CallMessage, Context, Credential, CryptoSpecExt, DispatchCall, EncodeCall,
-    EventEmitter, GasSchedule, Genesis, Module, ModuleEvent, ModuleInfo, ModuleMessage,
-    RuntimeEventProcessor, SchemeCosts, SelendraSpec, Spec, StateItem,
+    EventEmitter, GasSchedule, Genesis, MAX_EVENT_NAME_LEN, MAX_MODULE_NAME_LEN, Module,
+    ModuleEvent, ModuleInfo, ModuleMessage, RuntimeEventProcessor, SchemeCosts, SelendraSpec, Spec,
+    StateItem,
 };
 pub use runtime::OperatingMode;
+// The marker of consensus data (`selendra-interface`), which every stored, signed or emitted
+// type implements.
+pub use selendra_interface::common::ConsensusType;
 // Where a transaction runs, for `Context` (`selendra-interface`).
 pub use selendra_interface::stf::ExecutionContext;
 // The metered state access the accessors are built on, for module code (`selendra-state`).
@@ -120,5 +130,12 @@ pub mod __private {
     pub use proptest;
     pub use selendra_interface::common::ConsensusType;
     pub use selendra_primitives::bech32;
+    pub use selendra_state::Prefix;
     pub use {borsh, schemars, serde, serde_json};
+
+    pub use crate::{MAX_EVENT_NAME_LEN, ModuleEvent, ModuleId, ModuleInfo, Spec, StateItem};
+
+    /// Compiles only if the module `M` runs with the spec `S`: `#[derive(ModuleInfo)]` checks
+    /// each `#[module]` field with it.
+    pub const fn same_spec<M: ModuleInfo<Spec = S>, S: Spec>() {}
 }
