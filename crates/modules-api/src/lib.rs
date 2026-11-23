@@ -10,13 +10,21 @@
 //!   [`PreExecWorkingSet`], [`RevertableTxState`], [`GenesisStateAccessor`]), the block hooks'
 //!   [`BlockState`], the traits module code is written against ([`TxState`], [`GenesisState`],
 //!   [`StateAccessor`]) and events ([`EventContainer`], [`TypeErasedEvent`]);
-//! - [`module`]: the [`Spec`] trait every module is generic over, the chain's [`SelendraSpec`],
-//!   its per-operation [`GasSchedule`], and how an account is derived from the key that signs
-//!   ([`Credential`], [`AccountAddress`]);
+//! - [`module`]: the traits a module implements ([`ModuleInfo`], [`Module`], with its hooks) and
+//!   those built on them ([`Genesis`], [`EventEmitter`]), its calls and events ([`CallMessage`],
+//!   [`ModuleEvent`]), what a runtime implements over its modules ([`DispatchCall`],
+//!   [`EncodeCall`], [`RuntimeEventProcessor`]), the [`Context`] a call runs with; the [`Spec`]
+//!   trait every module is generic over, the chain's [`SelendraSpec`], its per-operation
+//!   [`GasSchedule`], and how an account is derived from the key that signs ([`Credential`],
+//!   [`AccountAddress`]);
+//! - [`hooks`]: a runtime's hooks ([`TxHooks`], [`BlockHooks`], [`FinalizeHook`]);
+//! - [`sort_values_by_modules_dependencies`]: the order of the modules' genesis (dependencies
+//!   first, [`ModuleDescriptor`]);
 //! - [`common`]: token amounts ([`Amount`]), 32-byte ids shown as bech32m ([`hash32_id!`],
 //!   [`ModuleId`]), module errors ([`ModuleError`], [`ErrorDetail`]) and the cryptography
 //!   bounds of the module system ([`PublicKeyExt`], [`SignatureExt`]);
-//! - [`runtime`] ([`OperatingMode`]) and [`transaction`] ([`PriorityFeeBips`]).
+//! - [`runtime`] ([`OperatingMode`]) and [`transaction`] ([`TxDetails`],
+//!   [`AuthenticatedTransactionData`], [`PriorityFeeBips`]).
 //!
 //! Every type that is stored or signed is a consensus type
 //! ([`ConsensusType`](selendra_interface::common::ConsensusType)); encodings are in
@@ -40,7 +48,9 @@ extern crate self as selendra_modules_api;
 
 pub mod common;
 mod consensus_types;
+mod dependencies;
 pub mod gas;
+pub mod hooks;
 pub mod module;
 pub mod runtime;
 pub mod state;
@@ -65,29 +75,41 @@ pub use common::{
     ModuleError, ModuleId, NotInstantiable, ParseAmountError, PublicKeyExt, SequencerType,
     SignatureExt, to_json_object,
 };
+pub use dependencies::{
+    DependencyError, ModuleDescriptor, ModuleKey, sort_values_by_modules_dependencies,
+};
 pub use gas::{
     BasicGasMeter, BlockGasInfo, Fraction, GAS_DIMENSIONS, Gas, GasArray, GasInfo, GasMeter,
     GasMeteringError, GasPrice, GasUnit, ImpossibleToRefundGasDetails, MeteredBorshDeserialize,
     MeteredBorshDeserializeError, MeteredHasher, MeteredReader, OutOfFundsDetails, OutOfGasDetails,
     PREFERRED_DATA_FRACTION, SlotGasMeter, SlotOutOfGasDetails, TxMeter, UnlimitedGasMeter,
 };
+pub use hooks::{BlockHooks, FinalizeHook, TxHooks};
 pub use module::{
-    AccountAddress, Credential, CryptoSpecExt, GasSchedule, SchemeCosts, SelendraSpec, Spec,
+    AccountAddress, CallMessage, Context, Credential, CryptoSpecExt, DispatchCall, EncodeCall,
+    EventEmitter, GasSchedule, Genesis, Module, ModuleEvent, ModuleInfo, ModuleMessage,
+    RuntimeEventProcessor, SchemeCosts, SelendraSpec, Spec, StateItem,
 };
 pub use runtime::OperatingMode;
+// Where a transaction runs, for `Context` (`selendra-interface`).
+pub use selendra_interface::stf::ExecutionContext;
 // The metered state access the accessors are built on, for module code (`selendra-state`).
 pub use selendra_state::metered::{
-    Metered, MeteredRef, MeteredView, PhaseOutcome, RevertReason, ScopeEnd, StateAccessError,
-    TxRights,
+    MAX_EVENT_KEY_LEN, Metered, MeteredRef, MeteredView, PhaseOutcome, RevertReason, ScopeEnd,
+    StateAccessError, TxRights,
 };
-pub use selendra_state::{StateReader, StateReaderAndWriter, StateWriter, VersionReader};
+pub use selendra_state::{
+    AccessoryStateReaderAndWriter, StateReader, StateReaderAndWriter, StateWriter, VersionReader,
+};
 pub use state::{
     BlockState, EventContainer, FinalizedGenesis, FinalizedPreExec, FinalizedWorkingSet,
     GenesisState, GenesisStateAccessor, InfallibleKernelStateAccessor, InfallibleStateAccessor,
     NotAtGenesis, PreExecWorkingSet, PrivilegedKernelAccessor, RevertableTxState, SpecCheckpoint,
     StateAccessor, TxOutcome, TxState, TxStateError, TypeErasedEvent, WorkingSet,
 };
-pub use transaction::{PriorityFeeApplyOverflowError, PriorityFeeBips};
+pub use transaction::{
+    AuthenticatedTransactionData, PriorityFeeApplyOverflowError, PriorityFeeBips, TxDetails,
+};
 
 /// What the macros of this crate (and the module system's derives) expand to. Not public API.
 #[doc(hidden)]

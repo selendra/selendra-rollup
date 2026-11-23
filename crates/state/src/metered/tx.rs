@@ -3,7 +3,9 @@
 
 use std::marker::PhantomData;
 
-use super::costs::{MAX_STATE_VALUE_SIZE, StateAccessCosts, StateGas, StateGasMeter};
+use super::costs::{
+    MAX_EVENT_KEY_LEN, MAX_STATE_VALUE_SIZE, StateAccessCosts, StateGas, StateGasMeter,
+};
 use super::error::{StateAccessError, StateOp};
 use super::journal::Level;
 use super::rights::AccessRights;
@@ -99,8 +101,8 @@ impl<St: Storage, M: StateGasMeter> TxInner<St, M> {
 /// so a phase in which an access failed is never applied, whatever the module returned.
 ///
 /// # Failures
-/// The first failed access (out of gas, a gas overflow, a value too large, a misused scope)
-/// **poisons** the phase: every later access returns
+/// The first failed access (out of gas, a gas overflow, a value too large, an event key too
+/// long, a misused scope) **poisons** the phase: every later access returns
 /// [`StateAccessError::Poisoned`] before touching the meter or storage (so a module that
 /// ignores the error adds neither gas nor witness hints), and nested scopes share the poison
 /// (reverting one does not clear it).
@@ -240,7 +242,8 @@ impl<St: Storage, M: StateGasMeter, R: AccessRights> MeteredTx<St, M, R> {
 /// at its scope: the phase's base scope, or a nested scope ([`scoped`](Self::scoped)).
 ///
 /// Its public operations are the charges ([`charge`](Self::charge),
-/// [`charge_linear`](Self::charge_linear)), the scope operations
+/// [`charge_linear`](Self::charge_linear)), the event-key check
+/// ([`check_event_key`](Self::check_event_key)), the scope operations
 /// ([`open_scope`](Self::open_scope), [`close_scope`](Self::close_scope),
 /// [`scoped`](Self::scoped)) and [`view`](Self::view). The raw reads and writes are
 /// crate-private: only the blanket [`StateReader`](crate::StateReader)/
@@ -288,6 +291,25 @@ impl<'a, St: Storage, M: StateGasMeter, R: AccessRights> MeteredRef<'a, St, M, R
             .and_then(|units| per_unit.checked_scale(units))
             .and_then(|scaled| base.checked_add(scaled));
         self.tx.charge(|| StateOp::Charge, gas)
+    }
+
+    /// Checks an event key before the event is charged: a key of more than
+    /// [`MAX_EVENT_KEY_LEN`] bytes (its UTF-8 length, `key.len()`, the measure the node's ledger
+    /// uses) fails with [`StateAccessError::EventKeyTooLong`], which poisons the phase. Charges
+    /// nothing either way. `selendra-modules-api`'s event containers call it for every event,
+    /// so no transaction keeps an event the ledger would refuse.
+    ///
+    /// # Errors
+    /// - [`StateAccessError::EventKeyTooLong`] (poisons the phase).
+    /// - As for any access: [`StateAccessError::Poisoned`] on a poisoned phase,
+    ///   [`StateAccessError::ScopeMisuse`] (poisons) if the accessor's scope is no longer open.
+    pub fn check_event_key(&mut self, key: &str) -> Result<(), Error<M>> {
+        self.tx.enter(self.level)?;
+        let len = key.len();
+        if len > MAX_EVENT_KEY_LEN {
+            return Err(self.tx.fail(StateAccessError::EventKeyTooLong { len }));
+        }
+        Ok(())
     }
 
     /// Read-only information on the phase.

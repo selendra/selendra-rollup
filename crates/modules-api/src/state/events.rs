@@ -10,6 +10,16 @@
 //! returns are always empty.
 //! Upstream charged nothing for events (P5-14).
 //!
+//! An event key is at most [`MAX_EVENT_KEY_LEN`](crate::MAX_EVENT_KEY_LEN) (256) bytes (its
+//! UTF-8 length, `key.len()`). A longer one is refused before anything is charged for the
+//! event: the access fails with
+//! [`StateAccessError::EventKeyTooLong`](crate::StateAccessError::EventKeyTooLong), which
+//! poisons the phase like any failed access (the transaction is reverted, natively and in the
+//! guest alike). The limit is `selendra-state`'s constant, which the node's ledger
+//! (`selendra-db`) uses too: it refuses a longer key, so without the check here one transaction
+//! emitting a longer key would make the node fail to store its slot. (Upstream bounded event
+//! keys nowhere.)
+//!
 //! An event belongs to the scope it was emitted in: the events of a reverted nested scope
 //! ([`RevertableTxState`](crate::RevertableTxState)) or of a reverted phase are dropped with its
 //! writes.
@@ -137,10 +147,10 @@ pub(crate) mod sealed {
 ///
 /// Implemented by the transaction accessors ([`WorkingSet`](crate::WorkingSet),
 /// [`RevertableTxState`](crate::RevertableTxState),
-/// [`GenesisStateAccessor`](crate::GenesisStateAccessor)). Module code emits events with
-/// [`add_event`](Self::add_event) (S7's `Module::emit_event` calls it with the module's
-/// discriminant); events reach the state transition function only through these accessors,
-/// all of which charge.
+/// [`GenesisStateAccessor`](crate::GenesisStateAccessor)). Module code emits events through
+/// [`EventEmitter`](crate::EventEmitter), which calls [`add_event`](Self::add_event) with the
+/// module's own discriminant; events reach the state transition function only through these
+/// accessors, all of which charge.
 ///
 /// Sealed: no other crate can implement it (its supertrait is private to this crate; E0277), so
 /// none can write a [`TxState`](crate::TxState) of its own. A committed nested scope hands its
@@ -196,22 +206,26 @@ pub(crate) mod sealed {
 /// fn keep(_: TypeErasedEvent) {}
 /// ```
 pub trait EventContainer<S: Spec>: EventSink<S> {
-    /// Charges `event_base + event_per_byte·(key.len() + borsh_len(event))`, then keeps the event
-    /// with the `native` feature; without it (the zk guest) the event is charged the same and
-    /// dropped.
+    /// Refuses a `key` of more than [`MAX_EVENT_KEY_LEN`](crate::MAX_EVENT_KEY_LEN) bytes, then
+    /// charges `event_base + event_per_byte·(key.len() + borsh_len(event))`, then keeps the
+    /// event with the `native` feature; without it (the zk guest) the event is checked and
+    /// charged the same and dropped.
     ///
     /// # Errors
-    /// The charge was refused (`OutOfGas`), its gas overflows, or the event's borsh encoding
-    /// fails (a `BorshSerialize` impl must be infallible: such an event cannot be priced, which
-    /// is reported as `GasOverflow`), or the phase is poisoned. Any failure poisons the phase,
-    /// and the event is dropped.
+    /// The key is longer than [`MAX_EVENT_KEY_LEN`](crate::MAX_EVENT_KEY_LEN) bytes
+    /// (`EventKeyTooLong`, nothing charged for the event), the charge was refused (`OutOfGas`),
+    /// its gas overflows, or the event's borsh encoding fails (a `BorshSerialize` impl must be
+    /// infallible: such an event cannot be priced, which is reported as `GasOverflow`), or the
+    /// phase is poisoned. Any failure poisons the phase, and the event is dropped.
     fn add_event<E>(&mut self, module: u8, key: &str, event: E) -> Result<(), TxStateError<S>>
     where
         E: BorshSerialize + Any + Send + Sync;
 }
 
-/// Charges for `event` with key `key` (see the [module docs](self)) on `state`'s phase and
-/// returns it, type-erased, if it is kept (natively).
+/// Checks `key`'s length, then charges for `event` with key `key` (see the [module docs](self))
+/// on `state`'s phase and returns it, type-erased, if it is kept (natively). Every
+/// [`EventContainer::add_event`] goes through it, so every accessor (and so `EventEmitter`'s
+/// `emit_event` and `emit_event_with_custom_key`) bounds keys the same way.
 pub(crate) fn charge_event<S, T, E>(
     state: &mut T,
     module: u8,
@@ -223,6 +237,9 @@ where
     T: GasMeter<S>,
     E: BorshSerialize + Any + Send + Sync,
 {
+    // First the key bound (charges nothing; a refused key poisons the phase), so no event the
+    // node's ledger would refuse is ever kept.
+    state.metered().check_event_key(key)?;
     let costs = &S::GAS_SCHEDULE;
     // An encoding that fails cannot be priced: charged as more units than any charge accepts
     // (`GasOverflow`), so it fails the same way natively and in the guest.

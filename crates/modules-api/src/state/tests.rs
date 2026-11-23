@@ -17,8 +17,8 @@ use selendra_state::{
 use super::*;
 use crate::test_utils::{MockKernel, TestSpec, TestStorage};
 use crate::{
-    Amount, BasicGasMeter, GasArray, GasMeter, GasMeteringError, GasPrice, GasUnit, Metered,
-    PhaseOutcome, StateAccessError,
+    Amount, BasicGasMeter, GasArray, GasMeter, GasMeteringError, GasPrice, GasUnit,
+    MAX_EVENT_KEY_LEN, Metered, PhaseOutcome, StateAccessError,
 };
 
 mod distinct_costs;
@@ -368,6 +368,97 @@ fn event_is_charged() {
     assert!(ws.events().is_empty());
     assert_eq!(ws.gas_info().gas_used, gas(0));
     assert_eq!(ws.add_event(7, "E", 5u8), Err(StateAccessError::Poisoned));
+}
+
+/// Emits on `state` (a fresh phase, or a scope of one) an event with the longest key
+/// (`MAX_EVENT_KEY_LEN` bytes), charged D15's `event_base + event_per_byte·(256 + 1)` = 258;
+/// the same with 128 two-byte characters (the limit is in UTF-8 bytes, the ledger's measure);
+/// then one byte more, which fails with `EventKeyTooLong`, charges nothing and poisons the
+/// phase: a later read, and a later event with a short key, are `Poisoned` and charge nothing.
+fn emit_longest_then_too_long_key<T: TxState<S>>(state: &mut T) {
+    let longest = "k".repeat(MAX_EVENT_KEY_LEN);
+    assert_eq!(
+        gas_of(state, |s| s.add_event(7, &longest, 1u8)),
+        (258, Ok(()))
+    );
+    let longest_utf8 = "\u{e9}".repeat(MAX_EVENT_KEY_LEN / 2);
+    assert_eq!(
+        gas_of(state, |s| s.add_event(7, &longest_utf8, 1u8)),
+        (258, Ok(()))
+    );
+    let too_long = format!("{longest_utf8}k");
+    assert_eq!(
+        gas_of(state, |s| s.add_event(7, &too_long, 1u8)),
+        (
+            0,
+            Err(StateAccessError::EventKeyTooLong {
+                len: MAX_EVENT_KEY_LEN + 1
+            })
+        )
+    );
+    assert!(state.metered_view().is_poisoned());
+    assert_eq!(
+        gas_of(state, |s| value().get(s)),
+        (0, Err(StateAccessError::Poisoned))
+    );
+    assert_eq!(
+        gas_of(state, |s| s.add_event(7, "k", 1u8)),
+        (0, Err(StateAccessError::Poisoned))
+    );
+}
+
+/// An event key is at most `MAX_EVENT_KEY_LEN` (256) bytes, the node's ledger's limit (it
+/// stores no longer key, so a transaction that kept one would stop the node from storing the
+/// slot): through the working set, nested scopes on it, and genesis
+/// ([`emit_longest_then_too_long_key`]). The longer key reverts the phase whatever the module
+/// returns: no event and no write is kept. The same in both builds (only the events kept before
+/// the failure depend on `native`).
+#[test]
+fn event_key_too_long_reverts_the_phase() {
+    let refused = || {
+        PhaseOutcome::Reverted(RevertReason::Poisoned(StateAccessError::EventKeyTooLong {
+            len: MAX_EVENT_KEY_LEN + 1,
+        }))
+    };
+    let kept_before = if cfg!(feature = "native") { 2 } else { 0 };
+    for depth in 0..3 {
+        let mut ws = working_set(1_000_000);
+        map().set(&3, &30, &mut ws).unwrap();
+        match depth {
+            0 => emit_longest_then_too_long_key(&mut ws),
+            1 => {
+                let mut nested = ws.to_revertable();
+                emit_longest_then_too_long_key(&mut nested);
+                assert_eq!(nested.events().len(), kept_before);
+                assert!(matches!(nested.commit(), Err(StateAccessError::Poisoned)));
+            }
+            _ => {
+                let mut outer = ws.to_revertable();
+                let mut inner = outer.to_revertable();
+                emit_longest_then_too_long_key(&mut inner);
+                assert!(matches!(inner.commit(), Err(StateAccessError::Poisoned)));
+                assert!(matches!(outer.commit(), Err(StateAccessError::Poisoned)));
+            }
+        }
+        // A failed commit hands the scope's events to no one.
+        let on_ws = if depth == 0 { kept_before } else { 0 };
+        assert_eq!(ws.events().len(), on_ws);
+        let finalized = ws.finalize(Ok::<(), ()>(()));
+        assert_eq!(finalized.outcome, refused(), "depth {depth}");
+        assert!(finalized.events.is_empty());
+        let mut scratchpad = finalized.scratchpad;
+        assert_eq!(map().get(&3, &mut scratchpad), Ok(None));
+    }
+
+    let mut genesis = genesis_state(storage_at_genesis());
+    map().set(&3, &30, &mut genesis).unwrap();
+    emit_longest_then_too_long_key(&mut genesis);
+    assert_eq!(genesis.events().len(), kept_before);
+    let finalized = genesis.finalize(Ok::<(), ()>(()));
+    assert_eq!(finalized.outcome, refused());
+    assert!(finalized.events.is_empty());
+    let (accesses, _, _) = finalized.checkpoint.freeze();
+    assert!(accesses.user.ordered_writes.is_empty());
 }
 
 // -------------------------------------------------------------------------------------------

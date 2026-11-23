@@ -437,10 +437,19 @@ pub(crate) const ACCESSORY_TABLES: [ColumnFamilyName; 4] = [
 // ---------------------------------------------------------------------------------------------
 // The ledger DB.
 
-/// The longest event key the ledger stores, in bytes. Longer keys are refused (`Err`) when a
-/// slot is materialized and by the key encoders, so `event_by_key` keys stay exact-length
+/// The longest event key the ledger stores, in bytes (256). Longer keys are refused (`Err`) when
+/// a slot is materialized and by the key encoders, so `event_by_key` keys stay exact-length
 /// prefixed (a `u16`).
-pub const MAX_EVENT_KEY_LEN: usize = 256;
+///
+/// `selendra-state`'s constant, not a copy: the state transition function refuses a longer key
+/// when a module emits the event (the transaction reverts), so a slot's events always fit here.
+pub use selendra_state::metered::MAX_EVENT_KEY_LEN;
+
+// `event_by_key`'s length prefix is a `u16`.
+const _: () = assert!(
+    MAX_EVENT_KEY_LEN <= u16::MAX as usize,
+    "an event key's length must fit event_by_key's u16 prefix"
+);
 
 /// The length of an encoded hash.
 const HASH_LEN: usize = 32;

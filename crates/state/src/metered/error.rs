@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use super::costs::MAX_STATE_VALUE_SIZE;
+use super::costs::{MAX_EVENT_KEY_LEN, MAX_STATE_VALUE_SIZE};
 use crate::{Namespace, SlotKey};
 
 /// The access that failed.
@@ -80,6 +80,14 @@ pub enum StateAccessError<E> {
         /// The write.
         op: StateOp,
         /// The value's length in bytes.
+        len: usize,
+    },
+    /// An event key of more than [`MAX_EVENT_KEY_LEN`] bytes
+    /// ([`MeteredRef::check_event_key`](super::MeteredRef::check_event_key)). Nothing was charged
+    /// for the event. The node's ledger cannot store such a key, so no transaction may emit one.
+    #[error("event key: {len} bytes is more than the maximum of {MAX_EVENT_KEY_LEN}")]
+    EventKeyTooLong {
+        /// The key's length in bytes.
         len: usize,
     },
     /// A scope was closed out of order, with a token of another phase or one already closed, or

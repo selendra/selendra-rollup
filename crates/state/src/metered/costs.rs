@@ -1,6 +1,7 @@
 //! Gas for state access: the gas type and meter the metered accessors charge
 //! ([`StateGas`], [`StateGasMeter`]), the per-operation costs ([`StateAccessCosts`]) and the
-//! charging formulas, and the bound on written values ([`MAX_STATE_VALUE_SIZE`]).
+//! charging formulas, the bound on written values ([`MAX_STATE_VALUE_SIZE`]) and the bound on
+//! event keys ([`MAX_EVENT_KEY_LEN`]).
 //!
 //! The formulas (all arithmetic checked: an overflow is a `GasOverflow` failure, never a panic
 //! or a wrap):
@@ -33,6 +34,19 @@ use std::fmt::Debug;
 /// far: a release-mode panic on a user-sized value would halt the chain. (Genesis writes are
 /// metered: `selendra-modules-api`'s `GenesisStateAccessor`.)
 pub const MAX_STATE_VALUE_SIZE: usize = 1 << 20;
+
+/// The longest event key, in bytes of its UTF-8 encoding (`key.len()`): 256. Consensus-relevant,
+/// and the one limit both sides use:
+/// - the state transition function refuses a longer key before charging for the event
+///   ([`MeteredRef::check_event_key`](super::MeteredRef::check_event_key), called by
+///   `selendra-modules-api`'s event containers): the access fails with `EventKeyTooLong`, which
+///   poisons the phase, natively and in the zk guest alike;
+/// - the node's ledger (`selendra-db`) stores event keys behind a `u16` length prefix
+///   (`event_by_key`) and refuses longer ones when it materializes a slot.
+///
+/// So no transaction can emit an event the ledger would refuse (which would stop the node from
+/// storing the slot). Changing it changes which transactions revert: a consensus change.
+pub const MAX_EVENT_KEY_LEN: usize = 256;
 
 /// A gas amount the metered accessors can compute with: checked addition and scaling by a
 /// byte count. Implemented by the module system's multi-dimensional gas (Phase 5,

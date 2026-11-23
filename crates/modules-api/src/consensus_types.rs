@@ -2,13 +2,13 @@
 //! ([`ConsensusType`](selendra_interface::common::ConsensusType), `docs/serialization.md`
 //! "Consensus types" and "Module system types"), checked at compile time in every build, the
 //! zk guest's included: every public borsh type of this crate, and a spec's gas, price and
-//! address.
+//! address. (A module's call messages and events are bounded by it in `Module`.)
 
 use selendra_interface::common::ConsensusType;
 
 use crate::{
     Amount, BlockGasInfo, GasPrice, GasUnit, ModuleId, NotInstantiable, OperatingMode,
-    PriorityFeeBips, SelendraSpec, SequencerType, Spec,
+    PriorityFeeBips, SelendraSpec, SequencerType, Spec, TxDetails,
 };
 
 /// Fails to compile if one of these types is not a consensus type.
@@ -34,4 +34,5 @@ fn spec_types_are_consensus_types<S: Spec>() {
     consensus::<<S::Gas as crate::Gas>::Price>();
     consensus::<S::Address>();
     consensus::<BlockGasInfo<S::Gas>>();
+    consensus::<TxDetails<S>>();
 }

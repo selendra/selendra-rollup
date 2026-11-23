@@ -3,10 +3,10 @@
 //! arithmetic) and the gas meters (a refused charge changes nothing; `remaining + used ==
 //! initial`).
 //!
-//! Random text almost never carries a valid bech32m checksum or a complete `BlockGasInfo`
-//! object, so ids and `BlockGasInfo` JSON are also built from the fuzz bytes (`id_strings`,
-//! `block_gas_info_json`): well-formed but possibly non-canonical candidates, each checked
-//! against an independent oracle.
+//! Random text almost never carries a valid bech32m checksum or a complete `BlockGasInfo` or
+//! `TxDetails` object, so ids and their JSON are also built from the fuzz bytes (`id_strings`,
+//! `block_gas_info_json`, `tx_details_json`): well-formed but possibly non-canonical
+//! candidates, each checked against an independent oracle.
 #![no_main]
 
 use std::io::Read;
@@ -18,7 +18,7 @@ use selendra_modules_api::{
     Amount, BasicGasMeter, BlockGasInfo, Gas, GasArray, GasMeter, GasPrice, GasUnit,
     MeteredBorshDeserialize, MeteredBorshDeserializeError, MeteredHasher, MeteredReader,
     ModuleId, NotInstantiable, OperatingMode, PriorityFeeBips, SequencerType, SlotGasMeter,
-    WorkingSet,
+    TxDetails, WorkingSet,
 };
 use selendra_state::{StateCheckpoint, TxScratchpad};
 use sha2::Digest;
@@ -122,6 +122,14 @@ fn binary(data: &[u8]) {
     if let Some(fee) = borsh_canonical::<PriorityFeeBips>(data) {
         round_trips(&fee);
     }
+    if let Some(details) = borsh_canonical::<TxDetails<TestSpec>>(data) {
+        // 8 + 16 + the option (1, or 1 + 16) + 4.
+        assert_eq!(
+            data.len(),
+            if details.gas_limit.is_some() { 45 } else { 29 }
+        );
+        round_trips(&details);
+    }
     assert!(borsh::from_slice::<NotInstantiable>(data).is_err());
     assert_eq!(borsh::from_slice::<TestSpec>(data).is_ok(), data.is_empty());
 }
@@ -144,6 +152,7 @@ fn text(s: &str) {
     let _ = json_canonical::<OperatingMode>(s);
     let _ = json_canonical::<SequencerType>(s);
     let _ = json_canonical::<PriorityFeeBips>(s);
+    let _ = json_canonical::<TxDetails<TestSpec>>(s);
     assert!(serde_json::from_str::<NotInstantiable>(s).is_err());
 }
 
@@ -555,6 +564,101 @@ fn metered(data: &[u8]) {
     assert_eq!(hash.is_ok(), fits(cost, budget));
 }
 
+/// `TxDetails` JSON built from the fuzz bytes: the canonical object, or one with flaws (a
+/// field missing, `gas_limit` included; an unknown or duplicate field; the priority fee quoted;
+/// `max_fee` a number or with a leading zero; `runtime_version` above `u32::MAX`). Exactly the
+/// flawless ones are accepted, as the value they spell.
+fn tx_details_json(data: &[u8]) {
+    let flags = data.get(3).copied().unwrap_or(0);
+    let flaw =
+        |bit: u8| flags & (1 << bit) != 0 && data.get(4).copied().unwrap_or(0) & (1 << bit) != 0;
+    let bips = u64_at(data, 8);
+    let max_fee = u128::from(u64_at(data, 9)) << (u64_at(data, 10) % 65);
+    let limit = (data.get(5).copied().unwrap_or(0) % 2 == 0)
+        .then(|| [u64_at(data, 11), u64_at(data, 12)]);
+    let version = if flaw(6) {
+        u64_at(data, 13)
+    } else {
+        u64_at(data, 13) & u64::from(u32::MAX)
+    };
+    let version_too_large = version > u64::from(u32::MAX);
+
+    let leading_zero = flaw(5) && max_fee != 0;
+    let mut fields = vec![
+        (
+            "max_priority_fee_bips",
+            if flaw(3) {
+                format!("\"{bips}\"")
+            } else {
+                bips.to_string()
+            },
+        ),
+        (
+            "max_fee",
+            if flaw(4) {
+                max_fee.to_string()
+            } else {
+                let zero = if leading_zero { "0" } else { "" };
+                format!("\"{zero}{max_fee}\"")
+            },
+        ),
+        (
+            "gas_limit",
+            match limit {
+                Some([a, b]) => format!("[{a},{b}]"),
+                None => "null".to_owned(),
+            },
+        ),
+        ("runtime_version", version.to_string()),
+    ];
+    let missing = flaw(0);
+    if missing {
+        fields.remove(usize::from(flags >> 6) % 4);
+    }
+    let extra = flaw(1);
+    if extra {
+        // Upstream's field.
+        fields.push(("chain_hash_fragment", "\"1\"".to_owned()));
+    }
+    let duplicate = flaw(2);
+    if duplicate {
+        fields.push(fields[0].clone());
+    }
+    let shift = usize::from(data.get(6).copied().unwrap_or(0)) % fields.len();
+    fields.rotate_left(shift);
+    let json = format!(
+        "{{{}}}",
+        fields
+            .iter()
+            .map(|(name, value)| format!("\"{name}\":{value}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    let valid = !(missing
+        || extra
+        || duplicate
+        || flaw(3)
+        || flaw(4)
+        || leading_zero
+        || version_too_large);
+    match serde_json::from_str::<TxDetails<TestSpec>>(&json) {
+        Ok(details) => {
+            assert!(valid, "flawed TxDetails accepted: {json}");
+            let expected = TxDetails::<TestSpec> {
+                max_priority_fee_bips: PriorityFeeBips(bips),
+                max_fee: Amount::new(max_fee),
+                gas_limit: limit.map(GasUnit::from),
+                runtime_version: u32::try_from(version).unwrap(),
+            };
+            assert_eq!(details, expected);
+            assert_eq!(json_canonical::<TxDetails<TestSpec>>(&json), Some(expected));
+            round_trips(&details);
+        }
+        Err(_) => assert!(!valid, "valid TxDetails rejected: {json}"),
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     binary(data);
     metered(data);
@@ -562,6 +666,7 @@ fuzz_target!(|data: &[u8]| {
     meters(data);
     id_strings(data);
     block_gas_info_json(data);
+    tx_details_json(data);
     if let Ok(s) = std::str::from_utf8(data) {
         text(s);
     }

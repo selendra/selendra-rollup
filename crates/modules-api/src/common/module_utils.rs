@@ -1,10 +1,12 @@
-//! [`NotInstantiable`]: the call message of a module that takes no calls.
+//! [`NotInstantiable`]: the call message (or event type) of a module that takes no calls (emits
+//! no events).
 
 use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 
-/// A type with no values: the call message of a module that takes no calls.
+/// A type with no values: the call message of a module that takes no calls, or the event type
+/// of a module that emits none.
 ///
 /// borsh decoding always fails (every byte string is rejected); there is nothing to encode.
 /// Its JSON schema is `null` (an enum with no variants confuses schema tools).

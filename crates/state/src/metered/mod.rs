@@ -70,8 +70,8 @@
 //! }
 //! ```
 //!
-//! ...and are private on the lent [`MeteredRef`] (E0624), which offers only charges, scopes
-//! and the view:
+//! ...and are private on the lent [`MeteredRef`] (E0624), which offers only charges, the
+//! event-key check, scopes and the view:
 //!
 //! ```compile_fail,E0624
 //! use selendra_state::metered::Metered;
@@ -274,7 +274,9 @@ mod view;
 #[cfg(test)]
 mod tests;
 
-pub use costs::{MAX_STATE_VALUE_SIZE, StateAccessCosts, StateGas, StateGasMeter};
+pub use costs::{
+    MAX_EVENT_KEY_LEN, MAX_STATE_VALUE_SIZE, StateAccessCosts, StateGas, StateGasMeter,
+};
 pub use error::{StateAccessError, StateOp};
 pub use rights::{
     AccessRights, PreExecRights, ReadsKernel, ReadsUser, TxRights, WritesAccessory, WritesKernel,

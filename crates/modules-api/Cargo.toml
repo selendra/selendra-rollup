@@ -1,6 +1,6 @@
 [package]
 name = "selendra-modules-api"
-description = "Selendra module system API: gas types and meters, metered utilities, the Spec trait and SelendraSpec, the state accessors (TxState, WorkingSet, BlockState) and events, token amounts, 32-byte bech32m ids (ModuleId), module errors."
+description = "Selendra module system API: the module traits (Module, ModuleInfo, DispatchCall, hooks) and Context, gas types and meters, metered utilities, the Spec trait and SelendraSpec, the state accessors (TxState, WorkingSet, BlockState) and events, transaction details, token amounts, 32-byte bech32m ids (ModuleId), module errors."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

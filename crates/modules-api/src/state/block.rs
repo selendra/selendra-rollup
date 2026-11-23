@@ -11,9 +11,11 @@ use selendra_state::{
 use super::SpecCheckpoint;
 use crate::Spec;
 
-/// The state the begin- and end-of-block hooks run on (S7): the block's checkpoint, unmetered
-/// and infallible. User and Kernel state read and write, Accessory state write only, and the
-/// versions ([`VersionReader`]).
+/// The state the begin- and end-of-block hooks run on
+/// ([`Module::begin_rollup_block_hook`](crate::Module::begin_rollup_block_hook),
+/// [`Module::end_rollup_block_hook`](crate::Module::end_rollup_block_hook)): the block's
+/// checkpoint, unmetered and infallible. User and Kernel state read and write, Accessory state
+/// write only, and the versions ([`VersionReader`]).
 ///
 /// The state transition function lends it over the checkpoint it owns ([`new`](Self::new));
 /// modules never hold the checkpoint itself. So module code cannot reach the storage (to build

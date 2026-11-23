@@ -6,11 +6,13 @@ use rockbound::Schema;
 use selendra_interface::common::HexHash;
 use selendra_interface::stf::{BlobDiscardReason, DiscardedBlob};
 use selendra_state::StateStorageSpec;
+// The state transition function's limit (`selendra-modules-api` refuses a longer key when a
+// module emits the event); the ledger's must be the same constant.
+use selendra_state::metered::MAX_EVENT_KEY_LEN;
 use selendra_state::test_utils::map;
 
 use super::*;
 use crate::harness::{TestDbs, test_slot_info};
-use crate::schema::MAX_EVENT_KEY_LEN;
 use crate::test_utils::blocks::{change_set, dump, key, value};
 use crate::test_utils::{TestDir, tempdir, tempdirs};
 use crate::{DbGroup, StateDbConfig, WitnessMode};
@@ -738,8 +740,15 @@ fn item_number_overflow_is_error() {
     }
 }
 
+// The ledger's event-key limit is the state transition function's (`selendra-state`'s
+// `MAX_EVENT_KEY_LEN`, enforced when a module emits an event), so every event a transaction can
+// keep is stored (`event_key_too_long_is_error`: a key of exactly that length is stored, one
+// byte more is refused).
+const _: () = assert!(crate::schema::MAX_EVENT_KEY_LEN == MAX_EVENT_KEY_LEN);
+
 /// An event key longer than [`MAX_EVENT_KEY_LEN`] is refused when materializing and by the key
-/// encoders and decoders (the `u16` length prefix of `event_by_key` stays exact).
+/// encoders and decoders (the `u16` length prefix of `event_by_key` stays exact); the longest key
+/// the state transition function accepts is stored.
 #[test]
 fn event_key_too_long_is_error() {
     use rockbound::schema::{KeyDecoder, KeyEncoder};
@@ -757,6 +766,12 @@ fn event_key_too_long_is_error() {
         1
     );
 
+    let key = key_of(&longest);
+    assert!(<_ as KeyEncoder<EventCountByKey>>::encode_key(&key).is_ok());
+    assert!(
+        <_ as KeyEncoder<EventByKey>>::encode_key(&(key, TxNumber::ZERO, EventNumber::ZERO))
+            .is_ok()
+    );
     let key = key_of(&too_long);
     assert!(<_ as KeyEncoder<EventCountByKey>>::encode_key(&key).is_err());
     assert!(

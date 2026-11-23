@@ -548,19 +548,94 @@ fn value_too_large_poisons_before_charging() {
     assert!(used > 0);
 }
 
-/// D3 / P5-13: a phase poisoned with budget left (`ValueTooLarge`, `ScopeMisuse`) charges
-/// nothing more and touches no storage: later reads, writes and charges fail with `Poisoned`
-/// before the meter, and add no read and no witness hint.
+/// An event key of [`MAX_EVENT_KEY_LEN`] bytes passes; one more byte fails with
+/// `EventKeyTooLong` and poisons the phase, charging nothing, at the base scope and in a nested
+/// scope. The length is the UTF-8 length (the ledger's measure), not the number of characters.
+#[test]
+fn event_key_too_long_poisons_without_charging() {
+    let longest = "k".repeat(MAX_EVENT_KEY_LEN);
+    // 128 two-byte characters: 256 bytes; one more byte is too long at 129 characters.
+    let longest_utf8 = "\u{e9}".repeat(MAX_EVENT_KEY_LEN / 2);
+    let too_long = format!("{longest_utf8}k");
+    assert_eq!(longest_utf8.len(), MAX_EVENT_KEY_LEN);
+    assert_eq!(too_long.chars().count(), MAX_EVENT_KEY_LEN / 2 + 1);
+
+    let mut tx: Tx = new_tx(storage(), u64::MAX);
+    for key in ["", "k", &longest, &longest_utf8] {
+        assert_eq!(tx.metered().check_event_key(key), Ok(()));
+    }
+    let token = tx.metered().open_scope();
+    assert_eq!(
+        tx.metered().scoped(&token).check_event_key(&longest),
+        Ok(())
+    );
+    assert_eq!(tx.metered().close_scope(token, ScopeEnd::Commit), Ok(()));
+    assert!(!tx.metered_view().is_poisoned());
+    assert_eq!(tx.metered_view().meter().used, COSTS.scope_open);
+
+    let refused = Error::EventKeyTooLong {
+        len: MAX_EVENT_KEY_LEN + 1,
+    };
+    assert_eq!(
+        refused.to_string(),
+        "event key: 257 bytes is more than the maximum of 256"
+    );
+    for nested in [false, true] {
+        let mut tx: Tx = new_tx(storage(), u64::MAX);
+        map().set(&3, &30, &mut tx.metered()).unwrap();
+        let used = tx.metered_view().meter().used;
+        let result = if nested {
+            let token = tx.metered().open_scope();
+            let result = tx.metered().scoped(&token).check_event_key(&too_long);
+            assert_eq!(
+                tx.metered().close_scope(token, ScopeEnd::Commit),
+                Err(Error::Poisoned)
+            );
+            result
+        } else {
+            tx.metered().check_event_key(&too_long)
+        };
+        assert_eq!(result, Err(refused.clone()));
+        let scope_open = if nested { COSTS.scope_open } else { 0 };
+        assert_eq!(tx.metered_view().meter().used, used + scope_open);
+        assert!(tx.metered_view().is_poisoned());
+        // Later accesses, a valid key included, are refused; the first failure is kept.
+        assert_eq!(tx.metered().check_event_key("k"), Err(Error::Poisoned));
+        assert_eq!(
+            tx.metered().check_event_key(&too_long),
+            Err(Error::Poisoned)
+        );
+        assert_eq!(map().get(&3, &mut tx.metered()), Err(Error::Poisoned));
+        let (outcome, accesses, _, _) = finalize_and_freeze(tx, Ok(()));
+        assert_eq!(
+            outcome,
+            PhaseOutcome::Reverted(RevertReason::Poisoned(refused.clone()))
+        );
+        assert_eq!(writes(&accesses), 0);
+    }
+}
+
+/// D3 / P5-13: a phase poisoned with budget left (`ValueTooLarge`, `EventKeyTooLong`,
+/// `ScopeMisuse`) charges nothing more and touches no storage: later reads, writes and charges
+/// fail with `Poisoned` before the meter, and add no read and no witness hint.
 #[test]
 fn poisoned_phase_with_budget_left_touches_nothing() {
     type Poison = fn(&mut Tx);
-    let poisons: [Poison; 2] = [
+    let poisons: [Poison; 3] = [
         |tx| {
             let key = SlotKey::singleton(&Prefix::new(7, 0));
             let too_large = SlotValue::from(vec![0; MAX_STATE_VALUE_SIZE + 1]);
             let result = StateWriter::<User>::set(&mut tx.metered(), &key, too_large);
             assert!(
                 matches!(result, Err(Error::ValueTooLarge { .. })),
+                "{result:?}"
+            );
+        },
+        |tx| {
+            let too_long = "k".repeat(MAX_EVENT_KEY_LEN + 1);
+            let result = tx.metered().check_event_key(&too_long);
+            assert!(
+                matches!(result, Err(Error::EventKeyTooLong { .. })),
                 "{result:?}"
             );
         },
@@ -928,6 +1003,61 @@ fn open_scope_through_a_stale_accessor_charges_nothing() {
     assert_eq!(
         tx.metered().close_scope(token, ScopeEnd::Commit),
         Err(Error::Poisoned)
+    );
+    let (outcome, accesses, _, _) = finalize_and_freeze(tx, Ok(()));
+    assert_eq!(
+        outcome,
+        PhaseOutcome::Reverted(RevertReason::Poisoned(Error::ScopeMisuse))
+    );
+    assert_eq!(writes(&accesses), 0);
+}
+
+/// `check_event_key` enters like any access, before the key is checked: through an accessor
+/// whose scope is no longer open it is `ScopeMisuse` (poisons, charges nothing), and that is
+/// the recorded failure even for a key that is too long; through an enclosing accessor it
+/// reverts a scope left open inside it, so closing that scope later is `ScopeMisuse`.
+#[test]
+fn check_event_key_enters_like_any_access() {
+    let too_long = "k".repeat(MAX_EVENT_KEY_LEN + 1);
+    for key in ["k", too_long.as_str()] {
+        let mut tx: Tx = new_tx(storage(), u64::MAX);
+        let outer = tx.metered().open_scope();
+        let inner = tx.metered().scoped(&outer).open_scope();
+        tx.metered().close_scope(outer, ScopeEnd::Revert).unwrap();
+        assert!(!tx.metered_view().is_poisoned());
+        let used = tx.metered_view().meter().used;
+
+        assert_eq!(
+            tx.metered().scoped(&inner).check_event_key(key),
+            Err(Error::ScopeMisuse)
+        );
+        assert_eq!(tx.metered_view().meter().used, used);
+        assert!(tx.metered_view().is_poisoned());
+        assert_eq!(tx.metered().check_event_key("k"), Err(Error::Poisoned));
+        let (outcome, accesses, _, _) = finalize_and_freeze(tx, Ok(()));
+        assert_eq!(
+            outcome,
+            PhaseOutcome::Reverted(RevertReason::Poisoned(Error::ScopeMisuse))
+        );
+        assert_eq!(writes(&accesses), 0);
+    }
+
+    // A scope left open inside the accessor's is reverted, as by a read.
+    let mut tx: Tx = new_tx(storage(), u64::MAX);
+    map().set(&3, &30, &mut tx.metered()).unwrap();
+    let token = tx.metered().open_scope();
+    map()
+        .set(&4, &40, &mut tx.metered().scoped(&token))
+        .unwrap();
+    assert_eq!(tx.journal_depth(), 2);
+    let used = tx.metered_view().meter().used;
+    assert_eq!(tx.metered().check_event_key("k"), Ok(()));
+    assert_eq!(tx.journal_depth(), 1);
+    assert_eq!(tx.metered_view().meter().used, used);
+    assert!(!tx.metered_view().is_poisoned());
+    assert_eq!(
+        tx.metered().close_scope(token, ScopeEnd::Commit),
+        Err(Error::ScopeMisuse)
     );
     let (outcome, accesses, _, _) = finalize_and_freeze(tx, Ok(()));
     assert_eq!(

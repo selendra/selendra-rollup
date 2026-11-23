@@ -96,8 +96,10 @@ types get a newtype.
 
 `selendra-state`'s `BorshCodec` encodes and decodes consensus types only, so every key and
 value stored with it, in any module and with or without a derive, is one: `StateValue<usize>`
-or `StateMap<u64, f64>` does not compile (E0277). Call messages, events and transactions
-require it as the module system lands.
+or `StateMap<u64, f64>` does not compile (E0277). A module's call messages and events
+(`CallMessage`, `Module::Event`) and a runtime's call type (`DispatchCall::Decodable`) must be
+consensus types too (trait bounds), and `TxDetails` is one; the other transaction types will
+be made consensus types as they land.
 
 Every public borsh type of `selendra-state` is a consensus type, each impl documenting why
 its encoding is canonical and the same on 32 and 64 bits: `Prefix`, `SlotKey`, `SlotValue`,
@@ -231,7 +233,7 @@ checked: an overflow is a `GasOverflow` failure, never a wrap or a panic.
 | `delete` (User, Kernel) | `set` with `len = 0` | – |
 | `set`/`delete` (Accessory) | `accessory_write + accessory_write_per_byte·(key_len + len)` (`len = 0` for a delete) | – |
 | open a nested scope (`open_scope`; `to_revertable`) | `scope_open`, before the scope is pushed | – |
-| emit an event (`EventContainer::add_event`) | `event_base + event_per_byte·(key_len + borsh_len)`, before the event is kept | – |
+| emit an event (`EventContainer::add_event`) | `event_base + event_per_byte·(key_len + borsh_len)`, after the key bound (`key_len` ≤ 256, below), before the event is kept | – |
 
 - A read takes `size` from the transaction's journal, or from the checkpoint's size query
   (in the guest only the value's leaf comes from the witness); an absent value gets no second
@@ -250,11 +252,18 @@ checked: an overflow is a `GasOverflow` failure, never a wrap or a panic.
   `ValueTooLarge`. Genesis writes are metered (`GenesisStateAccessor`, below), so the bound
   applies to them. Unmetered writes (kernel, block hooks) are only checked in debug builds
   until Phase 8.
+- **Event key bound:** an event key of more than `MAX_EVENT_KEY_LEN` = 256 bytes (its UTF-8
+  length, `key.len()`; checked before the event is charged) fails with `EventKeyTooLong`
+  (`MeteredRef::check_event_key`, called by every `EventContainer::add_event`). It is the
+  same constant (`selendra-state`'s) the ledger stores event keys under (`event_by_key`,
+  "Node state databases"), so every event a transaction keeps can be stored: a longer key would
+  make the node fail to materialize the slot.
 
 **Failures and reverts.** A metered phase (`MeteredTx`: pre-execution, or the call with its
 hooks) runs in a base scope of the transaction's journal (`TxScratchpad`) over the block's
 checkpoint.
-- The first failed access (`OutOfGas`, `GasOverflow`, `ValueTooLarge`, `ScopeMisuse`; a
+- The first failed access (`OutOfGas`, `GasOverflow`, `ValueTooLarge`, `EventKeyTooLong`,
+  `ScopeMisuse`; a
   refused scope open included) **poisons** the phase. A refused charge charges nothing. Every
   later access returns `Poisoned` before touching the meter or storage, so it adds neither gas
   nor a witness hint.
@@ -484,7 +493,7 @@ big-endian (`u64`: 8 bytes, `u32`: 4 bytes), so byte order is number order.
 | `slot_by_hash` | `ledger/` | DA block hash (32) | slot number |
 | `batch_by_number`, `tx_by_number`, `event_by_number`, `discarded_blob_by_number` | `ledger/` | item number | borsh `StoredBatch` (hash, tx range, receipt bytes, slot), `StoredTransaction` (hash, event range, `Option` body bytes, receipt bytes, batch), `StoredEvent`, `StoredDiscardedBlob` (`DiscardedBlob`, slot) |
 | `batch_by_hash`, `tx_by_hash`, `discarded_blob_by_hash` | `ledger/` | hash (32) ‖ item number | empty |
-| `event_by_key` | `ledger/` | `u16` key length ‖ event key (at most 256 bytes) ‖ tx number ‖ event number | empty |
+| `event_by_key` | `ledger/` | `u16` key length ‖ event key (at most `MAX_EVENT_KEY_LEN` = 256 bytes: `selendra-state`'s constant, which the state transition function enforces when an event is emitted) ‖ tx number ‖ event number | empty |
 | `event_count_by_key` | `ledger/` | the raw event key | count (`u64` big-endian; no row at 0) |
 | `aggregated_proof_by_slot` | `ledger/` | slot number ‖ `u32` index | the proof bytes |
 | `proof_receipt_by_slot` | `ledger/` | slot number ‖ `u32` index | borsh `([u8; 32], Vec<u8>)`: blob hash, receipt bytes |
@@ -587,8 +596,10 @@ commitment) and the guest decodes them. Every public borsh type is a consensus t
 
 `selendra-modules-api` (Phase 5). Every public borsh type is a consensus type (`Amount`,
 `GasUnit<N>`, `GasPrice<N>`, `BlockGasInfo<G>`, `ModuleId` and every `hash32_id!` type,
-`OperatingMode`, `SequencerType`, `PriorityFeeBips`, `NotInstantiable`, `SelendraSpec`), and a
-spec's `Gas` and `Address` must be (trait bounds).
+`OperatingMode`, `SequencerType`, `PriorityFeeBips`, `TxDetails<S>`, `NotInstantiable`,
+`SelendraSpec`), and a spec's `Gas` and `Address`, a module's call messages and events
+(`Module::CallMessage`: `CallMessage`; `Module::Event`) and a runtime's call type
+(`DispatchCall::Decodable`) must be (trait bounds).
 
 | Type | borsh | JSON (and other human-readable formats) | Binary serde (postcard) |
 |---|---|---|---|
@@ -600,6 +611,7 @@ spec's `Gas` and `Address` must be (trait bounds).
 | `OperatingMode` | one byte, explicit tags: `1` = `Zk`, `2` = `Operator` (`0` never assigned) | `"zk"` / `"operator"` | the variant index |
 | `SequencerType` | one byte: `0` = `Preferred`, `1` = `NonPreferred` | `"Preferred"` / `"NonPreferred"` | the variant index |
 | `PriorityFeeBips` (basis points: `100` = 1%) | `u64` LE | a number | `u64` |
+| `TxDetails<S>` (a transaction's fees, gas limit and runtime version) | `max_priority_fee_bips` (`u64`), `max_fee` (`u128`), `gas_limit` (`Option<S::Gas>`: tag `0`, or tag `1` and the gas), `runtime_version` (`u32`), all LE: 29 bytes without a gas limit, 45 with one (`GasUnit<2>`) | an object with exactly these four fields: `gas_limit` an array or `null` (never missing), `max_fee` an amount string, the others numbers; unknown fields (upstream's `chain_hash_fragment` included) rejected | the fields in order |
 | `NotInstantiable` (call message of a module without calls) | never decodes (no values) | never decodes; schema `null` | never decodes |
 | `SelendraSpec` (a marker) | no bytes | `null` | nothing |
 
@@ -624,6 +636,57 @@ spec's `Gas` and `Address` must be (trait bounds).
   byte per scheme, events). Block and transaction gas limits and the base fee are runtime values
   (Phase 6 `fee-params`), not constants. `SelendraSpec`'s values are placeholders until Phase 6
   calibrates them.
+- **`TxDetails::runtime_version`** selects an entry of the runtime's version table (the spec
+  version and schema hash the signing payload commits to); it replaces upstream's 64-bit
+  `chain_hash_fragment`. Phase 6 adds the fee token and payer (a pre-genesis format change).
+  `Context` and `AuthenticatedTransactionData` are never serialized.
+
+### Modules
+
+A module's identity is two constants of `ModuleInfo`, written once, intrinsic to the module
+type (a module nested in another as a dependency has the same ones):
+
+- **`DISCRIMINANT: u8`** numbers the module for everything: the first byte of every state
+  prefix of the module (`Prefix::new(DISCRIMINANT, item)`), and the tag of its calls and events
+  in the runtime's encodings. Unique within a runtime, never `0`.
+- **`NAME`** (`^[a-z][a-z0-9_]{0,31}$`), unique within a runtime: the key of the module's
+  calls and events in JSON, the first half of its event keys, and the source of its
+  `ModuleId`.
+
+Upstream numbered a module three ways (state prefixes from its Rust path, call tags from its
+position in the runtime, a discriminant from `constants.toml`).
+
+**Module discriminants.**
+
+| Range | For |
+|---|---|
+| 0 | reserved (rejected by the module derive and the runtime's checks) |
+| 1–127 | Selendra's runtime modules (allocated in Phase 6, each pinned by a known-answer test) |
+| 128–223 | other modules (future, applications) |
+| 224–255 | test modules |
+
+Only `0` is enforced: nothing can tell a test module from a production one.
+
+- **State items:** `ModuleInfo::STATE_LAYOUT` lists each item's id (the second prefix byte)
+  and field name; each module pins it with a known-answer test, so renumbering, renaming or
+  dropping an item fails a test.
+- **Dependencies:** `ModuleInfo::DEPENDENCIES` lists the `(DISCRIMINANT, NAME)` of the modules
+  a module holds; each must be a module of the runtime with exactly that pair. The runtime's
+  genesis runs each module after its dependencies (`sort_values_by_modules_dependencies`:
+  duplicates, a missing or mismatched dependency and cycles are errors; the order is
+  deterministic, no hash collections).
+- **Calls and events** of a module are consensus types. A runtime's call type
+  (`DispatchCall::Decodable`) and event type (`RuntimeEventProcessor::RuntimeEvent`) encode as
+  the module's `DISCRIMINANT` byte followed by the module's message (borsh), so adding,
+  removing or reordering modules changes no encoding; an unknown tag does not decode, and
+  `DispatchCall::decode` is `borsh::from_slice` (trailing bytes rejected). In JSON they are
+  externally tagged by the module's `NAME` (the runtime derive generates both; Phase 5).
+- **Event keys** are `"{NAME}/{event_name}"` (`EventEmitter::emit_event`, e.g.
+  `bank/Transfer`), from `ModuleEvent::event_name` (derived from the variant name), never from
+  `Debug` output (upstream's were). An event carries the emitting module's discriminant, by
+  which the runtime maps it to its event type (upstream: by `TypeId`). The key's length is
+  charged with the event, and a key (derived or custom, `emit_event_with_custom_key`) of more
+  than `MAX_EVENT_KEY_LEN` = 256 bytes reverts the call ("Metered state access").
 
 ## Checking
 

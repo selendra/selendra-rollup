@@ -1,9 +1,12 @@
-//! Fee fields of transactions: [`PriorityFeeBips`].
+//! A transaction's details ([`TxDetails`]: fees, gas limit, runtime version) and the
+//! authenticated form the hooks receive ([`AuthenticatedTransactionData`]); the priority fee
+//! ([`PriorityFeeBips`]).
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use serde::{Deserialize, Serialize};
+use selendra_interface::common::ConsensusType;
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::Amount;
+use crate::{Amount, BasicGasMeter, Gas, GasArray, Spec};
 
 /// A priority fee in basis points (1/100 of a percent) of the transaction's gas value: `100` is
 /// 1%, `10_000` is 100%. (Upstream's docs said `1%` is `10_000`, and the `TxDetails` field docs
@@ -88,6 +91,79 @@ impl PriorityFeeBips {
 
 fn div_rem(numerator: u128, denominator: u128) -> (u128, u128) {
     (numerator / denominator, numerator % denominator)
+}
+
+/// A transaction's fee and gas details, and the runtime version it was signed for.
+///
+/// borsh: the fields in order (`max_priority_fee_bips` `u64`, `max_fee` `u128`, `gas_limit` an
+/// option of the spec's gas, `runtime_version` `u32`, all little-endian). JSON: an object with
+/// exactly these four fields (`gas_limit` may be `null` but not missing; unknown fields are
+/// rejected), `max_fee` a decimal string, `gas_limit` the spec's gas (an array of numbers for
+/// [`GasUnit`](crate::GasUnit)) or `null`, the other two numbers. A consensus type.
+///
+/// `runtime_version` selects an entry of the runtime's version table (the spec version and
+/// schema hash the signing payload commits to; Phase 5's transaction formats). It replaces
+/// upstream's `chain_hash_fragment` (64 bits of the UniversalWallet chain hash).
+///
+/// Phase 6 adds the fee token and fee payer (a pre-genesis format change).
+#[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(bound = "S: Spec", deny_unknown_fields)]
+pub struct TxDetails<S: Spec> {
+    /// The most the sequencer may be tipped, in basis points of the gas value
+    /// ([`PriorityFeeBips`]: `100` is 1%).
+    pub max_priority_fee_bips: PriorityFeeBips,
+    /// The most the transaction may pay in fees, in gas token base units.
+    pub max_fee: Amount,
+    /// The most gas the transaction may use, per dimension; at most the block's limit. With
+    /// the gas price it must not cost more than `max_fee`. `None`: the block's limit.
+    #[serde(deserialize_with = "required_option")]
+    pub gas_limit: Option<S::Gas>,
+    /// The runtime version the transaction was signed for.
+    pub runtime_version: u32,
+}
+
+/// Every field is a consensus type.
+impl<S: Spec> ConsensusType for TxDetails<S> {}
+
+/// An `Option` field that must be present (`null` for `None`): one JSON form per value. (Serde's
+/// derive treats a missing `Option` field as `None` unless the field has its own
+/// deserializer.)
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// A transaction's details after authentication: what the authenticator returns and the
+/// transaction hooks receive.
+///
+/// Nothing at the type level proves it was authenticated: authenticators in other crates (the
+/// EVM's, Phase 7) build it too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedTransactionData<S: Spec>(pub TxDetails<S>);
+
+impl<S: Spec> From<TxDetails<S>> for AuthenticatedTransactionData<S> {
+    fn from(details: TxDetails<S>) -> Self {
+        Self(details)
+    }
+}
+
+impl<S: Spec> AuthenticatedTransactionData<S> {
+    /// The transaction's meter: the smaller of its gas limit and `slot_gas_limit` in each
+    /// dimension (`slot_gas_limit` without a gas limit), at `gas_price`, with `max_fee` as its
+    /// funds budget.
+    pub fn gas_meter(
+        &self,
+        gas_price: <S::Gas as Gas>::Price,
+        slot_gas_limit: S::Gas,
+    ) -> BasicGasMeter<S> {
+        let gas_limit = self.0.gas_limit.map_or(slot_gas_limit, |gas_limit| {
+            S::Gas::calculate_min(gas_limit, slot_gas_limit)
+        });
+        BasicGasMeter::new_with_funds_and_gas(self.0.max_fee, gas_limit, gas_price)
+    }
 }
 
 impl From<u64> for PriorityFeeBips {
@@ -198,5 +274,150 @@ mod tests {
             assert!(serde_json::from_str::<PriorityFeeBips>(rejected).is_err());
         }
         assert_eq!(u64::from(PriorityFeeBips::from(7)), 7);
+    }
+
+    type S = crate::test_utils::TestSpec;
+
+    fn details(gas_limit: Option<[u64; 2]>) -> TxDetails<S> {
+        TxDetails {
+            max_priority_fee_bips: PriorityFeeBips(0x0102),
+            max_fee: Amount::new(1000),
+            gas_limit: gas_limit.map(crate::GasUnit::from),
+            runtime_version: 0x0102_0304,
+        }
+    }
+
+    /// Known answers computed independently (`python3 -I -c 'import struct …'`: `<Q`, 16-byte
+    /// LE, option tag, `<Q` per dimension, `<I`).
+    #[test]
+    fn tx_details_borsh_known_answers() {
+        let bytes = borsh::to_vec(&details(Some([5, 0x0607]))).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                2, 1, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 0,
+                0, 0, 0, 0, 0, 0, 7, 6, 0, 0, 0, 0, 0, 0, 4, 3, 2, 1
+            ]
+        );
+        assert_eq!(
+            borsh::from_slice::<TxDetails<S>>(&bytes).unwrap(),
+            details(Some([5, 0x0607]))
+        );
+        let none = TxDetails::<S> {
+            max_priority_fee_bips: PriorityFeeBips::ZERO,
+            max_fee: Amount::MAX,
+            gas_limit: None,
+            runtime_version: 0,
+        };
+        let bytes = borsh::to_vec(&none).unwrap();
+        let mut expected = vec![0u8; 8];
+        expected.extend([255; 16]);
+        expected.extend([0; 5]);
+        assert_eq!(bytes, expected);
+        assert_eq!(borsh::from_slice::<TxDetails<S>>(&bytes).unwrap(), none);
+
+        // Trailing bytes, a truncated encoding and an option tag other than 0/1 are rejected.
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(borsh::from_slice::<TxDetails<S>>(&trailing).is_err());
+        assert!(borsh::from_slice::<TxDetails<S>>(&bytes[..bytes.len() - 1]).is_err());
+        // The tag is flipped in the `Some` encoding: every byte a decoder taking any nonzero tag
+        // as `Some` would read is present, so only the tag check can reject it.
+        let mut bad_tag = borsh::to_vec(&details(Some([5, 0x0607]))).unwrap();
+        assert_eq!(bad_tag[24], 1);
+        bad_tag[24] = 2;
+        assert!(borsh::from_slice::<TxDetails<S>>(&bad_tag).is_err());
+    }
+
+    /// JSON: exactly the four fields, `gas_limit` present (`null` for none), no unknown fields.
+    #[test]
+    fn tx_details_json() {
+        let json = serde_json::to_string(&details(Some([5, 6]))).unwrap();
+        assert_eq!(
+            json,
+            r#"{"max_priority_fee_bips":258,"max_fee":"1000","gas_limit":[5,6],"runtime_version":16909060}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<TxDetails<S>>(&json).unwrap(),
+            details(Some([5, 6]))
+        );
+        let json = serde_json::to_string(&details(None)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"max_priority_fee_bips":258,"max_fee":"1000","gas_limit":null,"runtime_version":16909060}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<TxDetails<S>>(&json).unwrap(),
+            details(None)
+        );
+        for rejected in [
+            // `gas_limit` missing (serde's derive would read it as `None`).
+            r#"{"max_priority_fee_bips":258,"max_fee":"1000","runtime_version":1}"#,
+            // An unknown field.
+            r#"{"max_priority_fee_bips":258,"max_fee":"1000","gas_limit":null,"runtime_version":1,"x":0}"#,
+            // `max_fee` as a number, `runtime_version` above `u32::MAX`.
+            r#"{"max_priority_fee_bips":258,"max_fee":1000,"gas_limit":null,"runtime_version":1}"#,
+            r#"{"max_priority_fee_bips":258,"max_fee":"1000","gas_limit":null,"runtime_version":4294967296}"#,
+            // The upstream field.
+            r#"{"max_priority_fee_bips":258,"max_fee":"1000","gas_limit":null,"chain_hash_fragment":"1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<TxDetails<S>>(rejected).is_err(),
+                "{rejected}"
+            );
+        }
+        let binary = postcard::to_allocvec(&details(Some([1, 2]))).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<TxDetails<S>>(&binary).unwrap(),
+            details(Some([1, 2]))
+        );
+    }
+
+    /// Every value round-trips through borsh, JSON and postcard.
+    #[proptest]
+    fn tx_details_round_trip(
+        fee: u64,
+        max_fee: u128,
+        gas_limit: Option<[u64; 2]>,
+        runtime_version: u32,
+    ) {
+        let details = TxDetails::<S> {
+            max_priority_fee_bips: PriorityFeeBips(fee),
+            max_fee: Amount::new(max_fee),
+            gas_limit: gas_limit.map(crate::GasUnit::from),
+            runtime_version,
+        };
+        let bytes = borsh::to_vec(&details).unwrap();
+        assert_eq!(bytes.len(), if gas_limit.is_some() { 45 } else { 29 });
+        assert_eq!(borsh::from_slice::<TxDetails<S>>(&bytes).unwrap(), details);
+        let json = serde_json::to_string(&details).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TxDetails<S>>(&json).unwrap(),
+            details
+        );
+        let binary = postcard::to_allocvec(&details).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<TxDetails<S>>(&binary).unwrap(),
+            details
+        );
+    }
+
+    /// The meter takes the smaller limit per dimension, the block's without a gas limit, and
+    /// `max_fee` as its budget.
+    #[test]
+    fn authenticated_tx_gas_meter() {
+        let price = crate::GasPrice::from([Amount::new(2), Amount::new(3)]);
+        let slot = crate::GasUnit::from([100, 10]);
+        let tx = AuthenticatedTransactionData::from(details(Some([50, 20])));
+        let meter = tx.gas_meter(price, slot);
+        assert_eq!(meter.remaining_gas(), crate::GasUnit::from([50, 10]));
+        assert_eq!(meter.remaining_funds(), Some(Amount::new(1000)));
+        assert_eq!(meter.gas_price(), price);
+
+        let tx = AuthenticatedTransactionData(details(None));
+        let meter = tx.gas_meter(price, slot);
+        assert_eq!(meter.remaining_gas(), slot);
+        assert_eq!(meter.initial_gas(), slot);
+        assert_eq!(tx.0, details(None));
     }
 }
