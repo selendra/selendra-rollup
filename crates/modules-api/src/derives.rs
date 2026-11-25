@@ -165,12 +165,13 @@ pub use selendra_macros::ModuleEvent;
 /// all consensus types: no `usize`, `isize`, `f32`, `f64`, `HashMap` or `HashSet` at any
 /// depth (`docs/serialization.md`, "Consensus types").
 ///
-/// The impl is bounded by the field types, not by the generic parameters: a generic type is a
-/// consensus type for the parameters that make its fields consensus types, and a
+/// By default the impl is bounded by the field types, not by the generic parameters: a generic
+/// type is a consensus type for the parameters that make its fields consensus types, and a
 /// `PhantomData<S>` field bounds nothing. A field whose type has no generic parameter is
 /// checked where the type is defined; one that has is checked where the type is used with
 /// concrete parameters (as a state value, a call message, an event, …). The check sees through
-/// type aliases and nested types.
+/// type aliases and nested types. `#[consensus_type(bound(…))]` gives the bounds instead (for
+/// generic types that hold each other; below).
 ///
 /// ```
 /// use std::collections::BTreeMap;
@@ -328,8 +329,121 @@ pub use selendra_macros::ModuleEvent;
 /// stored::<Slot<u64>>();
 /// ```
 ///
-/// Unions are a compile error. Two generic types holding each other (`A<T>` holding a `B<T>`
-/// holding an `A<T>`) make the trait solver loop where they are used (E0275).
+/// Unions are a compile error.
+///
+/// # Generic types that hold each other: `#[consensus_type(bound(…))]`
+///
+/// The inferred bounds cannot describe two generic types holding each other (`A<T>` holding a
+/// `B<T>` holding an `A<T>`): `A`'s impl requires `B`'s field type to be a consensus type and
+/// `B`'s requires `A`'s, so the trait solver loops where they are used (E0275):
+///
+/// ```compile_fail,E0275
+/// use selendra_modules_api::*;
+///
+/// #[derive(ConsensusType)]
+/// struct Forest<T> {
+///     groves: Vec<Grove<T>>,
+///     value: T,
+/// }
+///
+/// #[derive(ConsensusType)]
+/// struct Grove<T> {
+///     forest: Option<Box<Forest<T>>>,
+/// }
+///
+/// fn stored<T: ConsensusType>() {}
+/// stored::<Forest<u64>>();
+/// ```
+///
+/// The container attribute `#[consensus_type(bound(PRED, …))]` replaces the inferred bounds by
+/// the given `where` predicates (unquoted; `bound()` gives none): the impl's `where` clause is
+/// the type's own plus exactly those. Every field type, generic or not, is then checked where
+/// the type is defined, under exactly those bounds. So the attribute can make the impl apply
+/// to more or fewer types than the inferred bounds (`bound()` on a type with a `PhantomData<T>`
+/// and an `Option<Box<Self>>` field drops the `T: ConsensusType` the recursive field would
+/// infer), but never to a type whose fields are not consensus types. On one of the two types
+/// (or both), `bound(T: ConsensusType)` breaks the cycle:
+///
+/// ```
+/// use selendra_modules_api::*;
+///
+/// #[derive(ConsensusType)]
+/// #[consensus_type(bound(T: ConsensusType))]
+/// struct Forest<T> {
+///     groves: Vec<Grove<T>>,
+///     value: T,
+/// }
+///
+/// #[derive(ConsensusType)]
+/// struct Grove<T> {
+///     forest: Option<Box<Forest<T>>>,
+/// }
+///
+/// fn stored<T: ConsensusType>() {}
+/// stored::<Forest<u64>>();
+/// stored::<Grove<u64>>();
+/// ```
+///
+/// Predicates may name projections (`bound(S::Address: ConsensusType)`) and any other bound.
+/// The attribute goes on the type, once, with one `bound`; on a type without type parameters it
+/// is an error (no bound is inferred there: every field is checked where the type is defined).
+///
+/// Each of these fails with E0277: a field the bounds do not make a consensus type (`bound()`
+/// with a `T` field fails where the type is defined), and the attributed pair used with
+/// `usize`:
+///
+/// ```compile_fail,E0277
+/// use selendra_modules_api::*;
+///
+/// #[derive(ConsensusType)]
+/// #[consensus_type(bound())]
+/// struct Wrapper<T>(T);
+/// ```
+///
+/// ```compile_fail,E0277
+/// use selendra_modules_api::*;
+///
+/// #[derive(ConsensusType)]
+/// #[consensus_type(bound(T: ConsensusType))]
+/// struct Forest<T> {
+///     groves: Vec<Grove<T>>,
+///     value: T,
+/// }
+///
+/// #[derive(ConsensusType)]
+/// struct Grove<T> {
+///     forest: Option<Box<Forest<T>>>,
+/// }
+///
+/// fn stored<T: ConsensusType>() {}
+/// stored::<Forest<usize>>();
+/// ```
+///
+/// With `bound(T: ConsensusType)` and with `u64`, they compile:
+///
+/// ```
+/// use selendra_modules_api::*;
+///
+/// #[derive(ConsensusType)]
+/// #[consensus_type(bound(T: ConsensusType))]
+/// struct Wrapper<T>(T);
+///
+/// #[derive(ConsensusType)]
+/// #[consensus_type(bound(T: ConsensusType))]
+/// struct Forest<T> {
+///     groves: Vec<Grove<T>>,
+///     value: T,
+/// }
+///
+/// #[derive(ConsensusType)]
+/// struct Grove<T> {
+///     forest: Option<Box<Forest<T>>>,
+/// }
+///
+/// fn stored<T: ConsensusType>() {}
+/// stored::<Wrapper<u64>>();
+/// stored::<Forest<u64>>();
+/// ```
 ///
 /// The derive does not check that `BorshSerialize` never fails, nor that every encoding
 /// decodes (`docs/serialization.md`): those stay review rules.

@@ -5,15 +5,17 @@ use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 
+use crate::ConsensusType;
+
 /// A type with no values: the call message of a module that takes no calls, or the event type
 /// of a module that emits none.
 ///
 /// borsh decoding always fails (every byte string is rejected); there is nothing to encode.
 /// Its JSON schema is `null` (an enum with no variants confuses schema tools).
-#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq, Clone, Copy, ConsensusType,
+)]
 pub enum NotInstantiable {}
-
-selendra_interface::impl_consensus_type!(NotInstantiable);
 
 impl borsh::BorshDeserialize for NotInstantiable {
     fn deserialize_reader<R: borsh::io::Read>(_reader: &mut R) -> borsh::io::Result<Self> {

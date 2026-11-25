@@ -1,12 +1,18 @@
-//! The attributes of `#[derive(ModuleInfo)]`: `#[module_info(discriminant = N, name = "…")]` on
-//! the struct, and one of `#[id]`, `#[state(item = N)]`, `#[module]`, `#[phantom]` on each field.
+//! The derives' attributes: for `#[derive(ModuleInfo)]`,
+//! `#[module_info(discriminant = N, name = "…")]` on the struct and one of `#[id]`,
+//! `#[state(item = N)]`, `#[module]`, `#[phantom]` on each field; for
+//! `#[derive(ConsensusType)]`, an optional `#[consensus_type(bound(…))]` on the type.
 //!
 //! Unknown keys inside these attributes are errors (upstream had keys it accepted and then
 //! hit `unreachable!` on, P5-30); other attributes on a field (doc comments, `#[allow]`,
 //! another derive's) are left alone.
 
 use syn::parse::ParseStream;
-use syn::{Attribute, DeriveInput, Field, Ident, LitInt, LitStr, Meta, Path, Token};
+use syn::punctuated::Punctuated;
+use syn::{
+    Attribute, Data, DeriveInput, Field, Ident, LitInt, LitStr, Meta, Path, Token, WherePredicate,
+    parenthesized, token,
+};
 
 use crate::common;
 
@@ -126,6 +132,95 @@ pub(crate) fn module_attrs(input: &DeriveInput) -> syn::Result<ModuleAttrs> {
         syn::Error::new_spanned(attr, "`#[module_info]` is missing `name = \"…\"`")
     })?;
     Ok(ModuleAttrs { discriminant, name })
+}
+
+const CONSENSUS_TYPE_FORM: &str = "expected `#[consensus_type(bound(…))]`, with unquoted where \
+     predicates inside `bound(…)` (e.g. `bound(T: ConsensusType)`), or none";
+const BOUND_FORM: &str = "expected `bound(…)`, with unquoted where predicates inside (e.g. \
+     `bound(T: ConsensusType)`), or none";
+
+/// A type's `#[consensus_type(bound(…))]`.
+pub(crate) struct ConsensusTypeBound<'a> {
+    /// The attribute (for errors).
+    pub(crate) attr: &'a Attribute,
+    /// The where predicates inside `bound(…)` (possibly none).
+    pub(crate) predicates: Punctuated<WherePredicate, Token![,]>,
+}
+
+/// Parses the type's optional `#[consensus_type(bound(…))]` (`None` without it). The attribute
+/// goes on the type only: one on a field or a variant is an error (it would otherwise be
+/// ignored).
+pub(crate) fn consensus_type_bound(
+    input: &DeriveInput,
+) -> syn::Result<Option<ConsensusTypeBound<'_>>> {
+    let inner_attrs: Vec<&Attribute> = match &input.data {
+        Data::Struct(data) => data.fields.iter().flat_map(|field| &field.attrs).collect(),
+        Data::Enum(data) => data
+            .variants
+            .iter()
+            .flat_map(|variant| {
+                variant
+                    .attrs
+                    .iter()
+                    .chain(variant.fields.iter().flat_map(|field| &field.attrs))
+            })
+            .collect(),
+        // Rejected by the derive before its attributes are read.
+        Data::Union(_) => Vec::new(),
+    };
+    if let Some(attr) = inner_attrs
+        .into_iter()
+        .find(|attr| attr.path().is_ident("consensus_type"))
+    {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[consensus_type]` goes on the type, not on a field or a variant",
+        ));
+    }
+
+    let mut found: Option<&Attribute> = None;
+    for attr in &input.attrs {
+        if attr.path().is_ident("consensus_type") {
+            if found.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "duplicate `#[consensus_type]` attribute",
+                ));
+            }
+            found = Some(attr);
+        }
+    }
+    let Some(attr) = found else {
+        return Ok(None);
+    };
+    let Meta::List(_) = &attr.meta else {
+        return Err(syn::Error::new_spanned(attr, CONSENSUS_TYPE_FORM));
+    };
+
+    let mut bound = None;
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("bound") {
+            if bound.is_some() {
+                return Err(meta.error("duplicate `bound` in `#[consensus_type]`"));
+            }
+            if !meta.input.peek(token::Paren) {
+                return Err(meta.error(BOUND_FORM));
+            }
+            let content;
+            parenthesized!(content in meta.input);
+            bound = Some(Punctuated::<WherePredicate, Token![,]>::parse_terminated(
+                &content,
+            )?);
+            Ok(())
+        } else {
+            Err(meta.error(format!(
+                "unknown key `{}` in `#[consensus_type]`: expected `bound`",
+                path_name(&meta.path)
+            )))
+        }
+    })?;
+    let predicates = bound.ok_or_else(|| syn::Error::new_spanned(attr, CONSENSUS_TYPE_FORM))?;
+    Ok(Some(ConsensusTypeBound { attr, predicates }))
 }
 
 /// Parses the attribute that says what `field` (named `ident`) is.

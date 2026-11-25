@@ -45,9 +45,10 @@ pub fn derive_module_event(input: TokenStream) -> TokenStream {
     expand(module_event::derive(&input))
 }
 
-/// Derives `ConsensusType` for a struct or enum whose fields are all consensus types. See
-/// `selendra_modules_api::ConsensusType`.
-#[proc_macro_derive(ConsensusType)]
+/// Derives `ConsensusType` for a struct or enum whose fields are all consensus types, with
+/// bounds inferred from the field types, or given by `#[consensus_type(bound(…))]` (for
+/// generic types that contain each other). See `selendra_modules_api::ConsensusType`.
+#[proc_macro_derive(ConsensusType, attributes(consensus_type))]
 pub fn derive_consensus_type(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(consensus_type::derive(&input))

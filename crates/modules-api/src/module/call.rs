@@ -17,19 +17,16 @@ use serde::de::DeserializeOwned;
 /// decoded in the state transition.
 ///
 /// A call message whose fields are not all consensus types is not a `CallMessage` (E0277; the
-/// `ConsensusType` impl is what `#[derive(ConsensusType)]` writes, bounded on the parameter):
+/// derived `ConsensusType` impl is bounded by the field types, so `Transfer<usize>` is not one):
 ///
 /// ```compile_fail,E0277
 /// use selendra_modules_api::*;
-/// use selendra_interface::common::ConsensusType;
 ///
 /// #[derive(Debug, Clone, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
-/// #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+/// #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema, ConsensusType)]
 /// struct Transfer<T> {
 ///     amount: T,
 /// }
-///
-/// impl<T: ConsensusType> ConsensusType for Transfer<T> {}
 ///
 /// fn call_message<C: CallMessage>() {}
 /// call_message::<Transfer<usize>>();
@@ -37,15 +34,12 @@ use serde::de::DeserializeOwned;
 ///
 /// ```
 /// use selendra_modules_api::*;
-/// use selendra_interface::common::ConsensusType;
 ///
 /// #[derive(Debug, Clone, PartialEq, Eq, borsh::BorshSerialize, borsh::BorshDeserialize)]
-/// #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+/// #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema, ConsensusType)]
 /// struct Transfer<T> {
 ///     amount: T,
 /// }
-///
-/// impl<T: ConsensusType> ConsensusType for Transfer<T> {}
 ///
 /// fn call_message<C: CallMessage>() {}
 /// call_message::<Transfer<u64>>();

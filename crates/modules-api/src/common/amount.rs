@@ -6,6 +6,8 @@ use std::str::FromStr;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::ConsensusType;
+
 /// The number of decimal digits of `u128::MAX` (39), upstream's bound on token decimals.
 ///
 /// A token with this many decimals cannot hold one whole token (`10^39 > u128::MAX`); the
@@ -22,15 +24,23 @@ pub const MAX_U128_DECIMAL_PLACES: u8 = 39;
 ///   `u128::from_str`, which also accepts `"+1"` and `"01"`, so one amount had many spellings.
 /// - Binary serde formats: the `u128`.
 #[derive(
-    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, BorshSerialize, BorshDeserialize,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    BorshSerialize,
+    BorshDeserialize,
+    ConsensusType,
 )]
 #[cfg_attr(
     feature = "arbitrary",
     derive(arbitrary::Arbitrary, proptest_derive::Arbitrary)
 )]
 pub struct Amount(pub u128);
-
-selendra_interface::impl_consensus_type!(Amount);
 
 impl Amount {
     /// The largest amount.

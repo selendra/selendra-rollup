@@ -3,6 +3,8 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+use crate::ConsensusType;
+
 /// How the rollup is secured: zk proofs, or a trusted operator (launch).
 ///
 /// borsh: one byte, the explicit tag (`1` = `Zk`, `2` = `Operator`); `0` is never assigned
@@ -19,6 +21,7 @@ use serde::{Deserialize, Serialize};
     Copy,
     Clone,
     Hash,
+    ConsensusType,
 )]
 #[cfg_attr(
     feature = "arbitrary",
@@ -33,8 +36,6 @@ pub enum OperatingMode {
     /// A trusted operator runs the rollup (launch, before provers).
     Operator = 2,
 }
-
-selendra_interface::impl_consensus_type!(OperatingMode);
 
 #[cfg(test)]
 mod tests {

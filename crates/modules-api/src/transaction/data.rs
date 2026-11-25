@@ -3,10 +3,9 @@
 //! ([`PriorityFeeBips`]).
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use selendra_interface::common::ConsensusType;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::{Amount, BasicGasMeter, Gas, GasArray, Spec};
+use crate::{Amount, BasicGasMeter, ConsensusType, Gas, GasArray, Spec};
 
 /// A priority fee in basis points (1/100 of a percent) of the transaction's gas value: `100` is
 /// 1%, `10_000` is 100%. (Upstream's docs said `1%` is `10_000`, and the `TxDetails` field docs
@@ -26,14 +25,13 @@ use crate::{Amount, BasicGasMeter, Gas, GasArray, Spec};
     PartialOrd,
     Ord,
     Hash,
+    ConsensusType,
 )]
 #[cfg_attr(
     feature = "arbitrary",
     derive(arbitrary::Arbitrary, proptest_derive::Arbitrary)
 )]
 pub struct PriorityFeeBips(pub u64);
-
-selendra_interface::impl_consensus_type!(PriorityFeeBips);
 
 /// Applying the priority fee overflows `u128`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

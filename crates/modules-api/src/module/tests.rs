@@ -39,6 +39,7 @@ const PLAIN: u8 = 226;
     Serialize,
     Deserialize,
     schemars::JsonSchema,
+    ConsensusType,
 )]
 #[serde(rename_all = "snake_case")]
 enum CounterCall {
@@ -51,8 +52,6 @@ enum CounterCall {
     },
 }
 
-selendra_interface::impl_consensus_type!(CounterCall);
-
 #[derive(
     Clone,
     PartialEq,
@@ -62,13 +61,12 @@ selendra_interface::impl_consensus_type!(CounterCall);
     Serialize,
     Deserialize,
     schemars::JsonSchema,
+    ConsensusType,
 )]
 enum CounterEvent {
     Added { by: u64, total: u64 },
     Reset,
 }
-
-selendra_interface::impl_consensus_type!(CounterEvent);
 
 /// Not the derived `Debug`: upstream's event key was the first identifier of this (`counter`).
 impl fmt::Debug for CounterEvent {
@@ -195,14 +193,13 @@ impl<S: Spec> Module for Counter<S> {
     Serialize,
     Deserialize,
     schemars::JsonSchema,
+    ConsensusType,
 )]
 #[serde(rename_all = "snake_case")]
 enum HookedCall {
     /// Adds to the counter through the nested module.
     Forward(u64),
 }
-
-selendra_interface::impl_consensus_type!(HookedCall);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize)]
 #[serde(tag = "error_code", rename_all = "snake_case")]
@@ -409,14 +406,12 @@ struct TestRuntime<S: Spec> {
     counter: Counter<S>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConsensusType)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum TestRuntimeCall {
     Hooked(HookedCall),
     Counter(CounterCall),
 }
-
-selendra_interface::impl_consensus_type!(TestRuntimeCall);
 
 impl BorshSerialize for TestRuntimeCall {
     fn serialize<W: borsh::io::Write>(&self, writer: &mut W) -> borsh::io::Result<()> {

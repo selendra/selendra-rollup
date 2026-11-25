@@ -11,6 +11,8 @@ mod module_utils;
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+use crate::ConsensusType;
+
 pub use amount::{Amount, MAX_U128_DECIMAL_PLACES, ParseAmountError};
 #[cfg(feature = "native")]
 pub use crypto::PrivateKeyExt;
@@ -39,6 +41,7 @@ pub use module_utils::NotInstantiable;
     BorshDeserialize,
     Serialize,
     Deserialize,
+    ConsensusType,
 )]
 #[cfg_attr(
     feature = "arbitrary",
@@ -50,8 +53,6 @@ pub enum SequencerType {
     /// Any other sequencer: registered normally, or through an emergency registration.
     NonPreferred,
 }
-
-selendra_interface::impl_consensus_type!(SequencerType);
 
 #[cfg(test)]
 mod tests {

@@ -100,8 +100,19 @@ are, so `Wrapper<usize>` is not, and a `PhantomData<S>` field bounds nothing. A 
 without generic parameters is checked where the type is defined (E0277 there, e.g. a `usize`
 field or a field of an alias to `f64`); a field type with generic parameters is checked where
 the type is used with concrete ones (as a state value, call message, event, …). Recursive
-types (`Option<Box<Self>>`, `Vec<Tree<T>>`) are supported; two generic types holding each
-other are not (the trait solver loops, E0275, where they are used).
+types (`Option<Box<Self>>`, `Vec<Tree<T>>`) are supported. Two generic types holding each
+other (`A<T>` holding a `B<T>` holding an `A<T>`) are not, with the inferred bounds alone: each
+impl is bounded by the other's field type, and the trait solver loops (E0275) where they are
+used. For them, the container attribute `#[consensus_type(bound(PRED, …))]` (unquoted where
+predicates; `bound()` for none) replaces the inferred bounds: the impl's `where` clause is the
+type's own plus exactly those predicates, and every field type, generic or not, is checked where
+the type is defined under exactly those bounds. So the attribute decides how widely the impl
+applies, more or fewer types than the inferred bounds (`bound()` drops the bound a recursive
+field puts on the parameters it mentions), but never to a type whose fields are not consensus
+types (`#[consensus_type(bound())] struct W<T>(T);` fails with E0277 at the definition).
+`bound(T: ConsensusType)` on one type of the pair (or both) breaks the cycle. `bound` on a type
+without type parameters is an error (no bound is inferred there). The derive is a marker impl
+only: it never changes an encoding.
 
 `selendra-state`'s `BorshCodec` encodes and decodes consensus types only, so every key and
 value stored with it, in any module and with or without a derive, is one: `StateValue<usize>`

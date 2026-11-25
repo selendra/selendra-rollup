@@ -652,6 +652,245 @@ fn consensus_type_bounds_the_parameters_of_recursive_fields() {
     );
 }
 
+fn consensus_type_tokens(input: DeriveInput) -> String {
+    match consensus_type::derive(&input) {
+        Ok(tokens) => tokens.to_string(),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+fn consensus_type_error(input: DeriveInput) -> String {
+    match consensus_type::derive(&input) {
+        Ok(tokens) => panic!("expected an error, got {tokens}"),
+        Err(error) => error.to_string(),
+    }
+}
+
+/// `#[consensus_type(bound(…))]`: the impl's `where` clause is the type's own plus exactly the
+/// given predicates (no inferred bound), and every field type, recursive or not, generic or
+/// not, is checked under that `where` clause, with `Self` written out in the function.
+#[test]
+fn consensus_type_bound_replaces_the_inferred_bounds() {
+    let tokens = consensus_type_tokens(parse_quote! {
+        #[consensus_type(bound(T: Clone, Self: Sized))]
+        struct Node<T: Default>
+        where
+            T: Eq,
+        {
+            values: Vec<T>,
+            count: u64,
+            next: Option<Box<Self>>,
+        }
+    });
+    assert!(
+        tokens.contains(
+            "impl < T : Default > :: selendra_modules_api :: __private :: ConsensusType for \
+             Node < T > where T : Eq , T : Clone , Self : Sized { }"
+        ),
+        "{tokens}"
+    );
+    assert!(
+        tokens.contains(
+            "fn check_fields < T > () where T : Default , T : Eq , T : Clone , Node < T > : \
+             Sized {"
+        ),
+        "{tokens}"
+    );
+    for checked in [
+        "consensus_type :: < Vec < T > > ()",
+        "consensus_type :: < u64 > ()",
+        "consensus_type :: < Option < Box < Node < T > > > > ()",
+    ] {
+        assert!(tokens.contains(checked), "{checked}: {tokens}");
+    }
+    assert!(!tokens.contains("ConsensusType ,"), "{tokens}");
+    assert!(!tokens.contains("> : :: selendra_modules_api"), "{tokens}");
+}
+
+/// `bound()` adds no predicate: the impl has the type's own bounds only (none here), and the
+/// fields are still checked.
+#[test]
+fn consensus_type_empty_bound_adds_no_predicate() {
+    let tokens = consensus_type_tokens(parse_quote! {
+        #[consensus_type(bound())]
+        enum Slot<T> {
+            Empty,
+            Marked(PhantomData<T>),
+        }
+    });
+    assert!(
+        tokens.contains(
+            "impl < T > :: selendra_modules_api :: __private :: ConsensusType for Slot < T > { }"
+        ),
+        "{tokens}"
+    );
+    assert!(tokens.contains("fn check_fields < T > () {"), "{tokens}");
+    assert!(
+        tokens.contains("consensus_type :: < PhantomData < T > > ()"),
+        "{tokens}"
+    );
+    // Trailing commas, lifetimes, const parameters and higher-ranked predicates are accepted.
+    let tokens = consensus_type_tokens(parse_quote! {
+        #[consensus_type(bound(T: ConsensusType, for<'b> &'b T: Clone,))]
+        struct Fixed<'a, T, const N: usize> {
+            values: [T; N],
+            marker: PhantomData<&'a ()>,
+        }
+    });
+    assert!(
+        tokens.contains("where T : ConsensusType , for < 'b > & 'b T : Clone { }"),
+        "{tokens}"
+    );
+}
+
+#[test]
+fn consensus_type_attribute_forms_are_checked() {
+    let form = "expected `#[consensus_type(bound(…))]`, with unquoted where predicates inside \
+                `bound(…)` (e.g. `bound(T: ConsensusType)`), or none";
+    let bound_form = "expected `bound(…)`, with unquoted where predicates inside (e.g. \
+                      `bound(T: ConsensusType)`), or none";
+    let cases: [(TokenStream, &str); 9] = [
+        (quote!(#[consensus_type]), form),
+        (quote!(#[consensus_type = "T: ConsensusType"]), form),
+        (quote!(#[consensus_type()]), form),
+        (quote!(#[consensus_type(bound)]), bound_form),
+        (
+            quote!(#[consensus_type(bound = "T: ConsensusType")]),
+            bound_form,
+        ),
+        (
+            quote!(#[consensus_type(bound[T: ConsensusType])]),
+            bound_form,
+        ),
+        (
+            quote!(#[consensus_type(bound(T: ConsensusType), bound())]),
+            "duplicate `bound` in `#[consensus_type]`",
+        ),
+        (
+            quote!(#[consensus_type(bounds(T: ConsensusType))]),
+            "unknown key `bounds` in `#[consensus_type]`: expected `bound`",
+        ),
+        (
+            quote!(#[consensus_type(bound(T: ConsensusType), skip)]),
+            "unknown key `skip` in `#[consensus_type]`: expected `bound`",
+        ),
+    ];
+    for (attr, message) in cases {
+        let input = parse_quote! {
+            #attr
+            struct Wrapper<T>(T);
+        };
+        assert_eq!(consensus_type_error(input), message, "{attr}");
+    }
+}
+
+/// A predicate that does not parse is syn's error, spanned at it (a quoted one included: the
+/// predicates are written unquoted).
+#[test]
+fn consensus_type_malformed_predicates_are_rejected() {
+    let not_a_type = "expected one of: `for`, parentheses, `unsafe`, `fn`, `extern`, identifier, \
+                      `::`, `<`, `dyn`, square brackets, `*`, `&`, `!`, `impl`, `_`, lifetime";
+    let cases: [(TokenStream, &str); 5] = [
+        (quote!(bound(T)), "expected `:`"),
+        (quote!(bound("T: ConsensusType")), not_a_type),
+        (quote!(bound(T: ConsensusType,,)), not_a_type),
+        (quote!(bound(T: ConsensusType;)), "expected `,`"),
+        (quote!(bound(T: ConsensusType) extra), "expected `,`"),
+    ];
+    for (inner, message) in cases {
+        let input = parse_quote! {
+            #[consensus_type(#inner)]
+            struct Wrapper<T>(T);
+        };
+        assert_eq!(consensus_type_error(input), message, "{inner}");
+    }
+}
+
+#[test]
+fn duplicate_consensus_type_attribute_is_rejected() {
+    let input = parse_quote! {
+        #[consensus_type(bound(T: ConsensusType))]
+        #[consensus_type(bound())]
+        struct Wrapper<T>(T);
+    };
+    assert_eq!(
+        consensus_type_error(input),
+        "duplicate `#[consensus_type]` attribute"
+    );
+}
+
+/// The attribute is read on the type only: on a field or a variant it would be ignored, so it
+/// is an error there.
+#[test]
+fn consensus_type_attribute_on_a_field_or_variant_is_rejected() {
+    let message = "`#[consensus_type]` goes on the type, not on a field or a variant";
+    let inputs: [DeriveInput; 3] = [
+        parse_quote! {
+            struct Wrapper<T>(#[consensus_type(bound())] T);
+        },
+        parse_quote! {
+            enum Slot<T> {
+                #[consensus_type(bound())]
+                Value(T),
+            }
+        },
+        parse_quote! {
+            enum Slot<T> {
+                Value {
+                    #[consensus_type(bound())]
+                    value: T,
+                },
+            }
+        },
+    ];
+    for input in inputs {
+        assert_eq!(consensus_type_error(input), message);
+    }
+}
+
+/// Without type parameters no bound is inferred (every field is checked at the definition):
+/// `bound` would replace nothing, so it is an error (lifetimes and const parameters included).
+#[test]
+fn consensus_type_bound_needs_a_type_parameter() {
+    let inputs: [DeriveInput; 3] = [
+        parse_quote! {
+            #[consensus_type(bound())]
+            struct Plain(u64);
+        },
+        parse_quote! {
+            #[consensus_type(bound(u64: Copy))]
+            enum Plain {}
+        },
+        parse_quote! {
+            #[consensus_type(bound())]
+            struct Plain<'a, const N: usize>(PhantomData<&'a [u8; N]>);
+        },
+    ];
+    for input in inputs {
+        assert_eq!(
+            consensus_type_error(input),
+            "`bound` is for types with type parameters: `Plain` has none, so no bound is \
+             inferred (every field is checked where the type is defined)"
+        );
+    }
+}
+
+/// Other attributes are left alone, and the derive without `#[consensus_type]` infers its
+/// bounds as before.
+#[test]
+fn consensus_type_ignores_foreign_attributes() {
+    let tokens = consensus_type_tokens(parse_quote! {
+        /// Documented.
+        #[allow(dead_code)]
+        #[serde(bound = "")]
+        struct Wrapper<T>(#[allow(unused)] Vec<T>);
+    });
+    assert!(
+        tokens.contains("where Vec < T > : :: selendra_modules_api :: __private :: ConsensusType"),
+        "{tokens}"
+    );
+}
+
 // -------------------------------------------------------------------------------------------
 // Regressions of upstream's module macro bugs
 
