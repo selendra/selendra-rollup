@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use proc_macro2::{Ident, Literal, TokenStream};
 use quote::quote;
-use syn::{Data, DataStruct, DeriveInput, Field, Fields, GenericParam, Generics, Type};
+use syn::{Data, DataStruct, DeriveInput, Field, Fields, Type};
 
 use crate::attrs::{self, FieldKind};
 use crate::common;
@@ -29,7 +29,7 @@ use crate::common;
 /// The tokens implementing `ModuleInfo` and `Default` for `input`.
 pub(crate) fn derive(input: &DeriveInput) -> syn::Result<TokenStream> {
     let fields = named_fields(input)?;
-    let spec = spec_param(&input.generics, &input.ident)?;
+    let spec = common::spec_param(&input.generics, &input.ident, "module")?;
     let attrs::ModuleAttrs { discriminant, name } = attrs::module_attrs(input)?;
 
     let private = common::private();
@@ -166,28 +166,6 @@ fn named_fields(input: &DeriveInput) -> syn::Result<Vec<&Field>> {
         }) => Err(syn::Error::new_spanned(fields, NAMED_FIELDS_ONLY)),
         Data::Enum(data) => Err(syn::Error::new_spanned(data.enum_token, NAMED_FIELDS_ONLY)),
         Data::Union(data) => Err(syn::Error::new_spanned(data.union_token, NAMED_FIELDS_ONLY)),
-    }
-}
-
-/// The module's spec: its first generic parameter, which must be a type.
-fn spec_param<'a>(generics: &'a Generics, ident: &Ident) -> syn::Result<&'a Ident> {
-    const NOT_FIRST: &str =
-        "the first generic parameter of a module must be its spec type (`S: Spec`)";
-    match generics.params.first() {
-        Some(GenericParam::Type(param)) => Ok(&param.ident),
-        Some(GenericParam::Lifetime(param)) => Err(syn::Error::new_spanned(
-            param,
-            format!("{NOT_FIRST}, not a lifetime"),
-        )),
-        Some(GenericParam::Const(param)) => Err(syn::Error::new_spanned(
-            param,
-            format!("{NOT_FIRST}, not a const parameter"),
-        )),
-        None => Err(syn::Error::new(
-            ident.span(),
-            "a module is generic over its spec: `struct Module<S: Spec>` (the first generic \
-             parameter)",
-        )),
     }
 }
 

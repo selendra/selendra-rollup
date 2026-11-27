@@ -18,8 +18,13 @@
 //!   [`GasSchedule`], and how an account is derived from the key that signs ([`Credential`],
 //!   [`AccountAddress`]);
 //! - the derives: [`ModuleInfo`](macro@ModuleInfo) (a module's identity and state layout),
-//!   [`ModuleEvent`](macro@ModuleEvent) (its events' names) and
-//!   [`ConsensusType`](macro@ConsensusType) (a type allowed in consensus data);
+//!   [`ModuleEvent`](macro@ModuleEvent) (its events' names), the runtime's
+//!   ([`DispatchCall`](macro@DispatchCall) and its call type, [`MessageCodec`](macro@MessageCodec),
+//!   [`Genesis`](macro@Genesis) and its configuration type, [`Event`](macro@Event) and its event
+//!   type, [`Hooks`](macro@Hooks)) and [`ConsensusType`](macro@ConsensusType) (a type allowed in
+//!   consensus data);
+//! - [`check_layout`]: the rules between a runtime's modules ([`LayoutError`]), which the
+//!   runtime derives check at compile time;
 //! - [`hooks`]: a runtime's hooks ([`TxHooks`], [`BlockHooks`], [`FinalizeHook`]);
 //! - [`sort_values_by_modules_dependencies`]: the order of the modules' genesis (dependencies
 //!   first, [`ModuleDescriptor`]);
@@ -55,6 +60,8 @@ mod dependencies;
 mod derives;
 pub mod gas;
 pub mod hooks;
+mod layout;
+mod macro_support;
 pub mod module;
 pub mod runtime;
 pub mod state;
@@ -82,8 +89,11 @@ pub use common::{
 pub use dependencies::{
     DependencyError, ModuleDescriptor, ModuleKey, sort_values_by_modules_dependencies,
 };
-// The derives share their traits' names (another namespace: one `use` brings both).
-pub use derives::{ConsensusType, ModuleEvent, ModuleInfo};
+// The derives share their traits' names where there is one (another namespace: one `use`
+// brings both).
+pub use derives::{
+    ConsensusType, DispatchCall, Event, Genesis, Hooks, MessageCodec, ModuleEvent, ModuleInfo,
+};
 pub use gas::{
     BasicGasMeter, BlockGasInfo, Fraction, GAS_DIMENSIONS, Gas, GasArray, GasInfo, GasMeter,
     GasMeteringError, GasPrice, GasUnit, ImpossibleToRefundGasDetails, MeteredBorshDeserialize,
@@ -91,6 +101,7 @@ pub use gas::{
     PREFERRED_DATA_FRACTION, SlotGasMeter, SlotOutOfGasDetails, TxMeter, UnlimitedGasMeter,
 };
 pub use hooks::{BlockHooks, FinalizeHook, TxHooks};
+pub use layout::{LayoutError, check_layout};
 pub use module::{
     AccountAddress, CallMessage, Context, Credential, CryptoSpecExt, DispatchCall, EncodeCall,
     EventEmitter, GasSchedule, Genesis, MAX_EVENT_NAME_LEN, MAX_MODULE_NAME_LEN, Module,
@@ -128,14 +139,28 @@ pub mod __private {
     pub use arbitrary;
     #[cfg(feature = "arbitrary")]
     pub use proptest;
-    pub use selendra_interface::common::ConsensusType;
+    pub use selendra_interface::da::DaSpec;
     pub use selendra_primitives::bech32;
-    pub use selendra_state::Prefix;
+    pub use selendra_state::{AccessoryStateReaderAndWriter, Prefix, Storage};
+    pub use std::borrow::Cow;
+    pub use std::vec::Vec;
     pub use {borsh, schemars, serde, serde_json};
 
-    pub use crate::{MAX_EVENT_NAME_LEN, ModuleEvent, ModuleId, ModuleInfo, Spec, StateItem};
+    pub use crate::macro_support::{
+        GenesisConfigFields, MessageEnum, deserialize_genesis_config, deserialize_message,
+        fill_element, fill_slot, messages_schema, no_field_at, no_module_with, take_slot,
+        unknown_module_tag,
+    };
+    pub use crate::transaction::AuthenticatedTransactionData;
+    // `ConsensusType` is the trait and its derive.
+    pub use crate::{
+        BlockHooks, BlockState, ConsensusType, Context, DispatchCall, EncodeCall, FinalizeHook,
+        Genesis, GenesisState, MAX_EVENT_NAME_LEN, Module, ModuleDescriptor, ModuleError,
+        ModuleEvent, ModuleId, ModuleInfo, ModuleMessage, RuntimeEventProcessor, Spec, StateItem,
+        TxHooks, TxState, TypeErasedEvent, sort_values_by_modules_dependencies,
+    };
 
     /// Compiles only if the module `M` runs with the spec `S`: `#[derive(ModuleInfo)]` checks
-    /// each `#[module]` field with it.
+    /// each `#[module]` field with it, the runtime derives each module of the runtime.
     pub const fn same_spec<M: ModuleInfo<Spec = S>, S: Spec>() {}
 }

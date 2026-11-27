@@ -2,7 +2,8 @@
 //! module and runtime derives generate): module identity and layout, genesis in dependency
 //! order, calls decoded and dispatched through `TxState` with the module's error passed through,
 //! events emitted with each module's own discriminant and key, the hooks (no-ops unless
-//! overridden; a runtime calling them in field order), and `Context`.
+//! overridden; a runtime calling them in field order), and `Context`; and the same runtime
+//! derived, against the hand-written one.
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -461,6 +462,11 @@ impl<S: Spec> DispatchCall for TestRuntime<S> {
     type Spec = S;
     type Decodable = TestRuntimeCall;
 
+    const MODULES: &'static [ModuleDescriptor] = &[
+        ModuleDescriptor::of::<Hooked<S>>(),
+        ModuleDescriptor::of::<Counter<S>>(),
+    ];
+
     fn dispatch_call<T: TxState<S>>(
         &mut self,
         call: TestRuntimeCall,
@@ -520,6 +526,8 @@ impl<S: Spec> Genesis for TestRuntime<S> {
         config: &TestGenesisConfig,
         state: &mut impl GenesisState<S>,
     ) -> Result<(), ModuleError> {
+        let () = <Self as DispatchCall>::__CHECK_LAYOUT;
+        Self::validate_layout()?;
         let order = sort_values_by_modules_dependencies(vec![
             (ModuleDescriptor::of::<Hooked<S>>(), Field::Hooked),
             (ModuleDescriptor::of::<Counter<S>>(), Field::Counter),
@@ -1352,4 +1360,154 @@ fn module_bounds() {
     module::<Plain<S>>();
     fn runtime<R: DispatchCall + Genesis + TxHooks + BlockHooks + FinalizeHook>() {}
     runtime::<TestRuntime<S>>();
+}
+
+// -------------------------------------------------------------------------------------------
+// The derived runtime
+
+/// The test runtime, derived.
+#[derive(Debug, Clone, Default, DispatchCall, MessageCodec, Genesis, Event, Hooks)]
+struct DerivedRuntime<S: Spec> {
+    hooked: Hooked<S>,
+    counter: Counter<S>,
+}
+
+/// What the runtime derives generate is what the hand-written runtime does (the way S7 wrote
+/// it before the derives): the modules, the call encodings (borsh and JSON, both ways), the
+/// event encodings and mapping, the genesis state, dispatch and the hooks' state changes.
+#[test]
+fn derive_matches_hand_written_runtime() {
+    type D = DerivedRuntime<S>;
+    type H = TestRuntime<S>;
+    assert_eq!(D::MODULES, H::MODULES);
+    assert_eq!(D::validate_layout(), Ok(()));
+
+    let calls = [
+        (
+            DerivedRuntimeCall::Counter(CounterCall::Add(5)),
+            TestRuntimeCall::Counter(CounterCall::Add(5)),
+        ),
+        (
+            DerivedRuntimeCall::Counter(CounterCall::Reset),
+            TestRuntimeCall::Counter(CounterCall::Reset),
+        ),
+        (
+            DerivedRuntimeCall::Counter(CounterCall::AddTagged {
+                by: 2,
+                tag: "t".to_owned(),
+            }),
+            TestRuntimeCall::Counter(CounterCall::AddTagged {
+                by: 2,
+                tag: "t".to_owned(),
+            }),
+        ),
+        (
+            DerivedRuntimeCall::Hooked(HookedCall::Forward(7)),
+            TestRuntimeCall::Hooked(HookedCall::Forward(7)),
+        ),
+    ];
+    for (derived, hand) in &calls {
+        let bytes = D::encode(derived).unwrap();
+        assert_eq!(bytes, H::encode(hand).unwrap());
+        assert_eq!(&H::decode(&bytes).unwrap(), hand);
+        assert_eq!(&D::decode(&bytes).unwrap(), derived);
+        let json = serde_json::to_string(derived).unwrap();
+        assert_eq!(json, serde_json::to_string(hand).unwrap());
+        assert_eq!(
+            &serde_json::from_str::<TestRuntimeCall>(&json).unwrap(),
+            hand
+        );
+        assert_eq!(
+            (derived.module_discriminant(), derived.module_name()),
+            (hand.module_discriminant(), hand.module_name())
+        );
+    }
+    assert_eq!(
+        <D as EncodeCall<Counter<S>>>::encode_call(CounterCall::Add(5)).unwrap(),
+        <H as EncodeCall<Counter<S>>>::encode_call(CounterCall::Add(5)).unwrap()
+    );
+
+    let event = CounterEvent::Added { by: 1, total: 2 };
+    let derived_event = DerivedRuntimeEvent::<S>::Counter(event.clone());
+    let bytes = borsh::to_vec(&derived_event).unwrap();
+    assert_eq!(
+        bytes,
+        borsh::to_vec(&TestRuntimeEvent::Counter(event.clone())).unwrap()
+    );
+    assert_eq!(
+        borsh::from_slice::<TestRuntimeEvent>(&bytes).unwrap(),
+        TestRuntimeEvent::Counter(event.clone())
+    );
+    assert_eq!(
+        serde_json::to_string(&derived_event).unwrap(),
+        serde_json::to_string(&TestRuntimeEvent::Counter(event.clone())).unwrap()
+    );
+    for module in [COUNTER, HOOKED, 0] {
+        let erased = || TypeErasedEvent::new(module, "k", event.clone());
+        assert_eq!(
+            D::convert_to_runtime_event(erased()).map(|e| borsh::to_vec(&e).unwrap()),
+            H::convert_to_runtime_event(erased()).map(|e| borsh::to_vec(&e).unwrap())
+        );
+    }
+
+    // Genesis: the same state.
+    let mut derived = D::default();
+    let checkpoint = MockKernel::checkpoint(TestStorage::default(), ArrayWitness::default());
+    let prev_root = TestStorage::default().root();
+    let mut state = GenesisStateAccessor::<S>::new(checkpoint).unwrap();
+    let config = DerivedRuntimeGenesisConfig {
+        hooked: (),
+        counter: 41,
+    };
+    let result = derived.genesis(&header(), &config, &mut state);
+    let finalized = state.finalize(result);
+    assert_eq!(finalized.outcome, PhaseOutcome::Committed);
+    let (root, ..) = finalized.checkpoint.materialize_update(prev_root);
+    let (hand_root, ..) = {
+        let checkpoint = MockKernel::checkpoint(TestStorage::default(), ArrayWitness::default());
+        let mut state = GenesisStateAccessor::<S>::new(checkpoint).unwrap();
+        let config = TestGenesisConfig {
+            hooked: (),
+            counter: 41,
+        };
+        let result = TestRuntime::<S>::default().genesis(&header(), &config, &mut state);
+        state
+            .finalize(result)
+            .checkpoint
+            .materialize_update(prev_root)
+    };
+    assert_eq!(root, hand_root);
+
+    // Dispatch and the transaction hooks: the same writes, the same gas.
+    let run = |dispatch: &mut dyn FnMut(&mut WorkingSet<S>)| {
+        let mut ws = working_set::<S>(genesis_storage(1), 1_000_000);
+        dispatch(&mut ws);
+        let gas = ws.gas_info().gas_used;
+        let finalized = ws.finalize(Ok::<(), ModuleError>(()));
+        let (accesses, _, _) = finalized.scratchpad.commit().freeze();
+        (gas, accesses.user.ordered_writes)
+    };
+    let mut derived = D::default();
+    let mut hand = H::default();
+    let derived_run = run(&mut |ws| {
+        derived.pre_dispatch_tx_hook(&tx(3), ws).unwrap();
+        for (call, _) in calls.clone() {
+            derived.dispatch_call(call, ws, &context()).unwrap();
+        }
+        derived
+            .post_dispatch_tx_hook(&tx(3), &context(), ws)
+            .unwrap();
+    });
+    let hand_run = run(&mut |ws| {
+        hand.pre_dispatch_tx_hook(&tx(3), ws).unwrap();
+        for (_, call) in calls.clone() {
+            hand.dispatch_call(call, ws, &context()).unwrap();
+        }
+        hand.post_dispatch_tx_hook(&tx(3), &context(), ws).unwrap();
+    });
+    assert_eq!(derived_run, hand_run);
+    assert_eq!(
+        derived.pre_dispatch_tx_hook(&tx(0), &mut working_set::<S>(genesis_storage(1), 1_000_000)),
+        hand.pre_dispatch_tx_hook(&tx(0), &mut working_set::<S>(genesis_storage(1), 1_000_000))
+    );
 }

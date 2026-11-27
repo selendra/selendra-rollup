@@ -6,6 +6,9 @@
 //! module_info/`): `field_missing_attribute`, `no_generics`, `not_supported_type`,
 //! `derive_on_enum_not_supported`, `missing_address` (here `#[id]`) and
 //! `second_addr_not_supported`.
+//!
+//! The runtime derives (`DispatchCall`, `MessageCodec`, `Genesis`, `Event`, `Hooks`) share
+//! their input rules (`runtime.rs`): each case runs through all five.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -13,7 +16,9 @@ use syn::{DeriveInput, parse_quote};
 
 use crate::attrs::MAX_MODULE_NAME_LEN;
 use crate::module_event::MAX_EVENT_NAME_LEN;
-use crate::{consensus_type, module_event, module_info};
+use crate::{
+    consensus_type, dispatch_call, event, genesis, hooks, message_codec, module_event, module_info,
+};
 
 fn module_info_error(input: DeriveInput) -> String {
     match module_info::derive(&input) {
@@ -976,5 +981,281 @@ fn unknown_attribute_is_spanned_error() {
     assert_eq!(
         module_info_error(input),
         "unknown key `sequencer_safety` in `#[module_info]`: expected `discriminant` or `name`"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// The runtime derives
+
+/// A derive's expansion function.
+type Derive = fn(&DeriveInput) -> syn::Result<TokenStream>;
+
+/// The five runtime derives, by name.
+const RUNTIME_DERIVES: [(&str, Derive); 5] = [
+    ("DispatchCall", dispatch_call::derive),
+    ("MessageCodec", message_codec::derive),
+    ("Genesis", genesis::derive),
+    ("Event", event::derive),
+    ("Hooks", hooks::derive),
+];
+
+/// Each runtime derive's error on `input` (one per derive, with its name), or a panic if one
+/// accepts it.
+fn runtime_errors(input: &DeriveInput) -> Vec<(&'static str, String)> {
+    RUNTIME_DERIVES
+        .iter()
+        .map(|&(name, derive)| match derive(input) {
+            Ok(tokens) => panic!("`{name}` accepted the input: {tokens}"),
+            Err(error) => (name, error.to_string()),
+        })
+        .collect()
+}
+
+/// Asserts every runtime derive rejects `input` with `message` (`{derive}` replaced by the
+/// derive's name).
+fn assert_runtime_error(input: &DeriveInput, message: &str) {
+    for (name, error) in runtime_errors(input) {
+        assert_eq!(error, message.replace("{derive}", name), "`{name}`");
+    }
+}
+
+/// Every runtime derive's output for `input`.
+fn runtime_tokens(input: &DeriveInput) -> Vec<String> {
+    RUNTIME_DERIVES
+        .iter()
+        .map(|&(name, derive)| match derive(input) {
+            Ok(tokens) => tokens.to_string(),
+            Err(error) => panic!("`{name}` rejected the input: {error}"),
+        })
+        .collect()
+}
+
+#[test]
+fn valid_runtime_is_accepted() {
+    let input: DeriveInput = parse_quote! {
+        pub struct Runtime<S: Spec, T: Payload> where T: Default {
+            pub bank: Bank<S>,
+            pub third: Third<S, T>,
+        }
+    };
+    let tokens = runtime_tokens(&input);
+    assert!(
+        tokens[0].contains("pub enum RuntimeCall < S : Spec , T : Payload >"),
+        "{}",
+        tokens[0]
+    );
+    assert!(
+        tokens[2].contains("pub struct RuntimeGenesisConfig"),
+        "{}",
+        tokens[2]
+    );
+    assert!(tokens[3].contains("pub enum RuntimeEvent"), "{}", tokens[3]);
+}
+
+#[test]
+fn runtime_must_be_a_struct_with_named_fields() {
+    let message = "`{derive}` can only be derived for a runtime: a struct with named fields, one \
+                   per module";
+    assert_runtime_error(
+        &parse_quote!(
+            enum Runtime<S> {
+                Bank(Bank<S>),
+            }
+        ),
+        message,
+    );
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<S>(Bank<S>);
+        ),
+        message,
+    );
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<S>;
+        ),
+        message,
+    );
+    assert_runtime_error(&parse_quote!(union Runtime<S> { bank: Bank<S> }), message);
+}
+
+#[test]
+fn runtime_must_be_generic_over_its_spec_first() {
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime {
+                bank: Bank<TestSpec>,
+            }
+        ),
+        "a runtime is generic over its spec: `struct Runtime<S: Spec>` (the first generic \
+         parameter)",
+    );
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<'a, S> {
+                bank: Bank<&'a S>,
+            }
+        ),
+        "the first generic parameter of a runtime must be its spec type (`S: Spec`), not a \
+         lifetime",
+    );
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<const N: u8, S> {
+                bank: Bank<S>,
+            }
+        ),
+        "the first generic parameter of a runtime must be its spec type (`S: Spec`), not a const \
+         parameter",
+    );
+}
+
+#[test]
+fn runtime_without_modules_is_rejected() {
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<S: Spec> {}
+        ),
+        "a runtime needs at least one module (one per field)",
+    );
+}
+
+/// Two fields whose `PascalCase` is the same variant are rejected (the variant would be
+/// defined twice), and so is a field whose `PascalCase` is not an identifier.
+#[test]
+fn runtime_variant_names_must_be_distinct_identifiers() {
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<S: Spec> {
+                foo_bar: A<S>,
+                foo__bar: B<S>,
+            }
+        ),
+        "fields `foo_bar` and `foo__bar` both name the variant `FooBar` of the runtime's call \
+         and event types: rename one",
+    );
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<S: Spec> {
+                bank: A<S>,
+                _bank: B<S>,
+            }
+        ),
+        "fields `bank` and `_bank` both name the variant `Bank` of the runtime's call and event \
+         types: rename one",
+    );
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<S: Spec> {
+                __: A<S>,
+            }
+        ),
+        "the field `__` names the variant `` of the runtime's call and event types, which is not \
+         a valid identifier: rename the field",
+    );
+    assert_runtime_error(
+        &parse_quote!(
+            struct Runtime<S: Spec> {
+                self_: A<S>,
+            }
+        ),
+        "the field `self_` names the variant `Self` of the runtime's call and event types, which \
+         is not a valid identifier: rename the field",
+    );
+}
+
+/// Variants are the fields in `PascalCase`, without `r#`; generated types are named after the
+/// runtime, without `r#`.
+#[test]
+fn runtime_names_are_derived_from_the_input() {
+    let input: DeriveInput = parse_quote! {
+        struct r#type<S: Spec> {
+            sequencer_registry: A<S>,
+            r#type: B<S>,
+            bank2_v3: C<S>,
+        }
+    };
+    let tokens = runtime_tokens(&input);
+    assert!(tokens[0].contains("enum typeCall"), "{}", tokens[0]);
+    assert!(
+        tokens[2].contains("struct typeGenesisConfig"),
+        "{}",
+        tokens[2]
+    );
+    assert!(tokens[3].contains("enum typeEvent"), "{}", tokens[3]);
+    for variant in ["SequencerRegistry (", "Type (", "Bank2V3 ("] {
+        assert!(tokens[0].contains(variant), "{variant}: {}", tokens[0]);
+        assert!(tokens[3].contains(variant), "{variant}: {}", tokens[3]);
+    }
+    assert!(tokens[1].contains("typeCall :: Bank2V3 ("), "{}", tokens[1]);
+}
+
+/// The generated methods' generic parameters never take a name the runtime's parameters have,
+/// nor one its module types or where clause use (they would shadow them there).
+#[test]
+fn runtime_generic_parameters_are_not_shadowed() {
+    let input: DeriveInput = parse_quote! {
+        struct Runtime<W: Spec, R, State, State1, Ser, De, A> {
+            bank: Bank<W, R, State, State1, Ser, De, A>,
+        }
+    };
+    let tokens = runtime_tokens(&input);
+    for fresh in [
+        "fn serialize < W1 :",
+        "fn deserialize_reader < R1 :",
+        "fn serialize < Ser1 :",
+        "fn deserialize < De1 :",
+        "fn deserialize_variant < 'de , A1 :",
+        "fn dispatch_call < State2 :",
+    ] {
+        assert!(tokens[0].contains(fresh), "{fresh}: {}", tokens[0]);
+    }
+    assert!(
+        tokens[4].contains("fn pre_dispatch_tx_hook < State2 :"),
+        "{}",
+        tokens[4]
+    );
+    // Nor a name the module types or the where clause use (`type W = u32;` in `Bank<S, W>`).
+    let input: DeriveInput = parse_quote! {
+        struct Runtime<S: Spec> where Bank<S, De>: Sized {
+            bank: Bank<S, (W, R, Ser, A, E, State, State1)>,
+            other: other::Ser1,
+        }
+    };
+    let tokens = runtime_tokens(&input);
+    for fresh in [
+        "fn serialize < W1 :",
+        "fn deserialize_reader < R1 :",
+        "fn serialize < Ser2 :",
+        "fn deserialize < De1 :",
+        "fn deserialize_variant < 'de , A1 :",
+        "fn dispatch_call < State2 :",
+    ] {
+        assert!(tokens[0].contains(fresh), "{fresh}: {}", tokens[0]);
+    }
+    for fresh in [
+        "fn serialize < Ser2 :",
+        "fn deserialize < De1 :",
+        "fn next_value < A1 :",
+        "fn from_slots < E1 :",
+    ] {
+        assert!(tokens[2].contains(fresh), "{fresh}: {}", tokens[2]);
+    }
+    assert!(
+        tokens[4].contains("fn post_dispatch_tx_hook < State2 :"),
+        "{}",
+        tokens[4]
+    );
+    let input: DeriveInput = parse_quote! {
+        struct Runtime<S: Spec> {
+            bank: Bank<S>,
+        }
+    };
+    let tokens = runtime_tokens(&input);
+    assert!(tokens[0].contains("fn serialize < W :"), "{}", tokens[0]);
+    assert!(
+        tokens[0].contains("fn dispatch_call < State :"),
+        "{}",
+        tokens[0]
     );
 }

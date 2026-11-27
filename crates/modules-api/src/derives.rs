@@ -1,6 +1,7 @@
-//! The module system's derives (`selendra-macros`), re-exported with their documentation. The
-//! code they generate names only `::selendra_modules_api` (its hidden `__private` module) and
-//! `::core`.
+//! The module system's derives (`selendra-macros`), re-exported with their documentation: for
+//! modules ([`ModuleInfo`], [`ModuleEvent`]), for runtimes ([`DispatchCall`], [`MessageCodec`],
+//! [`Genesis`], [`Event`], [`Hooks`]) and for consensus types ([`ConsensusType`]). The code they
+//! generate names only `::selendra_modules_api` (its hidden `__private` module) and `::core`.
 
 /// Derives [`ModuleInfo`](trait@crate::ModuleInfo) and `Default` for a module struct: its
 /// discriminant and name, its dependencies, its state layout, and a constructor that gives
@@ -448,3 +449,667 @@ pub use selendra_macros::ModuleEvent;
 /// The derive does not check that `BorshSerialize` never fails, nor that every encoding
 /// decodes (`docs/serialization.md`): those stay review rules.
 pub use selendra_macros::ConsensusType;
+
+/// Derives [`DispatchCall`](trait@crate::DispatchCall) for a runtime, and generates its call
+/// type `{Runtime}Call`.
+///
+/// A runtime is a struct with named fields, generic over its spec first (other generic
+/// parameters are allowed), each field a module running with that spec. The runtime derives
+/// (this one, [`MessageCodec`](macro@crate::MessageCodec), [`Genesis`](macro@crate::Genesis),
+/// [`Event`](macro@crate::Event), [`Hooks`](macro@crate::Hooks)) take no attributes; the other
+/// four need this one's impl (its layout check, below).
+///
+/// Below, `Bank` (discriminant 240, name `bank`) and `Accounts` (241, `accounts`, holding a
+/// `Bank`) are modules taking `u8` calls (hidden):
+///
+/// ```
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(Accounts, 241, "accounts", Bank);
+/// #[derive(Clone, Default, DispatchCall, MessageCodec, Genesis, Event, Hooks)]
+/// pub struct Runtime<S: Spec> {
+///     pub accounts: Accounts<S>,
+///     pub bank: Bank<S>,
+/// }
+///
+/// type Rt = Runtime<TestSpec>;
+/// type Call = RuntimeCall<TestSpec>;
+///
+/// // borsh: the module's discriminant, then its call message (not the field's position).
+/// assert_eq!(Rt::encode(&Call::Bank(7)).unwrap(), [240, 7]);
+/// assert_eq!(<Rt as EncodeCall<Bank<TestSpec>>>::encode_call(7).unwrap(), [240, 7]);
+/// assert_eq!(Rt::decode(&[241, 7]).unwrap(), Call::Accounts(7));
+/// assert!(Rt::decode(&[0, 7]).is_err()); // no module has the tag
+/// assert!(Rt::decode(&[240, 7, 0]).is_err()); // trailing bytes
+///
+/// // JSON: keyed by the module's name.
+/// assert_eq!(serde_json::to_string(&Call::Bank(7)).unwrap(), r#"{"bank":7}"#);
+/// assert_eq!(Call::Bank(7).module_name(), "bank");
+///
+/// let runtime = Rt::default();
+/// assert_eq!(runtime.module_id(&Call::Bank(7)), runtime.bank.id());
+/// assert_eq!(Rt::MODULES, [ModuleDescriptor::of::<Accounts<TestSpec>>(), ModuleDescriptor::of::<Bank<TestSpec>>()]);
+/// assert_eq!(Rt::validate_layout(), Ok(()));
+/// ```
+///
+/// # Generated
+/// - At the call site, with the runtime's visibility and generic parameters, `{Runtime}Call`
+///   (`RuntimeCall` above): an enum with one variant per module, named after the field in
+///   `PascalCase` (`sequencer_registry` → `SequencerRegistry`, without `r#`), holding the
+///   module's `CallMessage`. Its encodings (`docs/serialization.md`, "Runtimes"):
+///   - borsh: the module's [`DISCRIMINANT`](crate::ModuleInfo::DISCRIMINANT), then the
+///     message, so adding, removing or reordering modules changes no call's encoding (upstream
+///     tagged by field position, P5-25); a tag that is no module's is an error;
+///   - serde: externally tagged by the module's [`NAME`](crate::ModuleInfo::NAME)
+///     (`{"bank": 7}`; another key, two keys or none are errors); in binary serde formats the
+///     variant index is the discriminant;
+///   - a JSON schema, `ConsensusType` (derived), [`ModuleMessage`](crate::ModuleMessage)
+///     (upstream's strum enums), `Debug`, `Clone`, `PartialEq`, `Eq`.
+/// - `DispatchCall`: [`MODULES`](crate::DispatchCall::MODULES) (each module's
+///   [`ModuleDescriptor`](crate::ModuleDescriptor), in field order), `dispatch_call` (the
+///   module's [`Module::call`](crate::Module::call), called fully qualified, its error returned
+///   unchanged as a [`ModuleError`](crate::ModuleError)) and `module_id`. Upstream's
+///   `module_info` is not generated (`ModuleInfo` is not object safe).
+///
+/// The impls are in an anonymous constant; every path they use is
+/// `::selendra_modules_api::__private::…` or `::core::…` (trait methods called fully
+/// qualified, primitive types as `::core::primitive::…`), so local items named like a crate
+/// (`mod borsh {}`), a prelude item or a primitive type (`struct u8;`) do not change them, the
+/// derives work under `#![no_implicit_prelude]`, and two runtimes can share a Rust module
+/// (upstream generated fixed names: P5-33). The generated methods' generic parameters are
+/// named unlike anything the runtime's generics, where clause and module types name.
+///
+/// # Errors
+/// At compile time, spanned at the input: an enum, a union, a tuple or unit struct, no generic
+/// parameter or a lifetime or const one first, no field, two fields with the same variant name
+/// (`foo_bar` and `foo__bar`), a field whose `PascalCase` is not an identifier (`self_`). A
+/// field that is not a module, or runs with another spec (E0271), fails to compile.
+///
+/// # The layout check
+/// The runtime's modules follow the layout rules ([`check_layout`](crate::check_layout)): no
+/// discriminant `0`, no two modules with one discriminant or one name, and every module's
+/// [`DEPENDENCIES`](crate::ModuleInfo::DEPENDENCIES) (the modules it holds) modules of the
+/// runtime with exactly that discriminant and name (upstream checked only that the runtime's own
+/// modules had distinct discriminants, and only at genesis: P5-25). Only the pairs are compared,
+/// not the types: a held module of another type that declares a runtime module's discriminant
+/// and name is not detected (see [`check_layout`](crate::check_layout)). The derived codecs
+/// (borsh and serde, both ways), the JSON schema, `module_discriminant`/`module_name`, dispatch,
+/// `EncodeCall`, genesis and its configuration's codecs, event mapping and hooks evaluate
+/// [`DispatchCall`](trait@crate::DispatchCall)'s layout check, a constant: instantiating the
+/// runtime with modules that break the rules is a compile error (E0080) naming the rule. It is
+/// evaluated in builds that generate code (`cargo build`, `cargo test`, doctests), not by
+/// `cargo check` or clippy, which do not evaluate the constants of generic code; a concrete
+/// runtime adds `const _: () = Runtime::<…>::__CHECK_LAYOUT;`, which they evaluate. Genesis
+/// checks the rules again at run time, and so does
+/// [`validate_layout`](crate::DispatchCall::validate_layout) (the node at startup).
+///
+/// Each of these fails with E0080: two modules with one discriminant, two with one name (also
+/// when the program only encodes a call to JSON, or asks a call for its module's name), a
+/// module holding a module the runtime does not have, and a hand-written module with the
+/// discriminant `0` (the module derive rejects it):
+///
+/// ```compile_fail,E0080
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(Vault, 240, "vault");
+/// // `Bank` and `Vault` both have the discriminant 240 (hidden).
+/// #[derive(DispatchCall)]
+/// pub struct Runtime<S: Spec> {
+///     pub bank: Bank<S>,
+///     pub vault: Vault<S>,
+/// }
+///
+/// fn main() {
+///     let _ = Runtime::<TestSpec>::decode(&[240, 7]);
+/// }
+/// ```
+///
+/// ```compile_fail,E0080
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(OtherBank, 241, "bank");
+/// // `Bank` (240) and `OtherBank` (241) are both named `bank` (hidden).
+/// #[derive(DispatchCall)]
+/// pub struct Runtime<S: Spec> {
+///     pub bank: Bank<S>,
+///     pub other_bank: OtherBank<S>,
+/// }
+///
+/// fn main() {
+///     let _ = Runtime::<TestSpec>::decode(&[240, 7]);
+/// }
+/// ```
+///
+/// Encoding a call to JSON is enough (the same runtime, hidden):
+///
+/// ```compile_fail,E0080
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(OtherBank, 241, "bank");
+/// # #[derive(DispatchCall)]
+/// # pub struct Runtime<S: Spec> {
+/// #     pub bank: Bank<S>,
+/// #     pub other_bank: OtherBank<S>,
+/// # }
+/// fn main() {
+///     let _ = serde_json::to_string(&RuntimeCall::<TestSpec>::OtherBank(7));
+/// }
+/// ```
+///
+/// So is asking a call for its module's name:
+///
+/// ```compile_fail,E0080
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(OtherBank, 241, "bank");
+/// # #[derive(DispatchCall)]
+/// # pub struct Runtime<S: Spec> {
+/// #     pub bank: Bank<S>,
+/// #     pub other_bank: OtherBank<S>,
+/// # }
+/// fn main() {
+///     let _ = RuntimeCall::<TestSpec>::OtherBank(7).module_name();
+/// }
+/// ```
+///
+/// ```compile_fail,E0080
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(Accounts, 241, "accounts", Bank);
+/// // `Accounts` holds a `Bank` (hidden), which the runtime does not have.
+/// #[derive(DispatchCall)]
+/// pub struct Runtime<S: Spec> {
+///     pub accounts: Accounts<S>,
+/// }
+///
+/// fn main() {
+///     let _ = Runtime::<TestSpec>::decode(&[241, 7]);
+/// }
+/// ```
+///
+/// ```compile_fail,E0080
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// #[derive(Clone)]
+/// pub struct Zero<S>(ModuleId, PhantomData<S>);
+///
+/// impl<S: Spec> ModuleInfo for Zero<S> {
+///     type Spec = S;
+///     const DISCRIMINANT: u8 = 0;
+///     const NAME: &'static str = "zero";
+///     const DEPENDENCIES: &'static [(u8, &'static str)] = &[];
+///     const STATE_LAYOUT: &'static [StateItem] = &[];
+///     fn id(&self) -> &ModuleId {
+///         &self.0
+///     }
+/// }
+/// # impl<S: Spec> Module for Zero<S> {
+/// #     type Config = ();
+/// #     type CallMessage = u8;
+/// #     type Event = NotInstantiable;
+/// #     type Error = anyhow::Error;
+/// #     fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #         Ok(())
+/// #     }
+/// # }
+///
+/// #[derive(DispatchCall)]
+/// pub struct Runtime<S: Spec> {
+///     pub bank: Bank<S>,
+///     pub zero: Zero<S>,
+/// }
+///
+/// fn main() {
+///     let _ = Runtime::<TestSpec>::decode(&[240, 7]);
+/// }
+/// ```
+///
+/// With distinct discriminants and names, the held module in the runtime, and a discriminant
+/// other than `0`, it compiles:
+///
+/// ```
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(Vault, 242, "vault");
+/// # module!(Accounts, 241, "accounts", Bank);
+/// #[derive(Clone)]
+/// pub struct One<S>(ModuleId, PhantomData<S>);
+///
+/// impl<S: Spec> ModuleInfo for One<S> {
+///     type Spec = S;
+///     const DISCRIMINANT: u8 = 1;
+///     const NAME: &'static str = "one";
+///     const DEPENDENCIES: &'static [(u8, &'static str)] = &[];
+///     const STATE_LAYOUT: &'static [StateItem] = &[];
+///     fn id(&self) -> &ModuleId {
+///         &self.0
+///     }
+/// }
+/// # impl<S: Spec> Module for One<S> {
+/// #     type Config = ();
+/// #     type CallMessage = u8;
+/// #     type Event = NotInstantiable;
+/// #     type Error = anyhow::Error;
+/// #     fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #         Ok(())
+/// #     }
+/// # }
+///
+/// #[derive(DispatchCall)]
+/// pub struct Runtime<S: Spec> {
+///     pub bank: Bank<S>,
+///     pub vault: Vault<S>,
+///     pub accounts: Accounts<S>,
+///     pub one: One<S>,
+/// }
+///
+/// fn main() {
+///     let _ = Runtime::<TestSpec>::decode(&[240, 7]);
+///     let _ = serde_json::to_string(&RuntimeCall::<TestSpec>::Vault(7));
+///     let _ = RuntimeCall::<TestSpec>::Vault(7).module_name();
+/// }
+/// ```
+pub use selendra_macros::DispatchCall;
+
+/// Derives [`EncodeCall<M>`](crate::EncodeCall) for a runtime, for each of its modules `M`:
+/// a module's call message as the runtime's call (`{Runtime}Call`, generated by
+/// [`DispatchCall`](macro@crate::DispatchCall)'s derive, which this one needs).
+///
+/// ```
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// #[derive(DispatchCall, MessageCodec)]
+/// pub struct Runtime<S: Spec> {
+///     pub bank: Bank<S>,
+/// }
+///
+/// type Rt = Runtime<TestSpec>;
+/// assert_eq!(<Rt as EncodeCall<Bank<TestSpec>>>::to_decodable(7), RuntimeCall::Bank(7));
+/// assert_eq!(<Rt as EncodeCall<Bank<TestSpec>>>::encode_call(7).unwrap(), [240, 7]);
+/// ```
+///
+/// Two fields of one module type conflict (E0119); they would break the layout rules anyway.
+pub use selendra_macros::MessageCodec;
+
+/// Derives [`Genesis`](trait@crate::Genesis) for a runtime, and generates its genesis
+/// configuration type `{Runtime}GenesisConfig`.
+///
+/// `{Runtime}GenesisConfig` (at the call site, with the runtime's visibility and generic
+/// parameters) has one field per module, named like the runtime's field, holding the module's
+/// [`Config`](crate::Module::Config). Its JSON is an object with exactly these fields, each
+/// once: an unknown, duplicate or missing field is an error, also a missing field whose
+/// configuration is an `Option` (write `null` for `None`; serde's derive would read a missing
+/// `Option` as `None`), and so is an array. In binary serde formats, the fields in order. Its
+/// serde impls are written out by the derive (not serde's derive, which names primitive types
+/// unqualified and takes bounds as strings, so `$crate::…` module types failed to parse);
+/// serde, `Debug`, `Clone` and `PartialEq` are implemented where the modules' configurations
+/// implement them.
+///
+/// The runtime's genesis checks the layout rules (at compile time like every runtime derive,
+/// see [`DispatchCall`](macro@crate::DispatchCall), whose derive this one needs; and again at
+/// run time), then runs each module's genesis, every module after the modules it depends on
+/// ([`sort_values_by_modules_dependencies`](crate::sort_values_by_modules_dependencies): a
+/// cycle is an error), otherwise in field order. The first error is returned (and the caller
+/// reverts the genesis state). No module is special (upstream required a `chain_state` field).
+///
+/// ```
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// # module!(Accounts, 241, "accounts", Bank);
+/// // `Accounts` holds a `Bank`: the bank's genesis runs first.
+/// #[derive(DispatchCall, Genesis)]
+/// pub struct Runtime<S: Spec> {
+///     pub accounts: Accounts<S>,
+///     pub bank: Bank<S>,
+/// }
+///
+/// let config: RuntimeGenesisConfig<TestSpec> =
+///     serde_json::from_str(r#"{"accounts": 1, "bank": 2}"#).unwrap();
+/// assert_eq!(config, RuntimeGenesisConfig { accounts: 1, bank: 2 });
+/// // A missing field, an unknown one, are errors.
+/// assert!(serde_json::from_str::<RuntimeGenesisConfig<TestSpec>>(r#"{"accounts": 1}"#).is_err());
+/// assert!(
+///     serde_json::from_str::<RuntimeGenesisConfig<TestSpec>>(r#"{"accounts": 1, "bank": 2, "chain_state": 3}"#)
+///         .is_err()
+/// );
+/// ```
+pub use selendra_macros::Genesis;
+
+/// Derives [`RuntimeEventProcessor`](crate::RuntimeEventProcessor) for a runtime, and
+/// generates its event type `{Runtime}Event`.
+///
+/// `{Runtime}Event` (at the call site, with the runtime's visibility and generic parameters)
+/// has one variant per module, named like `{Runtime}Call`'s, holding the module's
+/// [`Event`](crate::Module::Event), with the same encodings (borsh: the module's discriminant,
+/// then the event; serde: keyed by the module's name, where upstream's was `untagged`, P5-32),
+/// a JSON schema, `ConsensusType`, [`ModuleMessage`](crate::ModuleMessage), `Debug`, `Clone`
+/// and `PartialEq`.
+///
+/// An emitted event ([`TypeErasedEvent`](crate::TypeErasedEvent)) maps to the variant of the
+/// module whose discriminant it carries, if its type is that module's event type: two modules
+/// emitting one event type are told apart (upstream matched the `TypeId`, so the first such
+/// module got them all, P5-32). This derive needs [`DispatchCall`](macro@crate::DispatchCall)'s.
+///
+/// ```
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// #[derive(DispatchCall, Event)]
+/// pub struct Runtime<S: Spec> {
+///     pub bank: Bank<S>,
+/// }
+///
+/// // `Bank` emits no events (`NotInstantiable`): a `u8` under its discriminant maps to nothing.
+/// let event = TypeErasedEvent::new(240, "bank/Minted", 7u8);
+/// assert_eq!(Runtime::<TestSpec>::convert_to_runtime_event(event), None);
+/// ```
+pub use selendra_macros::Event;
+
+/// Derives [`TxHooks`](crate::TxHooks), [`BlockHooks`](crate::BlockHooks) and
+/// [`FinalizeHook`](crate::FinalizeHook) for a runtime: each hook calls every module's hook
+/// (the [`Module`](crate::Module) provided methods), in field order, fully qualified
+/// (`<M as Module>::begin_rollup_block_hook(&mut self.field, …)`). So the module's own hook
+/// always runs: never an inherent method of the same name, nor a fallback (upstream's
+/// `(&mut self.field).hook(…)` could pick either, P5-31). A transaction hook's first error is
+/// returned unchanged (as a [`ModuleError`](crate::ModuleError)), and the later modules' hooks
+/// do not run. This derive needs [`DispatchCall`](macro@crate::DispatchCall)'s.
+///
+/// ```
+/// # use std::marker::PhantomData;
+/// # use selendra_modules_api::*;
+/// # use selendra_modules_api::test_utils::TestSpec;
+/// # macro_rules! module {
+/// #     ($module:ident, $discriminant:tt, $name:tt $(, $dependency:ident)?) => {
+/// #         #[derive(Clone, ModuleInfo)]
+/// #         #[module_info(discriminant = $discriminant, name = $name)]
+/// #         pub struct $module<S: Spec> {
+/// #             #[id]
+/// #             pub id: ModuleId,
+/// #             $(#[module] pub dependency: $dependency<S>,)?
+/// #             #[phantom]
+/// #             spec: ::core::marker::PhantomData<S>,
+/// #         }
+/// #         impl<S: Spec> Module for $module<S> {
+/// #             type Config = u8;
+/// #             type CallMessage = u8;
+/// #             type Event = NotInstantiable;
+/// #             type Error = anyhow::Error;
+/// #             fn call(&mut self, _: u8, _: &Context<S>, _: &mut impl TxState<S>) -> anyhow::Result<()> {
+/// #                 Ok(())
+/// #             }
+/// #         }
+/// #     };
+/// # }
+/// # module!(Bank, 240, "bank");
+/// #[derive(DispatchCall, Hooks)]
+/// pub struct Runtime<S: Spec> {
+///     pub bank: Bank<S>,
+/// }
+///
+/// fn runtime<R: TxHooks + BlockHooks + FinalizeHook>() {}
+/// runtime::<Runtime<TestSpec>>();
+/// ```
+pub use selendra_macros::Hooks;

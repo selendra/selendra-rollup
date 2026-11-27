@@ -632,7 +632,7 @@ commitment) and the guest decodes them. Every public borsh type is a consensus t
 | `SequencerType` | one byte: `0` = `Preferred`, `1` = `NonPreferred` | `"Preferred"` / `"NonPreferred"` | the variant index |
 | `PriorityFeeBips` (basis points: `100` = 1%) | `u64` LE | a number | `u64` |
 | `TxDetails<S>` (a transaction's fees, gas limit and runtime version) | `max_priority_fee_bips` (`u64`), `max_fee` (`u128`), `gas_limit` (`Option<S::Gas>`: tag `0`, or tag `1` and the gas), `runtime_version` (`u32`), all LE: 29 bytes without a gas limit, 45 with one (`GasUnit<2>`) | an object with exactly these four fields: `gas_limit` an array or `null` (never missing), `max_fee` an amount string, the others numbers; unknown fields (upstream's `chain_hash_fragment` included) rejected | the fields in order |
-| `NotInstantiable` (call message of a module without calls) | never decodes (no values) | never decodes; schema `null` | never decodes |
+| `NotInstantiable` (call message of a module without calls) | never decodes (no values) | never decodes; schema `false` (no value matches), inlined where used, so a runtime's call or event schema admits nothing under the name of a module without calls or events (it was `null`, which `null` matched); as a root schema `{"not": {}}` | never decodes |
 | `SelendraSpec` (a marker) | no bytes | `null` | nothing |
 
 - **`ModuleId`** = `SHA-256("SELENDRA/module-id/v1" ‖ name)` with the state hasher, from the
@@ -700,9 +700,8 @@ invalid name, an item id outside 0..=255 or used twice, an enum or tuple struct)
 error spanned at the input. A hand-written `ModuleInfo` gets none of these per-module checks:
 it must itself keep a valid name, unique item ids, a `STATE_LAYOUT` that lists the prefixes it
 builds and an id that is `ModuleId::from_name(NAME)`. The checks between modules (unique
-discriminants and names, dependencies: genesis rejects them) apply to it as to a derived module.
-Discriminant `0` on a hand-written impl is rejected only once the runtime derive exists (its
-compile-time layout check).
+discriminants and names, dependencies, discriminant `0`: the runtime's layout check, below)
+apply to it as to a derived module.
 
 - **State items:** each `#[state(item = N)]` field is stored under the prefix
   `(DISCRIMINANT, N)`. Ids are explicit: reordering fields, renaming or moving the struct
@@ -723,7 +722,7 @@ compile-time layout check).
   the module's `DISCRIMINANT` byte followed by the module's message (borsh), so adding,
   removing or reordering modules changes no encoding; an unknown tag does not decode, and
   `DispatchCall::decode` is `borsh::from_slice` (trailing bytes rejected). In JSON they are
-  externally tagged by the module's `NAME` (the runtime derive generates both; Phase 5).
+  externally tagged by the module's `NAME` ("Runtimes" below).
 - **Event keys** are `"{NAME}/{event_name}"` (`EventEmitter::emit_event`, e.g.
   `bank/Transfer`), from `ModuleEvent::event_name` (derived from the variant name), never from
   `Debug` output (upstream's were). An event carries the emitting module's discriminant, by
@@ -733,6 +732,56 @@ compile-time layout check).
   `#[derive(ModuleEvent)]` (enums only; the name is the variant's, without `r#`) rejects an
   event name of more than `MAX_EVENT_NAME_LEN` = 256 − 32 − 1 = 223 bytes at compile time:
   module names are at most `MAX_MODULE_NAME_LEN` = 32 bytes, so a derived key always fits.
+
+### Runtimes
+
+A runtime is a struct with one module per field, generic over its spec first; its derives
+(`selendra-modules-api` re-exports them: `DispatchCall`, `MessageCodec`, `Genesis`, `Event`,
+`Hooks`) generate its types next to it, named after it, with its visibility and generic
+parameters: `{Runtime}Call`, `{Runtime}Event`, `{Runtime}GenesisConfig` (no fixed names, so two
+runtimes can share a Rust module). Each module is the variant named after its field in
+`PascalCase` (`sequencer_registry` → `SequencerRegistry`; two fields naming one variant are a
+compile error); the encodings use only the module's `DISCRIMINANT` and `NAME`, never the
+field's position or name.
+
+| Type | borsh | JSON (and other human-readable formats) | Binary serde (postcard) |
+|---|---|---|---|
+| `{Runtime}Call` (`DispatchCall::Decodable`) | the module's `DISCRIMINANT` (one byte), then the module's `CallMessage` (borsh); a tag that is no module's discriminant is an error, and so are trailing bytes (`DispatchCall::decode` is `borsh::from_slice`) | an object with exactly one key, the module's `NAME`, holding the module's call message's JSON: `{"bank": …}`. Another key (the field's name included), two keys or none are errors. Schema: `oneOf` one object per module, inlined | the variant index is the module's `DISCRIMINANT` (a varint), then the message |
+| `{Runtime}Event` (`RuntimeEventProcessor::RuntimeEvent`) | the same: the emitting module's `DISCRIMINANT`, then its `Event` | the same, keyed by the emitting module's `NAME` (upstream's was `untagged`: two modules' events of one type were the same JSON) | the same |
+| `{Runtime}GenesisConfig` (`Genesis::Config`) | none | an object with exactly one field per module, named like the runtime's field, holding the module's `Config`; unknown fields (upstream's `chain_state` coupling included), duplicate fields and missing fields are errors, a missing field whose configuration is an `Option` included (write `null` for `None`: serde's derive would read the missing field as `None`), and so is an array. The serde impls are written out by the derive (strict, through `__private::deserialize_genesis_config`; serde's derive names primitive types unqualified and takes its bounds as strings, in which a `$crate::…` module type does not parse) | the fields in order |
+
+Upstream tagged calls and events with the module's position in the runtime (a reordering was a
+fork), derived strum discriminant enums and names, and named every generated type the same.
+
+- **Layout check.** Within a runtime: no module has the discriminant `0`; no two modules have
+  the same discriminant or the same name; every module's `DEPENDENCIES` are modules of the
+  runtime with exactly that `(DISCRIMINANT, NAME)`. Only the pairs are compared, not the
+  module types: a dependency is taken to be the runtime's module with its pair, and when it is
+  (the same type) its own dependencies are checked as that module's (by induction, the whole
+  closure). A different type declaring a runtime module's pair (two semver-incompatible
+  versions of one module crate, or a copy) is not detected: it writes under that module's
+  prefixes with its own item layout, and its own dependencies go unchecked (TODO Phase 6:
+  module identity in the layout check). `check_layout` (a `const fn`) checks it on
+  `DispatchCall::MODULES` (each module's descriptor, in field order); the runtime derives
+  evaluate it as a constant wherever the runtime is used (its codecs both ways, JSON
+  included, its JSON schema, `module_discriminant`/`module_name`, dispatch, `EncodeCall`,
+  genesis and its configuration's codecs, event mapping, hooks), so a runtime that
+  breaks it fails to compile (E0080, naming the rule) in every build that generates code
+  (`cargo build`, `cargo test`, the node and guest binaries; not `cargo check`/clippy, which do
+  not evaluate constants of generic code: a concrete runtime adds a free
+  `const _: () = Runtime::<…>::__CHECK_LAYOUT;`, Phase 8). Genesis checks it again at run time,
+  and so does `DispatchCall::validate_layout` (the node at startup, Phase 8/10: an upgrade does
+  not rerun genesis). Upstream checked only that the runtime's own modules had distinct
+  discriminants, and only at genesis.
+- **Genesis** runs each module's genesis after its dependencies'
+  (`sort_values_by_modules_dependencies`, deterministic; a cycle is an error), otherwise in field
+  order; the first error is the runtime's.
+- **Dispatch, events, hooks.** A call goes to its variant's module (`Module::call`, fully
+  qualified), whose error comes back unchanged. An emitted event maps to the variant of the
+  module whose discriminant it carries, if its type is that module's event type (upstream
+  matched the `TypeId`: the first module with that type got every such event). The hooks call
+  every module's hook in field order, fully qualified (never an inherent method of the same
+  name); a transaction hook's first error stops the rest.
 
 ## Checking
 
@@ -748,6 +797,8 @@ compile-time layout check).
 - The derives: their compile errors by exact-message unit tests in `selendra-macros` (a
   derive's error has no error code, so no `compile_fail` doctest can pin it); what they
   generate by `selendra-modules-api`'s integration tests (`tests/derives/`: layouts, ids,
-  dependencies, event names, consensus types), in the guest configuration too.
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `modules_api_types`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
+  dependencies, event names, consensus types, runtime call and event encodings, dispatch,
+  genesis, hooks), in the guest configuration too; the layout check by unit tests on
+  `check_layout` and `compile_fail,E0080` doctests (`DispatchCall`'s derive).
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `modules_api_types`, `runtime_codec`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

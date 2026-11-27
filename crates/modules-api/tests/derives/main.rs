@@ -8,6 +8,7 @@
 mod consensus_type;
 mod module_event;
 mod module_info;
+mod runtime;
 
 use selendra_modules_api::test_utils::{MockKernel, TestStorage};
 use selendra_modules_api::{Amount, BasicGasMeter, Gas, Spec, WorkingSet};

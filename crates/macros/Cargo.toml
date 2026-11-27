@@ -1,6 +1,6 @@
 [package]
 name = "selendra-macros"
-description = "Selendra module system derives (ModuleInfo, ModuleEvent, ConsensusType), used through selendra-modules-api, which re-exports and documents them."
+description = "Selendra module system derives (ModuleInfo, ModuleEvent, ConsensusType; the runtime derives DispatchCall, MessageCodec, Genesis, Event, Hooks), used through selendra-modules-api, which re-exports and documents them."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

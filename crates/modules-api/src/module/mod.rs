@@ -95,11 +95,15 @@ impl StateItem {
 /// prefixes its constructor builds, and an [`id`](Self::id) that is
 /// `ModuleId::from_name(Self::NAME)`. Nothing checks the name, the item ids, the layout or the
 /// id of a hand-written impl: it must keep them itself. The rules between modules apply to
-/// derived and hand-written modules alike: genesis
-/// ([`sort_values_by_modules_dependencies`](crate::sort_values_by_modules_dependencies))
-/// rejects a repeated discriminant or name and a dependency that is not one of the modules
-/// with that discriminant and name. Discriminant `0` on a hand-written impl is not rejected
-/// yet: the runtime derive, which checks the runtime's modules together at compile time, will.
+/// derived and hand-written modules alike: the runtime's layout check
+/// ([`check_layout`](crate::check_layout) of [`DispatchCall::MODULES`]) rejects discriminant
+/// `0`, a repeated discriminant or name, and a dependency that is not one of the runtime's
+/// modules with that discriminant and name, at compile time wherever a runtime is used (a
+/// compile error, E0080, in every build that generates code: see
+/// [`DispatchCall`](macro@crate::DispatchCall)'s derive) and again at run time in its genesis;
+/// genesis's dependency sort
+/// ([`sort_values_by_modules_dependencies`](crate::sort_values_by_modules_dependencies)) also
+/// rejects cycles.
 ///
 /// Upstream's `ModuleInfo` named a module three ways (its `prefix()` from its Rust path, the
 /// module byte of its state prefixes from a `constants.toml` discriminant, its call tag from

@@ -19,7 +19,9 @@ selendra-mock-zkvm = { path = "../crates/adapters/mock-zkvm" }
 selendra-modules-api = { path = "../crates/modules-api", features = ["test-utils"] }
 selendra-primitives = { path = "../crates/primitives" }
 selendra-state = { path = "../crates/state" }
-serde = "1"
+# The test runtime's call messages and events derive them.
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "=0.10.9", default-features = false }
 
@@ -51,6 +53,13 @@ bench = false
 [[bin]]
 name = "modules_api_types"
 path = "fuzz_targets/modules_api_types.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runtime_codec"
+path = "fuzz_targets/runtime_codec.rs"
 test = false
 doc = false
 bench = false

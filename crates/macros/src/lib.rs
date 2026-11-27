@@ -1,6 +1,8 @@
 //! The Selendra module system's derives: [`ModuleInfo`](macro@ModuleInfo) and
-//! [`ModuleEvent`](macro@ModuleEvent) for modules, [`ConsensusType`](macro@ConsensusType) for
-//! the types of consensus data.
+//! [`ModuleEvent`](macro@ModuleEvent) for modules; [`DispatchCall`](macro@DispatchCall),
+//! [`MessageCodec`](macro@MessageCodec), [`Genesis`](macro@Genesis), [`Event`](macro@Event) and
+//! [`Hooks`](macro@Hooks) for runtimes; [`ConsensusType`](macro@ConsensusType) for the types of
+//! consensus data.
 //!
 //! Use them through `selendra-modules-api`, which re-exports them and documents their
 //! attributes, the rules they check and examples. The code they generate names only
@@ -19,8 +21,14 @@
 mod attrs;
 mod common;
 mod consensus_type;
+mod dispatch_call;
+mod event;
+mod genesis;
+mod hooks;
+mod message_codec;
 mod module_event;
 mod module_info;
+mod runtime;
 
 #[cfg(test)]
 mod tests;
@@ -52,6 +60,47 @@ pub fn derive_module_event(input: TokenStream) -> TokenStream {
 pub fn derive_consensus_type(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(consensus_type::derive(&input))
+}
+
+/// Derives `DispatchCall` for a runtime (a struct with one module per field, generic over its
+/// spec first), and generates its call type `{Runtime}Call`. See
+/// `selendra_modules_api::DispatchCall`.
+#[proc_macro_derive(DispatchCall)]
+pub fn derive_dispatch_call(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand(dispatch_call::derive(&input))
+}
+
+/// Derives `EncodeCall<M>` for a runtime, for each of its modules `M`. See
+/// `selendra_modules_api::MessageCodec`.
+#[proc_macro_derive(MessageCodec)]
+pub fn derive_message_codec(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand(message_codec::derive(&input))
+}
+
+/// Derives `Genesis` for a runtime, and generates its configuration type
+/// `{Runtime}GenesisConfig`. See `selendra_modules_api::Genesis`.
+#[proc_macro_derive(Genesis)]
+pub fn derive_genesis(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand(genesis::derive(&input))
+}
+
+/// Derives `RuntimeEventProcessor` for a runtime, and generates its event type
+/// `{Runtime}Event`. See `selendra_modules_api::Event`.
+#[proc_macro_derive(Event)]
+pub fn derive_event(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand(event::derive(&input))
+}
+
+/// Derives `TxHooks`, `BlockHooks` and `FinalizeHook` for a runtime: every module's hooks, in
+/// field order. See `selendra_modules_api::Hooks`.
+#[proc_macro_derive(Hooks)]
+pub fn derive_hooks(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand(hooks::derive(&input))
 }
 
 /// The derive's output, or its error as a `compile_error!`.

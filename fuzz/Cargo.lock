@@ -2197,6 +2197,7 @@ dependencies = [
  "libfuzzer-sys",
  "nomt-core",
  "postcard",
+ "schemars 1.2.3",
  "selendra-interface",
  "selendra-mock-da",
  "selendra-mock-zkvm",

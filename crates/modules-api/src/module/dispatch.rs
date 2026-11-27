@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::{Context, Module, Spec};
-use crate::{ModuleError, ModuleId, TxState};
+use crate::{LayoutError, ModuleDescriptor, ModuleError, ModuleId, TxState, check_layout};
 
 /// A runtime-level message, a runtime's call or event: one module's message, tagged with that
 /// module. Implemented by the runtime's call and event types (derived; upstream used strum's
@@ -31,9 +31,30 @@ pub trait ModuleMessage {
 /// the runtime, so adding, removing or reordering modules changes no call's encoding) and keyed
 /// by the module's [`NAME`](crate::ModuleInfo::NAME) in JSON. It is signed, so it is a
 /// consensus type.
+///
+/// # Layout
+/// The runtime's modules ([`MODULES`](Self::MODULES)) must follow the layout rules
+/// ([`check_layout`]: no discriminant `0`, no two modules with one discriminant or one name,
+/// every dependency a module of the runtime with its discriminant and name). The derive checks
+/// them at compile time wherever the runtime is used: its call and event codecs, its dispatch,
+/// genesis and hooks evaluate the hidden constant `__CHECK_LAYOUT`, which fails to compile
+/// (E0080, with the rule broken) when the runtime is instantiated with modules that break them.
+/// That happens in every build that generates code (`cargo build`, `cargo test`, doctests),
+/// not under `cargo check` or clippy, which do not evaluate constants of generic code; a
+/// concrete runtime also adds `const _: () = Runtime::<…>::__CHECK_LAYOUT;`, which they do
+/// evaluate (Phase 8). Genesis checks them again at run time, and so does the node at startup
+/// ([`validate_layout`](Self::validate_layout)): an upgrade does not rerun genesis.
 pub trait DispatchCall: Send + Sync {
     /// The spec.
     type Spec: Spec;
+
+    /// The runtime's modules ([`ModuleDescriptor::of`] each), in the order of its fields.
+    const MODULES: &'static [ModuleDescriptor];
+
+    /// The compile-time layout check: evaluating it fails to compile (E0080) if
+    /// [`MODULES`](Self::MODULES) break the layout rules.
+    #[doc(hidden)]
+    const __CHECK_LAYOUT: () = crate::layout::assert_layout(Self::MODULES);
 
     /// The runtime's call type: a call of one of its modules.
     type Decodable: ModuleMessage
@@ -82,6 +103,15 @@ pub trait DispatchCall: Send + Sync {
 
     /// The id of the module `call` goes to.
     fn module_id(&self, call: &Self::Decodable) -> &ModuleId;
+
+    /// Checks the runtime's layout ([`check_layout`] of [`MODULES`](Self::MODULES)) at run
+    /// time: genesis does, and the node at startup (an upgrade does not rerun genesis).
+    ///
+    /// # Errors
+    /// The first layout rule the runtime's modules break.
+    fn validate_layout() -> Result<(), LayoutError> {
+        check_layout(Self::MODULES)
+    }
 }
 
 /// Wraps a module's call message in the runtime's call type: implemented by the runtime's derive

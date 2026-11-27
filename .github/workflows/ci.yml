@@ -128,7 +128,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [addresses, keys, mock_adapters, modules_api_types, safe_types, state_keys, state_witness, tx_decoding]
+        target: [addresses, keys, mock_adapters, modules_api_types, runtime_codec, safe_types, state_keys, state_witness, tx_decoding]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
