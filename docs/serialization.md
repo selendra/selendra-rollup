@@ -617,7 +617,9 @@ commitment) and the guest decodes them. Every public borsh type is a consensus t
 `selendra-modules-api` (Phase 5). Every public borsh type is a consensus type (`Amount`,
 `GasUnit<N>`, `GasPrice<N>`, `BlockGasInfo<G>`, `ModuleId` and every `hash32_id!` type,
 `OperatingMode`, `SequencerType`, `PriorityFeeBips`, `TxDetails<S>`, `NotInstantiable`,
-`SelendraSpec`), and a spec's `Gas` and `Address`, a module's call messages and events
+`SelendraSpec`, and the transaction types below: `Transaction`, `Version0`, `Version1`,
+`PubKeyAndSignature`, `UnsignedTransaction`, the signing payloads, `UniquenessData`,
+`RuntimeCommitment`), and a spec's `Gas` and `Address`, a module's call messages and events
 (`Module::CallMessage`: `CallMessage`; `Module::Event`) and a runtime's call type
 (`DispatchCall::Decodable`) must be (trait bounds).
 
@@ -783,6 +785,82 @@ fork), derived strum discriminant enums and names, and named every generated typ
   every module's hook in field order, fully qualified (never an inherent method of the same
   name); a transaction hook's first error stops the rest.
 
+### Native transactions
+
+`selendra_modules_api::transaction` (Phase 5 S10; the authenticator that reads them from their
+envelope is S11). A transaction is single-key (`Version0`) or multisig (`Version1`), signed
+with ed25519 (`Transaction<R, S>`, `C = Ed25519CryptoSpec`) or secp256k1
+(`Transaction<R, S, EvmCryptoSpec>`; software keys only, wallets use EIP-712 in Phase 7). No
+legacy format (upstream's `legacy_v0`), no chain-hash fragment.
+
+| Type | borsh | JSON |
+|---|---|---|
+| `Transaction` | tag `0` (V0) or `1` (V1), then the version's fields | `{"v0": …}` / `{"v1": …}` |
+| `Version0` | `signature`, `pub_key`, `runtime_call`, `uniqueness`, `details`, `address_override` (`Option<S::Address>`) | an object with exactly these fields; `address_override` `null` for none, never missing |
+| `Version1` | `signatures` (`u32` LE count ≤ 21, each `signature` then `pub_key`), `unused_pub_keys` (count ≤ 21, keys), `min_signers` (one byte), `runtime_call`, `uniqueness`, `details`, `address_override` | the same rule |
+| `UnsignedTransaction` | `runtime_call`, `uniqueness`, `details`, `address_override` | the same rule |
+| `UniquenessData` | tag (`0` = `Nonce`, `1` = `Generation`, `2` = `Window`), then the `u64` LE (9 bytes) | `{"nonce": n}`, `{"generation": n}`, `{"window": n}` (a number) |
+| `TransactionSigningPayload` | tag `0` (V0) or `1` (V1), then the payload's fields | `{"v0": …}` / `{"v1": …}` |
+| V0 payload | `runtime_call`, `uniqueness`, `details`, `signer` (the key), `address_override`, `runtime_commitment` (32 bytes) | an object with exactly these fields |
+| V1 payload | `runtime_call`, `uniqueness`, `details`, `credential_address` (`S::Address`), `address_override`, `runtime_commitment` | the same |
+| `RuntimeCommitment` | the 32 bytes | `0x` + 64 lowercase hex digits |
+
+Keys and signatures encode as their raw bytes (ed25519: 32 and 64; secp256k1: the 33-byte
+compressed key and `r ‖ s`, low-S) in borsh, `0x` + lowercase hex in JSON (upstream's
+`hex_field_format` accepted any case and no prefix).
+
+- **Signed bytes:** `signing_bytes(SigningDomain::Transaction, chain_id, SHA-256(borsh(payload)))`,
+  i.e. `0xB5 "SELENDRA" ‖ 0x01 ‖ 0x01 ‖ chain_id (u64 LE) ‖ prehash`, 51 bytes (Phase 5 O2:
+  the prehash, so a signature costs the same whatever the call's size; the payload's SHA-256
+  is charged per byte, D17). Signatures are checked only against `SigningBytes`
+  (`Transaction::verify_signature(&SigningBytes)`), never a bare payload (P5-07). The payload
+  is never sent: the signer and the authenticator each build it from the transaction.
+- **Runtime commitment:** `SHA-256("SELENDRA/runtime/v1" ‖ chain_id (u64 LE) ‖ spec_version
+  (u32 LE) ‖ schema_hash)`, with `spec_version = details.runtime_version` and the schema hash
+  the runtime's version table gives for it. A signature is valid only for one network and one
+  runtime version's encoding of the call (upstream: a 32-byte `chain_hash`, selected by a
+  64-bit fragment of itself). Phase 7's EIP-712 domain carries it as its salt (with
+  `name = "Selendra"`, `version` = the spec version, `chainId`).
+- **V0 commits to its key** (`signer`): an ECDSA signature verifies under more than one key,
+  and upstream's V0 payload had no key, so another key could reuse the signature (P5-36).
+- **V1 commits to its multisig** (`credential_address` = `AccountAddress::default_for` of
+  `Credential::Multisig(credential)`): every subset and order of signers signs the same bytes,
+  and the signatures are valid for no other key set or threshold.
+- **Multisig:** `1 ≤ min_signers ≤ keys ≤ MAX_SIGNERS` (21, signers and unused keys
+  together), no key twice; each signature by one of its keys, each key at most once, at least
+  `min_signers` of them, and all must verify (upstream: a threshold of 0, up to 42 keys,
+  duplicates, and signers checked against the signatures themselves, so an outsider's
+  signature counted; P5-34). Decoding checks only each list's cap; the rest is checked before
+  the credential is computed and before any signature is verified. Credential:
+  `SHA-256("SELENDRA/multisig/v1" ‖ scheme ‖ min_signers ‖ borsh(keys sorted by their bytes))`,
+  scheme `0` = ed25519, `1` = secp256k1 (`SignatureScheme`: its own number space, never
+  reused; envelope tags are allocated separately, and several envelope formats may carry one
+  scheme). Its account is `Standard` (the first 28 bytes).
+- **Version table** (`VersionTable` of `VersionWindow { spec_version, schema_hash, from_height,
+  until_height }`, `until` exclusive, `None` for the current version): the first window starts
+  at genesis, only the last is open, each starts after the previous one starts and no later
+  than it ends, ends after it ends, overlaps only the next one (its **grace period**: both
+  versions accepted, at most two at any height), and spec versions increase. `check_version_table`
+  is a `const fn`; `VersionTable::new_or_panic` in a constant makes an invalid table a compile
+  error. A grace period is for additive schema changes only (every call of the old version
+  decodes to the same call under the new one); Phase 8 adds a compatibility test per grace
+  period and derives `schema_hash` in a golden test. Upstream could keep an old hash valid past
+  the next override into the one after it (P5-39).
+- **Known-answer vectors** (`transaction/tests/vectors.rs`, for the SDKs in Phase 13): one V0
+  and one V1 transaction per scheme, with the commitment, the payload's encoding, its prehash,
+  the signed bytes, the signatures and the transaction's encoding, computed independently of
+  the crate (Python's `hashlib`, RFC 8032's reference ed25519, a pure-Python RFC 6979 ECDSA over
+  keccak256; every signature reproduced with OpenSSL). Both schemes sign deterministically:
+  `sign` reproduces them. They change when Phase 6 adds the fee token and payer.
+- **Authorization data** (`AuthorizationData`, never serialized): the credential id and the
+  default address are derived from the typed `Credential` when it is built, so an EVM key's
+  default address is its `0x…` account on every path (P5-08).
+- **Fees:** `TransactionConsumption::from_meter` (the meter's gas used and its value, the tip
+  capped by the funds left) gives the `ProverReward`, `SequencerReward` and `RemainingFunds`;
+  their fields are private, they have no public constructor (but `SequencerReward::ZERO`) and
+  do not decode (upstream's were `pub` and `SequencerReward` and `TransactionConsumption`
+  decoded, P5-41), and they serialize for display only.
+
 ## Checking
 
 - `make test` (`cargo test --workspace --all-features`) — unit tests, including known-answer
@@ -800,5 +878,5 @@ fork), derived strum discriminant enums and names, and named every generated typ
   dependencies, event names, consensus types, runtime call and event encodings, dispatch,
   genesis, hooks), in the guest configuration too; the layout check by unit tests on
   `check_layout` and `compile_fail,E0080` doctests (`DispatchCall`'s derive).
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `modules_api_types`, `runtime_codec`, `safe_types`, `state_keys`, `state_witness`, `tx_decoding`
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `modules_api_types`, `runtime_codec`, `safe_types`, `state_keys`, `state_witness`, `transactions`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

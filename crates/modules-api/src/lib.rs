@@ -31,8 +31,15 @@
 //! - [`common`]: token amounts ([`Amount`]), 32-byte ids shown as bech32m ([`hash32_id!`],
 //!   [`ModuleId`]), module errors ([`ModuleError`], [`ErrorDetail`]) and the cryptography
 //!   bounds of the module system ([`PublicKeyExt`], [`SignatureExt`]);
-//! - [`runtime`] ([`OperatingMode`]) and [`transaction`] ([`TxDetails`],
-//!   [`AuthenticatedTransactionData`], [`PriorityFeeBips`]).
+//! - [`runtime`] ([`OperatingMode`]);
+//! - [`transaction`]: a transaction's details ([`TxDetails`], [`AuthenticatedTransactionData`],
+//!   [`PriorityFeeBips`]), native transactions (single-key or multisig, ed25519 or secp256k1:
+//!   [`transaction::Transaction`]), what they sign ([`transaction::TransactionSigningPayload`],
+//!   committing to the network and the runtime version, [`transaction::RuntimeCommitment`]), the
+//!   runtime versions accepted by height ([`transaction::VersionTable`]), multisigs
+//!   ([`transaction::Multisig`]), what authentication establishes
+//!   ([`transaction::AuthorizationData`]) and what fees pay
+//!   ([`transaction::TransactionConsumption`]).
 //!
 //! Every type that is stored or signed is a consensus type
 //! ([`ConsensusType`](trait@ConsensusType)); encodings are in `docs/serialization.md`, "Module

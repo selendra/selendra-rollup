@@ -86,6 +86,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "transactions"
+path = "fuzz_targets/transactions.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tx_decoding"
 path = "fuzz_targets/tx_decoding.rs"
 test = false

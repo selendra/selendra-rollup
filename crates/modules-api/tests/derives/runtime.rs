@@ -408,6 +408,42 @@ fn runtime_call_tag_is_module_discriminant() {
     assert_eq!(borsh::from_slice::<Event>(&[248, 0, 12]).unwrap(), event);
 }
 
+/// A runtime is what its transactions call (`TransactionCallable` for every `DispatchCall`): a
+/// transaction carries the runtime's call type, encoded with the module's tag.
+#[test]
+fn transactions_call_the_runtime() {
+    use selendra_modules_api::transaction::{Transaction, UniquenessData, UnsignedTransaction};
+    use selendra_primitives::crypto::{Ed25519CryptoSpec, Ed25519Signature};
+
+    let unsigned = UnsignedTransaction::<R, S>::new(
+        Call::Second(12),
+        UniquenessData::Nonce(1),
+        TxDetails {
+            max_priority_fee_bips: PriorityFeeBips::ZERO,
+            max_fee: Amount::new(1),
+            gas_limit: None,
+            runtime_version: 1,
+        },
+        None,
+    );
+    let key = "0xd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        .parse()
+        .unwrap();
+    let signature = Ed25519Signature::from_bytes([0; 64]).unwrap();
+    let tx: Transaction<R, S, Ed25519CryptoSpec> = unsigned.to_signed_tx(key, signature);
+    assert_eq!(tx.runtime_call(), &Call::Second(12));
+    let encoded = borsh::to_vec(&tx).unwrap();
+    // The version tag, the signature, the key, then the call.
+    assert_eq!(encoded[0], 0);
+    assert_eq!(encoded[97..99], [248, 12]);
+    assert_eq!(
+        borsh::from_slice::<Transaction<R, S>>(&encoded).unwrap(),
+        tx
+    );
+    let payload = borsh::to_vec(&tx.signing_payload(1961, &[0; 32]).unwrap()).unwrap();
+    assert_eq!(payload[..3], [0, 248, 12]);
+}
+
 /// Calls decode from exactly their encoding: a tag that is no module's discriminant (`0`,
 /// field positions, a gap), trailing bytes, a truncated message, and a message that does not
 /// decode are errors. The same for events (`NotInstantiable` modules' tags included).

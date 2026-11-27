@@ -126,7 +126,7 @@ impl<S: Spec> ConsensusType for TxDetails<S> {}
 /// An `Option` field that must be present (`null` for `None`): one JSON form per value. (Serde's
 /// derive treats a missing `Option` field as `None` unless the field has its own
 /// deserializer.)
-fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(crate) fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
