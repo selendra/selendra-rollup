@@ -1,7 +1,11 @@
 //! Native transactions: the signing known-answer vectors, the payload's commitments, multisig
 //! transactions, encodings.
 
-mod vectors;
+pub(crate) mod vectors;
+
+/// ed25519 keys of known seeds (the multisig tests' `ED25519_KEYS`), for the authenticator's
+/// tests.
+pub(crate) use super::multisig::tests::ed25519_key;
 
 use selendra_interface::crypto::PublicKey;
 use selendra_interface::zk::CryptoSpec;
@@ -37,13 +41,13 @@ const SCHEMA_2: SchemaHash = [0x22; 32];
     crate::ConsensusType,
 )]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum VectorCall {
+pub(crate) enum VectorCall {
     Ping(u64),
     Data(Vec<u8>),
 }
 
 /// A runtime whose calls are [`VectorCall`]s.
-pub(super) struct VectorRuntime;
+pub(crate) struct VectorRuntime;
 
 impl TransactionCallable for VectorRuntime {
     type Call = VectorCall;
@@ -299,6 +303,124 @@ fn signed_bytes_are_the_header_and_the_prehash() {
         tx.signing_bytes(CHAIN_ID, &SCHEMA_2).unwrap().as_bytes(),
         expected
     );
+}
+
+/// The payload a transaction's signed bytes are computed from borrows the transaction's fields
+/// (the call is not copied before the authenticator charges for encoding it): it encodes
+/// exactly like the owned payload, for both versions and both schemes, and gives the same
+/// length, prehash and signed bytes.
+#[test]
+fn borrowed_payload_encodes_like_the_owned_one() {
+    fn check<C: TxCryptoSpec>(tx: &Transaction<VectorRuntime, S, C>, schema: &SchemaHash) {
+        let owned = tx.signing_payload(CHAIN_ID, schema).unwrap();
+        let borrowed = owned.as_ref();
+        let encoded = borsh::to_vec(&owned).unwrap();
+        assert_eq!(borsh::to_vec(&borrowed).unwrap(), encoded);
+        assert_eq!(borrowed.encoded_len().unwrap(), encoded.len());
+        assert_eq!(borrowed.prehash().unwrap(), owned.prehash().unwrap());
+        assert_eq!(
+            borrowed.signing_bytes(CHAIN_ID).unwrap(),
+            tx.signing_bytes(CHAIN_ID, schema).unwrap()
+        );
+        let direct = match tx {
+            Transaction::V0(v0) => v0.signing_payload_ref(tx.runtime_commitment(CHAIN_ID, schema)),
+            Transaction::V1(v1) => v1.signing_payload_ref(
+                <S as crate::Spec>::Address::default_for(&v1.credential().unwrap()),
+                tx.runtime_commitment(CHAIN_ID, schema),
+            ),
+        };
+        assert_eq!(borsh::to_vec(&direct).unwrap(), encoded);
+    }
+    use vectors::{v0_ed25519, v0_secp256k1};
+    let v0_ed: Ed = v0_ed25519_unsigned()
+        .to_signed_tx(parse(v0_ed25519::PUB_KEY), parse(v0_ed25519::SIGNATURE));
+    let v0_secp: Secp = v0_secp256k1_unsigned()
+        .to_signed_tx(parse(v0_secp256k1::PUB_KEY), parse(v0_secp256k1::SIGNATURE));
+    check(&v0_ed, &SCHEMA_1);
+    check(&v0_secp, &SCHEMA_1);
+    check(&v1_ed25519_tx(), &SCHEMA_2);
+    check(&v1_secp256k1_tx(), &SCHEMA_2);
+}
+
+/// The signing payload's length computed from the transaction's encoded length (what the
+/// authenticator charges for, without walking the call: `signing_payload_len`) is the
+/// payload's encoded length, for both versions and both schemes, calls of any size, no address
+/// override or one of either kind, and V1 transactions with 0 to 21 signers and 0 to 21 unused
+/// keys (placeholder signatures and repeated keys: only the lengths matter here).
+#[test]
+fn signing_payload_len_from_the_transaction_len() {
+    fn check<C: TxCryptoSpec>(tx: &Transaction<VectorRuntime, S, C>) {
+        let encoded = borsh::to_vec(tx).unwrap().len();
+        let commitment = tx.runtime_commitment(CHAIN_ID, &SCHEMA_1);
+        let (computed, actual) = match tx {
+            Transaction::V0(v0) => (
+                v0.signing_payload_len(encoded),
+                borsh::object_length(&v0.signing_payload_ref(commitment)).unwrap(),
+            ),
+            Transaction::V1(v1) => {
+                let address = <S as crate::Spec>::Address::default_for(&Credential::Multisig(
+                    selendra_interface::crypto::CredentialId::from_bytes([3; 32]),
+                ));
+                (
+                    v1.signing_payload_len(encoded, &address),
+                    borsh::object_length(&v1.signing_payload_ref(address, commitment)).unwrap(),
+                )
+            }
+        };
+        assert_eq!(computed, Some(actual), "{tx:?}");
+    }
+    fn variants<C: TxCryptoSpec>(base: &Transaction<VectorRuntime, S, C>) {
+        let calls = [
+            VectorCall::Ping(1),
+            VectorCall::Data(Vec::new()),
+            VectorCall::Data(vec![7; 1000]),
+        ];
+        let overrides = [
+            None,
+            Some(MultiAddressEvm::Standard(Address::new([1; 28]))),
+            Some(MultiAddressEvm::Vm(EthereumAddress::new([2; 20]))),
+        ];
+        for call in &calls {
+            for address_override in overrides {
+                let mut tx = base.clone();
+                match &mut tx {
+                    Transaction::V0(v0) => {
+                        v0.runtime_call = call.clone();
+                        v0.address_override = address_override;
+                    }
+                    Transaction::V1(v1) => {
+                        v1.runtime_call = call.clone();
+                        v1.address_override = address_override;
+                    }
+                }
+                check(&tx);
+            }
+        }
+        if let Transaction::V1(v1) = base {
+            let signed = v1.signatures[0].clone();
+            for (signers, unused) in [(0, 0), (0, 21), (21, 0), (21, 21), (1, 2), (5, 3)] {
+                let mut v1 = v1.clone();
+                v1.signatures = vec![signed.clone(); signers].try_into().unwrap();
+                v1.unused_pub_keys = vec![signed.pub_key.clone(); unused].try_into().unwrap();
+                check(&Transaction::V1(v1));
+            }
+        }
+    }
+    use vectors::{v0_ed25519, v0_secp256k1};
+    let v0_ed: Ed = v0_ed25519_unsigned()
+        .to_signed_tx(parse(v0_ed25519::PUB_KEY), parse(v0_ed25519::SIGNATURE));
+    let v0_secp: Secp = v0_secp256k1_unsigned()
+        .to_signed_tx(parse(v0_secp256k1::PUB_KEY), parse(v0_secp256k1::SIGNATURE));
+    variants(&v0_ed);
+    variants(&v0_secp);
+    variants(&v1_ed25519_tx());
+    variants(&v1_secp256k1_tx());
+    // Too short to hold the fields the payload drops.
+    let Transaction::V0(v0) = &v0_ed else {
+        unreachable!()
+    };
+    assert_eq!(v0.signing_payload_len(63), None);
+    assert_eq!(v0.signing_payload_len(64), Some(32));
 }
 
 // Regressions of upstream's signing payload bugs

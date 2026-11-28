@@ -51,7 +51,9 @@ pub enum UniquenessData {
 /// value is built ([`AuthorizationData::new`]), on every path: an EVM key's default address is
 /// its `0x…` account (`Vm`) whichever authenticator built it (upstream computed
 /// `default_address` as `credential_id.into()` in the native authenticator, a `sel1…` address
-/// for an EVM key, and let each authenticator set it; P5-08).
+/// for an EVM key, and let each authenticator set it; P5-08). They are derived together
+/// ([`AccountAddress::default_and_credential_id`]): an EVM key's Ethereum address, which both
+/// come from, is derived once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizationData<S: Spec> {
     uniqueness: UniquenessData,
@@ -74,13 +76,14 @@ impl<S: Spec> AuthorizationData<S> {
         credential: Credential,
         address_override: Option<S::Address>,
     ) -> Self {
+        let (default_address, credential_id) = S::Address::default_and_credential_id(&credential);
         Self {
             uniqueness,
             tx_hash,
             non_malleable_hash,
-            credential_id: credential.credential_id(),
-            default_address: S::Address::default_for(&credential),
             credential,
+            credential_id,
+            default_address,
             address_override,
         }
     }
@@ -142,6 +145,7 @@ mod tests {
 
     use super::*;
     use crate::test_utils::TestSpec;
+    use selendra_primitives::crypto::count_ethereum_address_derivations;
 
     #[test]
     fn uniqueness_encodings() {
@@ -195,13 +199,18 @@ mod tests {
         let eth: EthereumAddress = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
             .parse()
             .unwrap();
-        let data = AuthorizationData::<TestSpec>::new(
-            UniquenessData::Nonce(1),
-            HexHash::new([1; 32]),
-            HexHash::new([2; 32]),
-            Credential::Secp256k1(secp),
-            None,
-        );
+        // The key's Ethereum address (its default address and, zero-padded, its credential id)
+        // is derived once (it was twice: once for each).
+        let (derivations, data) = count_ethereum_address_derivations(|| {
+            AuthorizationData::<TestSpec>::new(
+                UniquenessData::Nonce(1),
+                HexHash::new([1; 32]),
+                HexHash::new([2; 32]),
+                Credential::Secp256k1(secp),
+                None,
+            )
+        });
+        assert_eq!(derivations, 1);
         assert_eq!(data.default_address(), &MultiAddressEvm::Vm(eth));
         assert_eq!(
             data.credential_id(),

@@ -26,7 +26,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 postcard = { workspace = true }
-selendra-primitives = { path = ".", features = ["native"] }
+selendra-primitives = { path = ".", features = ["native", "test-counters"] }
 # Only to check at compile time that the crypto specs hash with the state hasher (`StateHasher`).
 # `native`: this crate's own dev-dependency above turns on `selendra-interface/native`.
 selendra-state = { workspace = true, features = ["native"] }
@@ -36,6 +36,10 @@ serde_json = { workspace = true }
 default = []
 # Node-only code (never in the zk guest): private keys and key generation.
 native = ["dep:rand_core", "k256/getrandom", "selendra-interface/native"]
+# Test instrumentation, never in a node or guest build: `crypto::count_ethereum_address_derivations`
+# counts (per thread) the Ethereum addresses derived from secp256k1 keys, so the crates that
+# price that derivation can test how often they do it.
+test-counters = []
 
 [lints]
 workspace = true

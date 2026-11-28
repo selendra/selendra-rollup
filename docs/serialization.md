@@ -619,7 +619,8 @@ commitment) and the guest decodes them. Every public borsh type is a consensus t
 `OperatingMode`, `SequencerType`, `PriorityFeeBips`, `TxDetails<S>`, `NotInstantiable`,
 `SelendraSpec`, and the transaction types below: `Transaction`, `Version0`, `Version1`,
 `PubKeyAndSignature`, `UnsignedTransaction`, the signing payloads, `UniquenessData`,
-`RuntimeCommitment`), and a spec's `Gas` and `Address`, a module's call messages and events
+`RuntimeCommitment`; the authenticator's envelope `AuthenticatorInput`; the sequencer
+registry's `AllowedSequencer<S>`), and a spec's `Gas` and `Address`, a module's call messages and events
 (`Module::CallMessage`: `CallMessage`; `Module::Event`) and a runtime's call type
 (`DispatchCall::Decodable`) must be (trait bounds).
 
@@ -788,7 +789,7 @@ fork), derived strum discriminant enums and names, and named every generated typ
 ### Native transactions
 
 `selendra_modules_api::transaction` (Phase 5 S10; the authenticator that reads them from their
-envelope is S11). A transaction is single-key (`Version0`) or multisig (`Version1`), signed
+envelope, below, is S11). A transaction is single-key (`Version0`) or multisig (`Version1`), signed
 with ed25519 (`Transaction<R, S>`, `C = Ed25519CryptoSpec`) or secp256k1
 (`Transaction<R, S, EvmCryptoSpec>`; software keys only, wallets use EIP-712 in Phase 7). No
 legacy format (upstream's `legacy_v0`), no chain-hash fragment.
@@ -860,6 +861,125 @@ compressed key and `r ‖ s`, low-S) in borsh, `0x` + lowercase hex in JSON (ups
   their fields are private, they have no public constructor (but `SequencerReward::ZERO`) and
   do not decode (upstream's were `pub` and `SequencerReward` and `TransactionConsumption`
   decoded, P5-41), and they serialize for display only.
+- **The signing payload is borrowed:** the signer and the authenticator encode the payload from
+  the transaction's own fields (`SigningPayloadRef`, the same bytes as
+  `TransactionSigningPayload`'s encoding, pinned by the vectors), so the call (up to 1 MiB) is
+  never copied, in particular not before the authenticator charges for encoding it.
+
+### Authenticator
+
+`selendra_modules_api::authenticator` (Phase 5 S11): `SelendraAuthenticator<S, R, V>` reads a
+`FullyBakedTx` and authenticates the native transaction in it; `R` is the runtime (its calls),
+`V: RuntimeVersions` gives the runtime's version table (a constant: an invalid table does not
+compile), and the chain ID is an input (Phase 8 reads it from kernel state per network).
+
+**Envelope** (`AuthenticatorInput`, the whole of `FullyBakedTx.data`): a tag byte, then the
+transaction as a `RawTx` (`u32` LE length ≤ `MAX_RAW_TX_SIZE`, then exactly that many bytes, the
+transaction's borsh encoding). Nothing may follow. The tags are part of the protocol and never
+reused; they are their own number space (`AuthenticatorKind`), separate from the
+`SignatureScheme` byte hashed into multisig credentials:
+
+| Tag | Authenticator | Transaction |
+|---|---|---|
+| `0` | native ed25519 | `Transaction<R, S, Ed25519CryptoSpec>` |
+| `1` | native secp256k1 (software keys) | `Transaction<R, S, EvmCryptoSpec>` |
+| `2` | reserved: EIP-712 (Phase 7) | rejected: `FatalError::UnsupportedAuthenticator` |
+| `3` | reserved: Ethereum RLP (Phase 7) | rejected: `FatalError::UnsupportedAuthenticator` |
+| other | none | `FatalError::DeserializationFailed` |
+
+The authenticator never decodes the envelope into a value: `Envelope::parse` reads the 5-byte
+header and borrows the transaction's bytes, accepting exactly what `AuthenticatorInput`'s borsh
+decoder accepts (the `authenticator` fuzz target checks it). Upstream decoded it with borsh,
+copying up to 1 MiB before any gas was charged (P5-37).
+
+**Hashes** (both SHA-256, the state hasher):
+- the **transaction hash** is the hash of `FullyBakedTx.data`, so it covers the tag: the same
+  transaction bytes under two tags have two hashes (upstream hashed the inner bytes, P5-38);
+- the **replay hash** (`AuthorizationData::non_malleable_hash`) is the hash of the 51 signed
+  bytes, for every version: another encoding of the same signed transaction (its multisig
+  signatures in another order) has the same replay hash (upstream used the transaction hash for
+  V0, P5-35). The key and signature encodings are canonical anyway (Phase 3: compressed SEC1
+  keys only, low-S signatures; "Canonical encodings" above), but replay protection no longer
+  depends on it.
+
+**Checks**, each charged before its work (`GasSchedule` of the spec; `n` a length in bytes), in
+the order they run (numbered as in the Phase 5 plan, D17):
+
+| | Work | Gas |
+|---|---|---|
+| 1 | the transaction hash, then the envelope (5 bytes) | `hash_per_byte·n + hash_update` over `data` |
+| 2 | borsh decode of the transaction (`from_slice`: trailing bytes rejected) | `decode_per_byte·n` |
+| 4 | the public keys decoded in 2 (curve decompression, checks) | `pubkey_decode[scheme]` per key: V0 one, V1 its signers and its unused keys |
+| 3 | the runtime version, at the accessor's rollup height | none (a lookup in a small constant table) |
+| 5 | V1: the multisig's credential (the threshold and key count checked first, the keys sorted and checked for duplicates after the charge) | `hash_update + hash_per_byte·(20 + 2 + 4 + key bytes)` |
+| 5 | the signing payload's encoding and prehash (borrowed, not copied; the encoding stops at `n` bytes) | `encode_per_byte·n + hash_update + hash_per_byte·n`, `n` = the payload's length from the transaction's (below) |
+| 6 | the replay hash | `hash_per_byte·51 + hash_update` |
+| 7 | the signatures, all charged before any is verified | `sig_verify[scheme] + sig_per_byte[scheme]·51` each |
+
+The keys are decoded inside stage 2 and their number is known only after it, so stage 4 is
+charged right after the work it pays for, before anything else can reject the transaction: a
+decode that fails, or a refused charge, leaves at most 42 key decodes unpaid (the `SafeVec`
+caps of a V1 transaction; P5-62, upstream priced keys by their bytes only). A V0 secp256k1 key's
+credential id and default address are both its Ethereum address, derived once when the
+authorization data is built (`AccountAddress::default_and_credential_id`: one decompression and
+one keccak256 of 64 bytes per transaction), and priced in its `pubkey_decode`.
+
+Stage 5 does nothing proportional to the call before its charges. The payload's length `n` is
+computed from the transaction's length (the bytes stage 2 decoded and paid for), not by walking
+the call:
+
+- V0: `len(tx) - len(signature) + 32`;
+- V1: `len(tx) - len(signatures) - len(unused keys) - 1 + len(credential address) + 32`
+
+(the payload holds the transaction's other fields, the same values and so the same bytes, and
+the 32-byte runtime commitment). The encoding is then hashed as it is written and stops at the
+first write past `n` bytes, so at most `n` bytes are encoded and hashed: a payload that does not
+encode to exactly `n` bytes (a call decoded from bytes other than its own encoding, i.e. a call
+type whose decoding is not canonical) is `DeserializationFailed`, having paid stages 1 to 5. For V1, the
+multisig's threshold and key count are checked before the credential's charge (constant
+time), and its keys are copied, sorted and checked for duplicates after it (the charge pays
+for that: the credential hashes the same keys). An invalid multisig is `SigVerificationFailed`
+having paid stages 1, 2 and 4, and for a duplicate key also the credential's charge. Gas grows
+linearly with the call's size (`2·hash_per_byte + decode_per_byte + encode_per_byte` per byte)
+and the signatures cost the same for any size (they sign the prehash).
+
+A refused charge is `AuthenticationError::OutOfGas` and poisons the pre-execution phase (the
+sequencer pays for the checks, it is not slashed); anything else is
+`AuthenticationError::FatalError(error, tx_hash)` (the sequencer should have caught it):
+
+- `DeserializationFailed`: the envelope or the transaction does not decode, or its signing
+  payload does not encode to the length its encoding gives (not canonical);
+- `UnsupportedAuthenticator { tag }`: a reserved tag (`2`, `3`);
+- `InvalidRuntimeVersion { expected, got }`: the version the transaction names is not accepted
+  at this height (unknown, or outside its window; `expected` is the newest version accepted, a
+  version in its grace period is accepted too);
+- `SigVerificationFailed`: a signature does not verify over the signed bytes for this chain ID
+  and this version's schema hash (a signature for another network, domain, runtime version or
+  schema, over a bare payload, by another key), or the multisig is invalid;
+- `Other`: a payload that does not encode (consensus types never fail to encode).
+
+Upstream's chain-hash errors (`InvalidChainHash`, `InvalidChainHashFragment`, `MissingChainId`,
+`InvalidChainId`) do not exist: the chain ID and the version are in the signed bytes.
+`FatalError`/`AuthenticationError` JSON: externally tagged, snake_case variant names (for
+receipts and APIs; never decoded by the STF).
+
+**Unregistered sequencers** (`authenticate_unregistered`, a forced registration): the same
+checks; an envelope that does not parse (or a reserved tag) is
+`InvalidAuthenticationDiscriminant`.
+
+**Authorization data:** the credential is typed (`Credential::Ed25519`, `Secp256k1`, or
+`Multisig(credential)`), and the default address derives from it
+(`AccountAddress::default_for`): an EVM key's account is its `0x…` address on the authenticator
+path too (P5-08). The credential id and the default address are derived together
+(`AccountAddress::default_and_credential_id`; for an EVM key, its Ethereum address once).
+
+**EIP-712 (Phase 7, envelope tag `2`):** the domain is `name = "Selendra"`, `version` = the spec
+version, `chainId` = the chain ID, `salt` = the runtime commitment; Ethereum RLP transactions
+(tag `3`) use EIP-155 with the chain ID.
+
+**Test support** (`test-utils`): `MockCapabilities` implements every capability over in-memory
+maps (and `HasCapabilities`, for runtimes overriding one capability); `TestUser` (with `native`)
+signs native transactions and gives the account the authenticator assigns them.
 
 ## Checking
 
@@ -878,5 +998,5 @@ compressed key and `r ‖ s`, low-S) in borsh, `0x` + lowercase hex in JSON (ups
   dependencies, event names, consensus types, runtime call and event encodings, dispatch,
   genesis, hooks), in the guest configuration too; the layout check by unit tests on
   `check_layout` and `compile_fail,E0080` doctests (`DispatchCall`'s derive).
-- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `keys`, `mock_adapters`, `modules_api_types`, `runtime_codec`, `safe_types`, `state_keys`, `state_witness`, `transactions`, `tx_decoding`
+- `cd fuzz && cargo +nightly fuzz run <target>` — targets `addresses`, `authenticator`, `keys`, `mock_adapters`, `modules_api_types`, `runtime_codec`, `safe_types`, `state_keys`, `state_witness`, `transactions`, `tx_decoding`
   (no panics + canonical round-trip). Add a target for every new decoder.

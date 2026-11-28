@@ -13,6 +13,8 @@ pub use self::ed25519::{
 };
 #[cfg(feature = "native")]
 pub use self::secp256k1::EthereumPrivateKey;
+#[cfg(feature = "test-counters")]
+pub use self::secp256k1::count_ethereum_address_derivations;
 pub use self::secp256k1::{EthereumPublicKey, EthereumSignature};
 
 /// The [`CryptoSpec`] for native `sel1…` accounts: ed25519 signatures and SHA-256.

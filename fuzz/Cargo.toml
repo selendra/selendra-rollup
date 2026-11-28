@@ -37,6 +37,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "authenticator"
+path = "fuzz_targets/authenticator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "keys"
 path = "fuzz_targets/keys.rs"
 test = false

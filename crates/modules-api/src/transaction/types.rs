@@ -5,12 +5,18 @@ use selendra_interface::common::SafeVec;
 use selendra_interface::crypto::CredentialId;
 use selendra_primitives::signing::{SigningBytes, verify_signing_bytes};
 
+use selendra_state::metered::StateGas;
+
+use super::signing_payload::SigningPayloadRef;
 use super::{
     MAX_SIGNERS, Multisig, MultisigError, PubKeyAndSignature, RuntimeCommitment, SchemaHash,
     TransactionCallable, TransactionError, TransactionSigningPayload, TransactionSigningPayloadV0,
     TransactionSigningPayloadV1, TxCryptoSpec, UniquenessData, UnsignedTransaction, value_traits,
 };
-use crate::{AccountAddress, ConsensusType, Credential, Spec, TxDetails};
+use crate::{AccountAddress, ConsensusType, Credential, GasMeter, Spec, TxDetails, TxStateError};
+
+/// The length of a [`RuntimeCommitment`]'s borsh encoding: its 32 bytes.
+const RUNTIME_COMMITMENT_LEN: usize = 32;
 
 /// A single-key transaction.
 ///
@@ -210,6 +216,38 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> Version0<R, S, C> {
         C::credential(&self.pub_key)
     }
 
+    /// The signing payload for `commitment`, borrowing the transaction's fields.
+    pub(crate) fn signing_payload_ref(
+        &self,
+        commitment: RuntimeCommitment,
+    ) -> SigningPayloadRef<'_, R, S, C> {
+        SigningPayloadRef::V0 {
+            runtime_call: &self.runtime_call,
+            uniqueness: self.uniqueness,
+            details: &self.details,
+            signer: &self.pub_key,
+            address_override: self.address_override.as_ref(),
+            runtime_commitment: commitment,
+        }
+    }
+
+    /// The length of the borsh encoding of the signing payload
+    /// ([`signing_payload_ref`](Self::signing_payload_ref)), from `encoded_len`, the length of
+    /// this transaction's own encoding (as a [`Transaction`], its tag included; the
+    /// authenticator has it: the bytes it decoded). The payload holds the transaction's fields
+    /// but the signature (the signer's key in another place), and the runtime commitment, so
+    /// it is `encoded_len - len(signature) + 32`. Constant time: the call is not walked.
+    ///
+    /// `None` if `encoded_len` is shorter than the signature. If `encoded_len` is not the
+    /// length of this transaction's canonical encoding, the payload does not encode to the
+    /// result ([`TransactionError::NonCanonicalEncoding`] when it is hashed at that length).
+    pub(crate) fn signing_payload_len(&self, encoded_len: usize) -> Option<usize> {
+        let signature = borsh::object_length(&self.signature).ok()?;
+        encoded_len
+            .checked_sub(signature)?
+            .checked_add(RUNTIME_COMMITMENT_LEN)
+    }
+
     /// The signing payload for `commitment`.
     pub fn signing_payload(
         &self,
@@ -287,6 +325,51 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> Version1<R, S, C> {
         }))
     }
 
+    /// The signing payload for `commitment`, borrowing the transaction's fields;
+    /// `credential_address` is the multisig credential's default address (the caller computed
+    /// the credential).
+    pub(crate) fn signing_payload_ref(
+        &self,
+        credential_address: S::Address,
+        commitment: RuntimeCommitment,
+    ) -> SigningPayloadRef<'_, R, S, C> {
+        SigningPayloadRef::V1 {
+            runtime_call: &self.runtime_call,
+            uniqueness: self.uniqueness,
+            details: &self.details,
+            credential_address,
+            address_override: self.address_override.as_ref(),
+            runtime_commitment: commitment,
+        }
+    }
+
+    /// The length of the borsh encoding of the signing payload for `credential_address`
+    /// ([`signing_payload_ref`](Self::signing_payload_ref)), from `encoded_len`, the length of
+    /// this transaction's own encoding (as a [`Transaction`], its tag included). The payload
+    /// holds the transaction's fields but the signatures (with their keys), the unused keys and
+    /// the threshold, and adds the credential address and the runtime commitment, so it is
+    /// `encoded_len - len(signatures) - len(unused keys) - 1 + len(credential_address) + 32`.
+    /// Bounded work: the lists' encodings (at most [`MAX_SIGNERS`] items each), never the
+    /// call.
+    ///
+    /// `None` if `encoded_len` is shorter than those fields. If it is not the length of this
+    /// transaction's canonical encoding, the payload does not encode to the result.
+    pub(crate) fn signing_payload_len(
+        &self,
+        encoded_len: usize,
+        credential_address: &S::Address,
+    ) -> Option<usize> {
+        let signatures = borsh::object_length(&self.signatures).ok()?;
+        let unused = borsh::object_length(&self.unused_pub_keys).ok()?;
+        let address = borsh::object_length(credential_address).ok()?;
+        encoded_len
+            .checked_sub(signatures)?
+            .checked_sub(unused)?
+            .checked_sub(1)?
+            .checked_add(address)?
+            .checked_add(RUNTIME_COMMITMENT_LEN)
+    }
+
     /// Whether at least `min_signers` keys signed.
     pub fn is_fully_signed(&self) -> bool {
         self.signatures.len() >= usize::from(self.min_signers)
@@ -360,7 +443,10 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> Version1<R, S, C> {
     ) -> Result<C::Signature, TransactionError> {
         let commitment =
             RuntimeCommitment::new(chain_id, self.details.runtime_version, schema_hash);
-        let bytes = self.signing_payload(commitment)?.signing_bytes(chain_id)?;
+        let credential_address = S::Address::default_for(&self.credential()?);
+        let bytes = self
+            .signing_payload_ref(credential_address, commitment)
+            .signing_bytes(chain_id)?;
         Ok(selendra_primitives::signing::sign_signing_bytes(
             key, &bytes,
         ))
@@ -451,6 +537,7 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> Transaction<R, S, C> {
 
     /// The bytes the transaction's signatures must cover on `chain_id`, the runtime version
     /// (`details.runtime_version`) having `schema_hash` (the runtime's version table gives it).
+    /// The payload is encoded from the transaction's own fields (borrowed, not copied).
     ///
     /// # Errors
     /// A V1 transaction whose keys are not a valid multisig, or a payload that does not encode.
@@ -459,8 +546,14 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> Transaction<R, S, C> {
         chain_id: u64,
         schema_hash: &SchemaHash,
     ) -> Result<SigningBytes, TransactionError> {
-        self.signing_payload(chain_id, schema_hash)?
-            .signing_bytes(chain_id)
+        let commitment = self.runtime_commitment(chain_id, schema_hash);
+        let payload = match self {
+            Self::V0(tx) => tx.signing_payload_ref(commitment),
+            Self::V1(tx) => {
+                tx.signing_payload_ref(S::Address::default_for(&tx.credential()?), commitment)
+            }
+        };
+        payload.signing_bytes(chain_id)
     }
 
     /// Checks the signatures against `bytes` ([`signing_bytes`](Self::signing_bytes)): the key's
@@ -498,5 +591,47 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> Transaction<R, S, C> {
             Self::V0(_) => 1,
             Self::V1(tx) => tx.signatures.len(),
         }
+    }
+
+    /// Charges `meter` for decoding the transaction's public keys: the spec's
+    /// `pubkey_decode` of the scheme per key ([`key_count`](Self::key_count): V0 one, V1 the
+    /// signers and the unused keys, unused keys included: decoding the transaction decoded
+    /// them all; P5-62).
+    ///
+    /// # Errors
+    /// The charge was refused or overflows (the phase is then poisoned).
+    pub fn charge_gas_for_key_decode<M: GasMeter<S>>(
+        &self,
+        meter: &mut M,
+    ) -> Result<(), TxStateError<S>> {
+        let per_key = C::SCHEME.cost(&S::GAS_SCHEDULE.pubkey_decode);
+        let keys = u64::try_from(self.key_count()).unwrap_or(u64::MAX);
+        meter
+            .metered()
+            .charge_linear(<S::Gas as StateGas>::ZERO, per_key, keys)
+    }
+
+    /// Charges `meter` for verifying the transaction's signatures over a message of
+    /// `msg_len` bytes: the spec's `sig_verify + sig_per_byte·msg_len` of the scheme per
+    /// signature, every signature charged before any is verified (so batch verification would
+    /// cost the same). The authenticator calls it right before
+    /// [`verify_signature`](Self::verify_signature), which charges nothing.
+    ///
+    /// # Errors
+    /// A charge was refused or overflows (the phase is then poisoned; the earlier signatures'
+    /// charges stay).
+    pub fn charge_gas_for_signature<M: GasMeter<S>>(
+        &self,
+        msg_len: usize,
+        meter: &mut M,
+    ) -> Result<(), TxStateError<S>> {
+        let schedule = &S::GAS_SCHEDULE;
+        let verify = C::SCHEME.cost(&schedule.sig_verify);
+        let per_byte = C::SCHEME.cost(&schedule.sig_per_byte);
+        let units = u64::try_from(msg_len).unwrap_or(u64::MAX);
+        for _ in 0..self.signature_count() {
+            meter.metered().charge_linear(verify, per_byte, units)?;
+        }
+        Ok(())
     }
 }

@@ -39,7 +39,14 @@
 //!   runtime versions accepted by height ([`transaction::VersionTable`]), multisigs
 //!   ([`transaction::Multisig`]), what authentication establishes
 //!   ([`transaction::AuthorizationData`]) and what fees pay
-//!   ([`transaction::TransactionConsumption`]).
+//!   ([`transaction::TransactionConsumption`]);
+//! - [`capabilities`]: what a runtime provides the state transition function
+//!   ([`capabilities::HasCapabilities`]): gas enforcement, authentication and authorization of
+//!   transactions, the sequencer's authorization and pay, proof processing;
+//! - [`authenticator`]: the native authenticator ([`authenticator::SelendraAuthenticator`]),
+//!   which reads a transaction's envelope ([`authenticator::AuthenticatorInput`]) and
+//!   authenticates the native transaction in it against the chain ID and the runtime versions
+//!   accepted, charging every stage first.
 //!
 //! Every type that is stored or signed is a consensus type
 //! ([`ConsensusType`](trait@ConsensusType)); encodings are in `docs/serialization.md`, "Module
@@ -51,8 +58,9 @@
 //!   zk guest keeps none, so a build that reads events needs it).
 //! - `arbitrary`: `arbitrary::Arbitrary` and proptest strategies for this crate's types.
 //! - `test-utils`: `test_utils`, spec aliases over the mock DA, the mock zkVM and
-//!   `selendra-state`'s in-memory `TestStorage`, a spec whose gas costs are all distinct, and a
-//!   mock kernel. Never in a node or guest build.
+//!   `selendra-state`'s in-memory `TestStorage`, a spec whose gas costs are all distinct, a
+//!   mock kernel, capabilities over in-memory maps and (with `native`) test users that sign
+//!   transactions. Never in a node or guest build.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -61,6 +69,8 @@
 // used inside it too.
 extern crate self as selendra_modules_api;
 
+pub mod authenticator;
+pub mod capabilities;
 pub mod common;
 mod consensus_types;
 mod dependencies;

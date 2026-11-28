@@ -133,13 +133,35 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> core::fmt::Debug
     }
 }
 
-/// A `Write` that hashes what is written: the payload is hashed as it is encoded, without
-/// holding its encoding.
-struct HashWriter(StateHasher);
+/// A `Write` that hashes what is written, at most `remaining` bytes: the payload is hashed as it
+/// is encoded, without holding its encoding. A write past `remaining` fails before hashing
+/// anything of it (and sets `overflowed`), which stops the encoding.
+struct HashWriter {
+    hasher: StateHasher,
+    remaining: usize,
+    overflowed: bool,
+}
+
+impl HashWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            hasher: StateHasher::new(),
+            remaining: limit,
+            overflowed: false,
+        }
+    }
+}
 
 impl std::io::Write for HashWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.update(bytes);
+        let Some(remaining) = self.remaining.checked_sub(bytes.len()) else {
+            self.overflowed = true;
+            return Err(std::io::Error::other(
+                "the signing payload is longer than its length",
+            ));
+        };
+        self.remaining = remaining;
+        self.hasher.update(bytes);
         Ok(bytes.len())
     }
 
@@ -148,7 +170,152 @@ impl std::io::Write for HashWriter {
     }
 }
 
+/// A signing payload that borrows the transaction's fields instead of owning copies: what the
+/// signed bytes are computed from ([`Transaction::signing_bytes`](super::Transaction) and the
+/// authenticator), so the call (up to 1 MiB) is never copied, in particular not before the
+/// authenticator has charged for encoding it. Its borsh encoding is
+/// [`TransactionSigningPayload`]'s (the version tag, then the same fields in the same order):
+/// the known-answer vectors pin both.
+pub(crate) enum SigningPayloadRef<'a, R: TransactionCallable, S: Spec, C: TxCryptoSpec> {
+    /// A V0 payload.
+    V0 {
+        runtime_call: &'a R::Call,
+        uniqueness: UniquenessData,
+        details: &'a TxDetails<S>,
+        signer: &'a C::PublicKey,
+        address_override: Option<&'a S::Address>,
+        runtime_commitment: RuntimeCommitment,
+    },
+    /// A V1 payload.
+    V1 {
+        runtime_call: &'a R::Call,
+        uniqueness: UniquenessData,
+        details: &'a TxDetails<S>,
+        credential_address: S::Address,
+        address_override: Option<&'a S::Address>,
+        runtime_commitment: RuntimeCommitment,
+    },
+}
+
+impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> BorshSerialize
+    for SigningPayloadRef<'_, R, S, C>
+{
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        match self {
+            Self::V0 {
+                runtime_call,
+                uniqueness,
+                details,
+                signer,
+                address_override,
+                runtime_commitment,
+            } => {
+                BorshSerialize::serialize(&0u8, writer)?;
+                BorshSerialize::serialize(*runtime_call, writer)?;
+                BorshSerialize::serialize(uniqueness, writer)?;
+                BorshSerialize::serialize(*details, writer)?;
+                BorshSerialize::serialize(*signer, writer)?;
+                BorshSerialize::serialize(address_override, writer)?;
+                BorshSerialize::serialize(runtime_commitment, writer)
+            }
+            Self::V1 {
+                runtime_call,
+                uniqueness,
+                details,
+                credential_address,
+                address_override,
+                runtime_commitment,
+            } => {
+                BorshSerialize::serialize(&1u8, writer)?;
+                BorshSerialize::serialize(*runtime_call, writer)?;
+                BorshSerialize::serialize(uniqueness, writer)?;
+                BorshSerialize::serialize(*details, writer)?;
+                BorshSerialize::serialize(credential_address, writer)?;
+                BorshSerialize::serialize(address_override, writer)?;
+                BorshSerialize::serialize(runtime_commitment, writer)
+            }
+        }
+    }
+}
+
+impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> SigningPayloadRef<'_, R, S, C> {
+    /// The length of the payload's borsh encoding, without encoding it into memory.
+    pub(crate) fn encoded_len(&self) -> Result<usize, TransactionError> {
+        borsh::object_length(self).map_err(TransactionError::encoding)
+    }
+
+    /// `SHA-256(borsh(payload))`, hashed as it is encoded.
+    pub(crate) fn prehash(&self) -> Result<[u8; 32], TransactionError> {
+        let mut writer = HashWriter::new(usize::MAX);
+        BorshSerialize::serialize(self, &mut writer).map_err(TransactionError::encoding)?;
+        Ok(writer.hasher.finalize().into())
+    }
+
+    /// `SHA-256(borsh(payload))` of a payload whose encoding must be exactly `len` bytes (the
+    /// authenticator charged for `len`, [`Version0::signing_payload_len`](super::Version0) or
+    /// [`Version1::signing_payload_len`](super::Version1)): the encoding stops at the first
+    /// write past `len`, so at most `len` bytes are encoded and hashed.
+    ///
+    /// # Errors
+    /// [`TransactionError::NonCanonicalEncoding`] if the encoding is longer or shorter than
+    /// `len`; [`TransactionError::Encoding`] if it fails otherwise.
+    pub(crate) fn prehash_of_len(&self, len: usize) -> Result<[u8; 32], TransactionError> {
+        let mut writer = HashWriter::new(len);
+        let encoded = BorshSerialize::serialize(self, &mut writer);
+        if writer.overflowed || (encoded.is_ok() && writer.remaining != 0) {
+            return Err(TransactionError::NonCanonicalEncoding);
+        }
+        encoded.map_err(TransactionError::encoding)?;
+        Ok(writer.hasher.finalize().into())
+    }
+
+    /// The signed bytes: `signing_bytes(SigningDomain::Transaction, chain_id, prehash)`.
+    pub(crate) fn signing_bytes(&self, chain_id: u64) -> Result<SigningBytes, TransactionError> {
+        Ok(signing_bytes(
+            SigningDomain::Transaction,
+            chain_id,
+            &self.prehash()?,
+        ))
+    }
+
+    /// The signed bytes, the payload's encoding being exactly `len` bytes
+    /// ([`prehash_of_len`](Self::prehash_of_len)).
+    pub(crate) fn signing_bytes_of_len(
+        &self,
+        chain_id: u64,
+        len: usize,
+    ) -> Result<SigningBytes, TransactionError> {
+        Ok(signing_bytes(
+            SigningDomain::Transaction,
+            chain_id,
+            &self.prehash_of_len(len)?,
+        ))
+    }
+}
+
 impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> TransactionSigningPayload<R, S, C> {
+    /// The payload, borrowed.
+    pub(crate) fn as_ref(&self) -> SigningPayloadRef<'_, R, S, C> {
+        match self {
+            Self::V0(payload) => SigningPayloadRef::V0 {
+                runtime_call: &payload.runtime_call,
+                uniqueness: payload.uniqueness,
+                details: &payload.details,
+                signer: &payload.signer,
+                address_override: payload.address_override.as_ref(),
+                runtime_commitment: payload.runtime_commitment,
+            },
+            Self::V1(payload) => SigningPayloadRef::V1 {
+                runtime_call: &payload.runtime_call,
+                uniqueness: payload.uniqueness,
+                details: &payload.details,
+                credential_address: payload.credential_address,
+                address_override: payload.address_override.as_ref(),
+                runtime_commitment: payload.runtime_commitment,
+            },
+        }
+    }
+
     /// The runtime call.
     pub fn runtime_call(&self) -> &R::Call {
         match self {
@@ -211,7 +378,7 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> TransactionSigningPayload
     /// # Errors
     /// If the call's `BorshSerialize` fails (consensus types must never fail to encode).
     pub fn encoded_len(&self) -> Result<usize, TransactionError> {
-        borsh::object_length(self).map_err(TransactionError::encoding)
+        self.as_ref().encoded_len()
     }
 
     /// `SHA-256(borsh(payload))`, hashed with the state hasher as it is encoded.
@@ -219,9 +386,7 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> TransactionSigningPayload
     /// # Errors
     /// As [`encoded_len`](Self::encoded_len).
     pub fn prehash(&self) -> Result<[u8; 32], TransactionError> {
-        let mut writer = HashWriter(StateHasher::new());
-        BorshSerialize::serialize(self, &mut writer).map_err(TransactionError::encoding)?;
-        Ok(writer.0.finalize().into())
+        self.as_ref().prehash()
     }
 
     /// The signed bytes: `signing_bytes(SigningDomain::Transaction, chain_id, prehash)`, 51 bytes.
@@ -229,10 +394,6 @@ impl<R: TransactionCallable, S: Spec, C: TxCryptoSpec> TransactionSigningPayload
     /// # Errors
     /// As [`encoded_len`](Self::encoded_len).
     pub fn signing_bytes(&self, chain_id: u64) -> Result<SigningBytes, TransactionError> {
-        Ok(signing_bytes(
-            SigningDomain::Transaction,
-            chain_id,
-            &self.prehash()?,
-        ))
+        self.as_ref().signing_bytes(chain_id)
     }
 }

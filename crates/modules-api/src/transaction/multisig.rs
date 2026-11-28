@@ -104,18 +104,9 @@ impl<C: TxCryptoSpec> Multisig<C> {
     /// If `min_signers` is 0 or above the number of keys, there are more than [`MAX_SIGNERS`]
     /// keys, or a key is listed twice.
     pub fn new(min_signers: u8, mut keys: Vec<C::PublicKey>) -> Result<Self, MultisigError> {
-        if keys.len() > MAX_SIGNERS {
-            return Err(MultisigError::TooManyKeys { keys: keys.len() });
-        }
-        if min_signers == 0 {
-            return Err(MultisigError::ZeroThreshold);
-        }
-        if usize::from(min_signers) > keys.len() {
-            return Err(MultisigError::ThresholdAboveKeys {
-                min_signers,
-                keys: keys.len(),
-            });
-        }
+        #[cfg(test)]
+        MULTISIG_BUILDS.with(|count| count.set(count.get() + 1));
+        Self::check_shape(min_signers, keys.len())?;
         // A key's bytes are its borsh encoding (both schemes encode keys as their raw bytes),
         // and each key has one encoding.
         keys.sort_unstable_by(|a, b| a.as_ref().cmp(b.as_ref()));
@@ -129,6 +120,38 @@ impl<C: TxCryptoSpec> Multisig<C> {
         let keys =
             SafeVec::try_from(keys).map_err(|_| MultisigError::TooManyKeys { keys: count })?;
         Ok(Self { min_signers, keys })
+    }
+
+    /// The checks of [`new`](Self::new) that read no key, in its order: at most
+    /// [`MAX_SIGNERS`] keys, then a threshold of at least 1 and at most `keys`. Constant time:
+    /// the authenticator runs them before charging for the multisig's credential, and the
+    /// duplicate-key check (which sorts the keys) after.
+    ///
+    /// # Errors
+    /// [`MultisigError::TooManyKeys`], [`MultisigError::ZeroThreshold`] or
+    /// [`MultisigError::ThresholdAboveKeys`].
+    pub(crate) fn check_shape(min_signers: u8, keys: usize) -> Result<(), MultisigError> {
+        if keys > MAX_SIGNERS {
+            return Err(MultisigError::TooManyKeys { keys });
+        }
+        if min_signers == 0 {
+            return Err(MultisigError::ZeroThreshold);
+        }
+        if usize::from(min_signers) > keys {
+            return Err(MultisigError::ThresholdAboveKeys { min_signers, keys });
+        }
+        Ok(())
+    }
+
+    /// The length of the credential's preimage ([`credential_id`](Self::credential_id)) for
+    /// `keys`: the domain tag, the scheme and threshold bytes, the keys' `u32` count and their
+    /// bytes. Reads only the keys' lengths (no copy, no comparison): what the authenticator
+    /// charges for the credential before validating the keys.
+    pub(crate) fn credential_preimage_len<'k>(
+        keys: impl IntoIterator<Item = &'k C::PublicKey>,
+    ) -> usize {
+        let keys: usize = keys.into_iter().map(|key| key.as_ref().len()).sum();
+        Self::DOMAIN.len() + 2 + 4 + keys
     }
 
     /// The threshold.
@@ -217,6 +240,23 @@ impl<C: TxCryptoSpec> Multisig<C> {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many multisigs this thread built or tried to build ([`Multisig::new`] calls: the
+    /// keys copied, then sorted and checked for duplicates).
+    static MULTISIG_BUILDS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The multisigs `f` builds or tries to build ([`Multisig::new`] calls, which every build goes
+/// through, `Version1::multisig` included), and its result: the authenticator must build one
+/// only after charging for its credential.
+#[cfg(test)]
+pub(crate) fn count_multisig_builds<T>(f: impl FnOnce() -> T) -> (u64, T) {
+    let before = MULTISIG_BUILDS.with(core::cell::Cell::get);
+    let result = f();
+    (MULTISIG_BUILDS.with(core::cell::Cell::get) - before, result)
 }
 
 #[cfg(test)]

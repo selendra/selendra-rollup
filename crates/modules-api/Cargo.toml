@@ -1,6 +1,6 @@
 [package]
 name = "selendra-modules-api"
-description = "Selendra module system API: the module traits (Module, ModuleInfo, DispatchCall, hooks) and their derives (ModuleInfo, ModuleEvent, ConsensusType; the runtime derives DispatchCall, MessageCodec, Genesis, Event, Hooks), the runtime layout check (check_layout), Context, gas types and meters, metered utilities, the Spec trait and SelendraSpec, the state accessors (TxState, WorkingSet, BlockState) and events, transaction details, native transactions (V0 single-key and V1 multisig, ed25519 and secp256k1) with their signing payloads, runtime commitment and version table, token amounts, 32-byte bech32m ids (ModuleId), module errors."
+description = "Selendra module system API: the module traits (Module, ModuleInfo, DispatchCall, hooks) and their derives (ModuleInfo, ModuleEvent, ConsensusType; the runtime derives DispatchCall, MessageCodec, Genesis, Event, Hooks), the runtime layout check (check_layout), Context, gas types and meters, metered utilities, the Spec trait and SelendraSpec, the state accessors (TxState, WorkingSet, BlockState) and events, transaction details, native transactions (V0 single-key and V1 multisig, ed25519 and secp256k1) with their signing payloads, runtime commitment and version table, the capability traits (HasCapabilities, GasEnforcer, TransactionAuthenticator, TransactionAuthorizer, SequencerAuthorization, SequencerRemuneration, ProofProcessor) and the native authenticator (ed25519 and secp256k1 envelopes, every stage charged first), token amounts, 32-byte bech32m ids (ModuleId), module errors."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -38,6 +38,8 @@ hex = { workspace = true }
 postcard = { workspace = true }
 proptest = { workspace = true }
 selendra-modules-api = { path = ".", features = ["test-utils"] }
+# Counts the Ethereum addresses derived (a V0 secp256k1 transaction's, priced once).
+selendra-primitives = { workspace = true, features = ["test-counters"] }
 # Another hasher: a spec whose storage hashes with it does not compile (a doctest), though
 # that storage is a `Storage` (a unit test).
 sha2 = { workspace = true }
@@ -63,7 +65,8 @@ arbitrary = [
 ]
 # Test support for this crate and the crates built on it: `test_utils` (spec aliases over the
 # mock DA and zkVM and `selendra-state`'s in-memory `TestStorage`, a spec whose gas costs are all
-# distinct, and a mock kernel). Never in a node or guest build.
+# distinct, a mock kernel, capabilities over in-memory maps, and with `native` test users that
+# sign transactions). Never in a node or guest build.
 test-utils = ["selendra-state/test-utils", "dep:selendra-mock-da", "dep:selendra-mock-zkvm"]
 
 [lints]

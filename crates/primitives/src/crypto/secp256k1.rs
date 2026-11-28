@@ -55,14 +55,40 @@ impl EthereumPublicKey {
     }
 
     /// The Ethereum address of this key: the last 20 bytes of `keccak256` of the
-    /// uncompressed point (without the `0x04` tag).
+    /// uncompressed point (without the `0x04` tag). A decompression and a keccak256 of 64
+    /// bytes: every derivation of the address (the key's [`credential_id`] and its `Vm`
+    /// account included) runs this, and with the `test-counters` feature it is counted
+    /// (`crypto::count_ethereum_address_derivations`).
+    ///
+    /// [`credential_id`]: selendra_interface::crypto::PublicKey::credential_id
     pub fn ethereum_address(&self) -> EthereumAddress {
+        #[cfg(feature = "test-counters")]
+        ETHEREUM_ADDRESS_DERIVATIONS.with(|count| count.set(count.get() + 1));
         let uncompressed = self.verifying_key().to_sec1_point(false);
         let hash = keccak256(&uncompressed.as_bytes()[1..]);
         let mut addr = [0u8; 20];
         addr.copy_from_slice(&hash[12..]);
         EthereumAddress::new(addr)
     }
+}
+
+#[cfg(feature = "test-counters")]
+std::thread_local! {
+    /// How many Ethereum addresses this thread derived ([`EthereumPublicKey::ethereum_address`]).
+    static ETHEREUM_ADDRESS_DERIVATIONS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// How many Ethereum addresses `f` derives from secp256k1 keys (on this thread, through
+/// [`EthereumPublicKey::ethereum_address`], which every derivation runs), and its result.
+///
+/// Test instrumentation (the `test-counters` feature, never in a node or guest build): the
+/// crates that price the derivation test how often they do it.
+#[cfg(feature = "test-counters")]
+pub fn count_ethereum_address_derivations<T>(f: impl FnOnce() -> T) -> (u64, T) {
+    let before = ETHEREUM_ADDRESS_DERIVATIONS.with(core::cell::Cell::get);
+    let result = f();
+    let after = ETHEREUM_ADDRESS_DERIVATIONS.with(core::cell::Cell::get);
+    (after.wrapping_sub(before), result)
 }
 
 impl From<&k256::PublicKey> for EthereumPublicKey {
@@ -443,6 +469,26 @@ mod tests {
             one.pub_key().credential_id(),
             one.pub_key().ethereum_address().as_credential_id()
         );
+    }
+
+    /// Every derivation of a key's Ethereum address is counted: the address itself, the key's
+    /// credential id and its `Vm` account each derive it once.
+    #[test]
+    fn ethereum_address_derivations_are_counted() {
+        let key = key("0000000000000000000000000000000000000000000000000000000000000001").pub_key();
+        let (count, address) = count_ethereum_address_derivations(|| key.ethereum_address());
+        assert_eq!(count, 1);
+        let (count, id) = count_ethereum_address_derivations(|| key.credential_id());
+        assert_eq!((count, id), (1, address.as_credential_id()));
+        let (count, account) =
+            count_ethereum_address_derivations(|| crate::MultiAddressEvm::from(&key));
+        assert_eq!((count, account), (1, crate::MultiAddressEvm::Vm(address)));
+        let (count, ()) = count_ethereum_address_derivations(|| {
+            let _ = (key.credential_id(), key.ethereum_address());
+        });
+        assert_eq!(count, 2);
+        let (count, ()) = count_ethereum_address_derivations(|| ());
+        assert_eq!(count, 0);
     }
 
     #[test]

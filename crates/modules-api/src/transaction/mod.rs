@@ -28,7 +28,7 @@ mod types;
 mod unsigned;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use core::fmt::Debug;
 
@@ -41,6 +41,8 @@ pub(crate) use data::required_option;
 pub use data::{
     AuthenticatedTransactionData, PriorityFeeApplyOverflowError, PriorityFeeBips, TxDetails,
 };
+#[cfg(test)]
+pub(crate) use multisig::count_multisig_builds;
 pub use multisig::{MAX_SIGNERS, Multisig, MultisigError, PubKeyAndSignature};
 pub use rewards::{ProverReward, RemainingFunds, SequencerReward, TransactionConsumption};
 pub use runtime_version::{
@@ -99,6 +101,15 @@ pub enum TransactionError {
         /// Why.
         error: String,
     },
+    /// The signing payload does not encode to the length the transaction's own encoding gives
+    /// (the length the authenticator charges for before encoding the payload): a field, in
+    /// practice the call, was decoded from bytes other than its own encoding (a call type whose
+    /// decoding is not canonical).
+    #[error(
+        "the signing payload does not encode to the length the transaction's encoding gives: \
+         the transaction's encoding is not canonical"
+    )]
+    NonCanonicalEncoding,
 }
 
 impl TransactionError {

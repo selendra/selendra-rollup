@@ -7,7 +7,8 @@
 //!   payload exists exactly when the keys and threshold are a valid multisig (an independent
 //!   oracle: `1 ≤ min ≤ keys ≤ 21`, distinct keys); its prehash is the SHA-256 of its borsh
 //!   encoding (hashed here with `sha2` directly), the signed bytes are the 19-byte header and
-//!   that prehash, and they do not depend on which keys signed or in what order;
+//!   that prehash, and they do not depend on which keys signed or in what order; the
+//!   credential's default address and id derived together are those derived separately;
 //! - `Multisig::new` against the same oracle; the credential ignores the keys' order;
 //! - version tables built from the fuzz bytes: whatever `VersionTable::new` accepts has one or
 //!   two versions at every boundary height, the primary one being the newest, and `resolve`
@@ -248,6 +249,14 @@ fn check_transaction<C: Pool>(
     // The placeholder signatures never verify.
     assert!(tx.verify_signature(&signed).is_err());
     let credential = tx.credential().unwrap();
+    // The authorization data's derivation (both at once) agrees with each separately.
+    assert_eq!(
+        <S as Spec>::Address::default_and_credential_id(&credential),
+        (
+            <S as Spec>::Address::default_for(&credential),
+            credential.credential_id()
+        )
+    );
     match tx {
         Transaction::V0(inner) => {
             assert_eq!(payload.signer(), Some(&inner.pub_key));

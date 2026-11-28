@@ -39,6 +39,11 @@ pub struct GasSchedule<G> {
     /// checked against).
     pub encode_per_byte: G,
     /// Cost of decoding one public key (curve point decompression and checks), per scheme.
+    ///
+    /// The native authenticator charges it per key a transaction carries (its multisig's unused
+    /// keys included). For a V0 secp256k1 transaction it also covers deriving the key's
+    /// credential id and default address: both are its Ethereum address, derived once (a
+    /// decompression and a keccak256 of 64 bytes), on top of the decode's own decompression.
     pub pubkey_decode: SchemeCosts<G>,
     /// Fixed cost of verifying one signature, per scheme.
     pub sig_verify: SchemeCosts<G>,
